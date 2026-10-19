@@ -52,7 +52,9 @@ variable "landing_zone_version" {
 }
 
 variable "ous" {
-  type    = map(object({}))
+  type = map(object({
+    parent = optional(string, "root") # name of a top-level OU in this map; "root" = directly under the organization root
+  }))
   default = {}
 }
 

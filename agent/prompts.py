@@ -25,6 +25,13 @@ Rules for the JSON:
 - regions.governed = regions Control Tower should govern (must include home). regions.extraAllowed = regions the SOW allows
   but does not govern. regions.explicitDeny = regions the SOW explicitly forbids. Do NOT compute the full deny list;
   it is derived. Set enforceDeny true unless the SOW says region restriction is not wanted.
+- An OU in "ous" may carry "parent": the name of another OU in "ous" that contains it (one level only, for example NonProd
+  and Prod under Workloads when the SOW says Workloads has child OUs). Omit "parent" for OUs directly under the root.
+  Controls enabled on a parent OU apply to its child OUs.
+- "accounts" lists every AWS account the SOW names, so the reviewer sees the organization tree: name, "ou" ("root", Security,
+  Sandbox or an OU in "ous"), "kind" (management | log-archive | audit | workload | other), "provisioning"
+  (existing | control-tower | account-factory | manual), optional "purpose", plus basis and source like every other item.
+  The stacks never create or move accounts; this list only documents and draws them.
 - Control targets are OU names only. Security and Sandbox are created by Control Tower: you may target them but not list them in "ous".
   SCP targets are "root" or OU names.
 - Account ids: copy only if the SOW states them; otherwise leave "" and add an openQuestion.
@@ -38,6 +45,7 @@ Rules for the JSON:
  "logging": {{"retentionDays": 365, "accessLogRetentionDays": 365, "logArchiveAccountId": "", "auditAccountId": "", "kmsKeyArn": ""}},
  "evidence": {{"regions.home": {{"basis": "explicit", "source": "<quote>"}}, "regions.governed": {{...}}, "logging.retentionDays": {{...}}}},
  "ous": [{{"name": "Workloads", "basis": "explicit", "source": "<quote>"}}],
+ "accounts": [{{"name": "acme-prod", "ou": "Workloads", "kind": "workload", "provisioning": "account-factory", "purpose": "...", "basis": "explicit", "source": "<quote>"}}],
  "scps": [{{"id": "deny-root-user", "targets": ["Workloads"], "basis": "explicit", "source": "<quote>"}}],
  "controls": [{{"id": "AWS-GR_RESTRICT_ROOT_USER", "targets": ["Workloads"], "basis": "explicit", "source": "<quote>"}}],
  "unsupported": [{{"requirement": "...", "reason": "...", "source": "<quote>"}}],

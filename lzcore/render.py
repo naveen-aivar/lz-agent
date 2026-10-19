@@ -11,15 +11,16 @@ import zipfile
 from pathlib import Path
 
 from .catalog import CT_MANAGED_OUS, cid, scp_json
+from .diagram import org_markdown
 from .scope import scope_markdown
 
 TEMPLATES = Path(os.environ.get("TEMPLATES_DIR", Path(__file__).resolve().parent.parent / "templates"))
 TF_STATIC = ("versions.tf", "providers.tf", "variables.tf", "prerequisites.tf", "landing_zone.tf",
              "organizations.tf", "scps.tf", "controls.tf", "outputs.tf")
 CFN_STATIC = ("00-prerequisites.yaml", "01-landing-zone.yaml")
-TF_FIXED = set(TF_STATIC) | {"README.md", "terraform.tfvars", "docs/SCOPE.md", "docs/scope.json"}
+TF_FIXED = set(TF_STATIC) | {"README.md", "terraform.tfvars", "docs/SCOPE.md", "docs/ORG-STRUCTURE.md", "docs/scope.json"}
 CFN_FIXED = set(CFN_STATIC) | {"README.md", "02-governance.yaml", "parameters/01-landing-zone.json",
-                               "parameters/02-governance.json", "docs/SCOPE.md", "docs/scope.json"}
+                               "parameters/02-governance.json", "docs/SCOPE.md", "docs/ORG-STRUCTURE.md", "docs/scope.json"}
 
 
 # ---------- helpers ----------
@@ -39,7 +40,8 @@ def _readme(name, scope):
 
 
 def _docs(scope):
-    return {"docs/SCOPE.md": scope_markdown(scope), "docs/scope.json": json.dumps(scope, indent=2, sort_keys=True) + "\n"}
+    return {"docs/SCOPE.md": scope_markdown(scope), "docs/ORG-STRUCTURE.md": org_markdown(scope),
+            "docs/scope.json": json.dumps(scope, indent=2, sort_keys=True) + "\n"}
 
 
 # ---------- terraform ----------
@@ -61,7 +63,8 @@ def render_terraform(scope):
     ])
     out += "\nous = {" + ("}\n" if not scope["ous"] else "\n")
     if scope["ous"]:
-        out += _aligned([(json.dumps(o["name"]), "{}") for o in scope["ous"]], "  ") + "}\n"
+        out += _aligned([(json.dumps(o["name"]), "{ parent = " + json.dumps(o["parent"]) + " }" if o.get("parent") else "{}")
+                         for o in scope["ous"]], "  ") + "}\n"
     out += "\nscps = {" + ("}\n" if not scope["scps"] else "\n")
     if scope["scps"]:
         out += _aligned([(json.dumps(p["id"]), "{ targets = " + _hcl_list(p["targets"]) + " }") for p in scope["scps"]], "  ") + "}\n"
@@ -131,7 +134,8 @@ def render_cloudformation(scope):
     emitted = False
     for o in scope["ous"]:
         L += [f"  {cid('Ou', o['name'])}:", "    Type: AWS::Organizations::OrganizationalUnit", "    Properties:",
-              f"      Name: {json.dumps(o['name'])}", "      ParentId: !Ref OrganizationRootId"]
+              f"      Name: {json.dumps(o['name'])}",
+              f"      ParentId: {'!GetAtt ' + cid('Ou', o['parent']) + '.Id' if o.get('parent') else '!Ref OrganizationRootId'}"]
         emitted = True
     for p in scope["scps"]:
         L += [f"  {cid('Scp', p['id'])}:", "    Type: AWS::Organizations::Policy", "    Properties:",

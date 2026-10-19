@@ -16,6 +16,9 @@ BASIS = ("explicit", "inferred", "default")
 REQUIRED_EVIDENCE = ("regions.home", "regions.governed", "logging.retentionDays")
 ACCOUNT_RE = re.compile(r"^\d{12}$")
 OU_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$")
+ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
+ACCOUNT_KINDS = ("management", "log-archive", "audit", "workload", "other")
+PROVISIONING = ("existing", "control-tower", "account-factory", "manual")
 PAGE_CHARS = 30000
 
 
@@ -166,8 +169,55 @@ def validate(scope, sow_text=None):
             ou_names.append(name)
             seen_cid.add(cid(name))
         evidence(f"ous[{i}] ({name})", ou.get("basis"), ou.get("source"))
+    # optional "parent": one level of nesting under a top-level custom OU; absent means directly under the root
+    def _top(o):
+        return isinstance(o, dict) and o.get("parent") in (None, "", "root")
+
+    top_level = {o["name"] for o in ous if _top(o)}
+    for i, ou in enumerate(ous):
+        if not isinstance(ou, dict):
+            continue
+        parent = ou.get("parent")
+        if parent in (None, "", "root"):
+            ou.pop("parent", None)
+            continue
+        label = f"ous[{i}] ({ou['name']}).parent"
+        if parent == ou["name"]:
+            err(f"{label}: an OU cannot be its own parent")
+        elif parent in CT_MANAGED_OUS:
+            err(f"{label}: {parent!r} is created by Control Tower and cannot be a parent")
+        elif parent not in ou_names:
+            err(f"{label}: unknown parent {parent!r}; it must be another OU listed under ous")
+        elif parent not in top_level:
+            err(f"{label}: {parent!r} is itself a child OU; only one level of nesting is supported, put the rest under 'unsupported'")
     ous.sort(key=lambda o: str(o.get("name", "")))
     ou_targets = set(ou_names) | set(CT_MANAGED_OUS)
+
+    # accounts: documentation and diagram only. The stacks never create or move accounts.
+    accounts = _list(s, "accounts", errors, "accounts")
+    acct_names = []
+    for i, a in enumerate(accounts):
+        if not isinstance(a, dict):
+            err(f"accounts[{i}] must be an object")
+            continue
+        name = str(a.get("name", "")).strip()
+        a["name"] = name
+        if not ACCOUNT_NAME_RE.match(name):
+            err(f"accounts[{i}].name invalid: {name!r}")
+        elif name in acct_names:
+            err(f"duplicate account {name!r}")
+        else:
+            acct_names.append(name)
+        ou = a.get("ou")
+        if not isinstance(ou, str) or (ou != "root" and ou not in ou_targets):
+            err(f"accounts[{i}] ({name}).ou must be 'root' or an OU name from the scope (or Security / Sandbox), got {ou!r}")
+        if a.get("kind") not in ACCOUNT_KINDS:
+            err(f"accounts[{i}] ({name}).kind must be one of {list(ACCOUNT_KINDS)}")
+        if a.get("provisioning") not in PROVISIONING:
+            err(f"accounts[{i}] ({name}).provisioning must be one of {list(PROVISIONING)}")
+        a["purpose"] = str(a.get("purpose", "") or "")[:200]
+        evidence(f"accounts[{i}] ({name})", a.get("basis"), a.get("source"))
+    accounts.sort(key=lambda a: (str(a.get("ou")), str(a.get("name"))))
 
     # SCPs
     scps = _list(s, "scps", errors, "scps")
@@ -248,7 +298,7 @@ def validate(scope, sow_text=None):
     missing = [k for k in ("logArchiveAccountId", "auditAccountId") if not lg.get(k)]
     s["status"] = "needs-input" if (missing or s["openQuestions"]) else "complete"
     s["missingRequired"] = missing
-    s["summary"] = {"ous": len(ous), "scps": len(scps), "controls": len(controls),
+    s["summary"] = {"ous": len(ous), "accounts": len(accounts), "scps": len(scps), "controls": len(controls),
                     "controlAttachments": sum(len(c.get("targets", [])) for c in controls),
                     "governedRegions": len(r["governed"]), "deniedRegions": len(r["denied"]),
                     "unsupported": len(un), "openQuestions": len(s["openQuestions"])}
@@ -267,7 +317,9 @@ def scope_markdown(s):
           f"- Log archive account: {lg['logArchiveAccountId'] or 'NOT PROVIDED'}",
           f"- Audit account: {lg['auditAccountId'] or 'NOT PROVIDED'}",
           f"- KMS key: {lg['kmsKeyArn'] or 'Control Tower default'}", "", "## Organizational units (created by the stack)"]
-    L += [f"- {o['name']} [{o['basis']}]" for o in s["ous"]] or ["- none"]
+    L += [f"- {o['name']}{' (under ' + o['parent'] + ')' if o.get('parent') else ''} [{o['basis']}]" for o in s["ous"]] or ["- none"]
+    L += ["", "## Accounts (for context: the stacks do not create or move accounts)"]
+    L += [f"- {a['name']}: {a['kind']}, {a['provisioning']}, in {a['ou']} [{a['basis']}]" for a in s.get("accounts", [])] or ["- none"]
     L += ["", "## Service control policies"]
     L += [f"- `{p['id']}` -> {', '.join(p['targets'])} [{p['basis']}]" for p in s["scps"]] or ["- none"]
     L += ["", "## Control Tower controls"]

@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from lzcore import render, scope as sc  # noqa: E402
+from lzcore import diagram, render, scope as sc  # noqa: E402
 from lzcore.regions import ALL_REGIONS  # noqa: E402
 
 SOW = ("The customer, Acme Corp, requires a Control Tower landing zone in eu-west-1 and eu-central-1 only. "
@@ -80,6 +80,62 @@ class ScopeTests(unittest.TestCase):
         _, errs = sc.validate(g, SOW)
         self.assertTrue(any("must be an OU name" in e for e in errs))
 
+    def test_child_ou_parent_is_accepted_and_normalized(self):
+        g = good()
+        g["ous"][1]["parent"] = "Workloads"
+        g["ous"][0]["parent"] = "root"  # explicit root is the same as absent
+        s, errs = sc.validate(g, SOW)
+        self.assertEqual(errs, [])
+        by = {o["name"]: o for o in s["ous"]}
+        self.assertEqual(by["Shared"]["parent"], "Workloads")
+        self.assertNotIn("parent", by["Workloads"])
+        self.assertIn("- Shared (under Workloads) [explicit]", sc.scope_markdown(s))
+
+    def test_bad_ou_parents_rejected(self):
+        for parent, text in (("Shared", "own parent"), ("Nope", "unknown parent"), ("Security", "created by Control Tower")):
+            g = good()
+            g["ous"][1]["parent"] = parent
+            _, errs = sc.validate(g, SOW)
+            self.assertTrue(any(text in e for e in errs), (parent, errs))
+        g = good()  # grandchild: three OUs in a chain
+        g["ous"].append({"name": "Deep", "basis": "explicit", "source": "Workloads and Shared OUs are required", "parent": "Shared"})
+        g["ous"][1]["parent"] = "Workloads"
+        _, errs = sc.validate(g, SOW)
+        self.assertTrue(any("one level of nesting" in e for e in errs), errs)
+
+    def _with_accounts(self):
+        g = good()
+        g["ous"][1]["parent"] = "Workloads"
+        q = "Workloads and Shared OUs are required"
+        g["accounts"] = [
+            {"name": "acme-log-archive", "ou": "Security", "kind": "log-archive", "provisioning": "control-tower", "basis": "explicit", "source": q},
+            {"name": "acme-ml-dev", "ou": "Shared", "kind": "workload", "provisioning": "account-factory", "basis": "explicit", "source": q},
+            {"name": "acme-mgmt", "ou": "root", "kind": "management", "provisioning": "existing", "basis": "inferred", "source": "the existing account"},
+        ]
+        return g
+
+    def test_accounts_validate(self):
+        s, errs = sc.validate(self._with_accounts(), SOW)
+        self.assertEqual(errs, [])
+        self.assertEqual(s["summary"]["accounts"], 3)
+        self.assertIn("acme-ml-dev: workload, account-factory, in Shared", sc.scope_markdown(s))
+
+    def test_bad_accounts_rejected(self):
+        for field, value, text in (("ou", "Nowhere", ".ou must be"), ("ou", ["x"], ".ou must be"), ("kind", "pet", ".kind must be"),
+                                   ("provisioning", "magic", ".provisioning must be"), ("name", 'a"];x', "name invalid")):
+            g = self._with_accounts()
+            g["accounts"][1][field] = value
+            _, errs = sc.validate(g, SOW)
+            self.assertTrue(any(text in e for e in errs), (field, errs))
+        g = self._with_accounts()
+        g["accounts"][1]["name"] = "acme-mgmt"
+        _, errs = sc.validate(g, SOW)
+        self.assertTrue(any("duplicate account" in e for e in errs), errs)
+        g = self._with_accounts()
+        g["accounts"][0]["source"] = "a quote the SOW never says"
+        _, errs = sc.validate(g, SOW)
+        self.assertTrue(any("quote not found" in e for e in errs), errs)
+
     def test_missing_accounts_marks_needs_input(self):
         g = good()
         g["logging"]["auditAccountId"] = ""
@@ -136,6 +192,51 @@ class RenderTests(unittest.TestCase):
         self.assertIn("ControlAwsGrRestrictRootUserSecurity:", g)
         self.assertIn("${SecurityOuId}", g)
         self.assertIn("DependsOn: ControlAwsGrRestrictRootUserSecurity", g)  # serial chain
+
+    def test_child_ou_rendered_under_parent_in_both_stacks(self):
+        g = good()
+        g["ous"][1]["parent"] = "Workloads"
+        s, errs = sc.validate(g, SOW)
+        self.assertEqual(errs, [])
+        cfn = render.render_cloudformation(s)["02-governance.yaml"]
+        self.assertIn("ParentId: !GetAtt OuWorkloads.Id", cfn)
+        self.assertEqual(cfn.count("ParentId: !Ref OrganizationRootId"), 1)  # only Workloads stays under the root
+        tfvars = render.render_terraform(s)["terraform.tfvars"]
+        self.assertIn('"Shared"    = { parent = "Workloads" }', tfvars)
+        self.assertIn('"Workloads" = {}', tfvars)
+        self.assertEqual(set(render.render_terraform(s)) - {f for f in render.render_terraform(s) if f.startswith("policies/")}, render.TF_FIXED)
+
+    def test_org_diagram_shows_tree_and_who_creates_what(self):
+        g = ScopeTests._with_accounts(ScopeTests())
+        g["logging"]["auditAccountId"] = ""
+        s, errs = sc.validate(g, SOW)
+        self.assertEqual(errs, [])
+        d = diagram.org_mermaid(s)
+        self.assertTrue(d.startswith("flowchart TD\n"))
+        for edge in ("ROOT --> OuSecurity", "ROOT --> OuSandbox", "ROOT --> OuWorkloads", "OuWorkloads --> OuShared",
+                     "OuSecurity --> AcctAcmeLogArchive", "ROOT --> AcctAcmeMgmt"):
+            self.assertIn(edge, d)
+        self.assertIn("OuShared -.-> AcctAcmeMlDev", d)  # not created by the stacks: dotted edge
+        self.assertIn("AcctAcmeMlDev(", d)
+        self.assertIn(":::planned", d)
+        self.assertIn("OuWorkloads[", d)
+        self.assertIn("id: 111111111111", d)  # log archive id from the scope
+        self.assertIn("SCPs: deny-region", d)  # root label
+        self.assertEqual(d, diagram.org_mermaid(s))  # deterministic
+
+    def test_diagram_label_text_is_sanitized(self):
+        self.assertNotRegex(diagram._t('a"b<c>d`e{f}g[h]i|j#k&l;m'), r'["<>`{}\[\]|#&;]')
+
+    def test_bundles_include_org_structure_doc(self):
+        for files in (render.render_terraform(self.scope), render.render_cloudformation(self.scope)):
+            doc = files["docs/ORG-STRUCTURE.md"]
+            self.assertIn("```mermaid\nflowchart TD", doc)
+            self.assertIn("## Legend", doc)
+
+    def test_flat_scope_renders_without_parents(self):
+        cfn = render.render_cloudformation(self.scope)["02-governance.yaml"]
+        self.assertNotIn("ParentId: !GetAtt", cfn)
+        self.assertNotIn("parent =", render.render_terraform(self.scope)["terraform.tfvars"])
 
     def test_tfvars_has_no_template_leftovers(self):
         for fmt in (render.render_terraform(self.scope), render.render_cloudformation(self.scope)):

@@ -3,5 +3,8 @@ output "landing_zone_arn" {
 }
 
 output "custom_ou_ids" {
-  value = { for k, v in aws_organizations_organizational_unit.custom : k => v.id }
+  value = merge(
+    { for k, v in aws_organizations_organizational_unit.custom : k => v.id },
+    { for k, v in aws_organizations_organizational_unit.custom_child : k => v.id },
+  )
 }

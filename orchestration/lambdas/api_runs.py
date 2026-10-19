@@ -13,6 +13,7 @@ from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
 from common import ARTIFACT_BUCKET, audit, get_run, now, s3, table
+from lzcore.diagram import org_mermaid
 
 sfn = boto3.client("stepfunctions")
 EXTS = {"pdf", "docx", "txt", "md"}
@@ -125,7 +126,8 @@ def _scope(run_id, sub, approver):
     if not art:
         return _resp(404, {"error": "scope not available yet"})
     body = s3().get_object(Bucket=ARTIFACT_BUCKET, Key=art["key"])["Body"].read().decode()
-    return _resp(200, {"scope": json.loads(body), "sha": art["sha"]})
+    scope = json.loads(body)
+    return _resp(200, {"scope": scope, "sha": art["sha"], "orgDiagram": org_mermaid(scope)})
 
 
 def handler(event, _ctx):
