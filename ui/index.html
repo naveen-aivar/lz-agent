@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Landing Zone Agent</title>
+<style>
+  :root { --bg:#fff; --fg:#14213d; --muted:#5c677d; --line:#dde1e7; --accent:#0b6bcb; --bad:#b42318; --ok:#067647; --warn:#b54708; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#10141c; --fg:#e8ecf3; --muted:#9aa5b8; --line:#2a3242; --accent:#5aa7ff; --bad:#ff8a80; --ok:#5fd39b; --warn:#fdb022; } }
+  body { margin:0; font:15px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:900px; margin:0 auto; padding:24px 16px; }
+  h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:16px; margin:28px 0 8px; } h3 { font-size:14px; margin:14px 0 4px; }
+  .muted { color:var(--muted); }
+  label { display:block; margin:12px 0 4px; font-weight:600; }
+  input, select, textarea { width:100%; box-sizing:border-box; padding:8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); font:inherit; }
+  textarea { min-height:120px; }
+  button { padding:8px 14px; border:0; border-radius:6px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  button.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  .card { border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin:8px 0; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  code { font-family:ui-monospace,monospace; font-size:12px; word-break:break-all; }
+  .err { color:var(--bad); } .okc { color:var(--ok); } .warn { color:var(--warn); }
+  table { width:100%; border-collapse:collapse; font-size:13px; } td,th { text-align:left; padding:4px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  ul { margin:4px 0; padding-left:20px; }
+  .tag { font-size:11px; padding:1px 6px; border:1px solid var(--line); border-radius:10px; color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Landing Zone Agent</h1>
+  <p class="muted">Upload a SOW (or paste requirements). The agent extracts the Control Tower scope. After a reviewer approves it, you download a Terraform stack and a CloudFormation stack.</p>
+  <div id="auth" class="row"></div>
+  <section id="app" hidden>
+    <h2>New run</h2>
+    <label for="customer">Customer id</label>
+    <input id="customer" placeholder="acme-corp" pattern="[a-z0-9-]{3,40}">
+    <label for="file">SOW file (PDF, DOCX, TXT or MD, up to 10 MB)</label>
+    <input id="file" type="file" accept=".pdf,.docx,.txt,.md">
+    <label for="req">Additional requirements (optional)</label>
+    <textarea id="req" placeholder="Anything not in the SOW file..."></textarea>
+    <p><button id="create">Start run</button> <span id="createMsg"></span></p>
+
+    <h2>Recent runs</h2>
+    <div id="runs" class="muted">Loading...</div>
+
+    <h2>Run</h2>
+    <div class="row"><input id="runId" placeholder="run id" style="max-width:340px"><button class="secondary" id="load">Load</button>
+      <label class="row" style="margin:0;font-weight:400"><input type="checkbox" id="poll" style="width:auto" checked> auto-refresh</label></div>
+    <div id="run"></div>
+    <h2>Audit log</h2>
+    <div id="audit" class="muted">No run loaded.</div>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

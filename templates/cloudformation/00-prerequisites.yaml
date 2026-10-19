@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Service roles that Control Tower requires before a landing zone can be created through the API.
+
+Resources:
+  ControlTowerAdmin:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSControlTowerAdmin
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: controltower.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSControlTowerServiceRolePolicy"
+      Policies:
+        - PolicyName: AWSControlTowerAdminPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeAvailabilityZones
+                Resource: "*"
+
+  ControlTowerCloudTrailRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSControlTowerCloudTrailRole
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudtrail.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AWSControlTowerCloudTrailRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:*:*:log-group:aws-controltower/CloudTrailLogs:*"
+
+  ControlTowerStackSetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSControlTowerStackSetRole
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudformation.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AWSControlTowerStackSetRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::*:role/AWSControlTowerExecution"
+
+  ControlTowerConfigAggregatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSControlTowerConfigAggregatorRoleForOrganizations
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: config.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSConfigRoleForOrganizations"

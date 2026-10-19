@@ -1,0 +1,567 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Landing Zone Agent platform. SOW in, validated Terraform and CloudFormation stacks out. No deployment into customer accounts.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: lz-agent
+    AllowedPattern: "[a-z][a-z0-9-]{2,20}"
+  CodeBucket:
+    Type: String
+    Description: Existing bucket holding orchestration.zip, buildspecs.zip and statemachine.asl.json (scripts/deploy.sh uploads them).
+  AgentImageUri:
+    Type: String
+    Default: ""
+    Description: ECR image (linux/arm64). Leave empty on the first deploy; push the image, then update the stack.
+  ModelId:
+    Type: String
+    Description: Bedrock inference-profile id for the Claude model (verify it in your region before deploying).
+  CognitoDomainPrefix:
+    Type: String
+  ApprovalTtlSeconds:
+    Type: Number
+    Default: 86400
+
+Conditions:
+  CreateRuntime: !Not [!Equals [!Ref AgentImageUri, ""]]
+
+Resources:
+  # ---------- Data ----------
+  Key:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "${ProjectName} data key"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Root
+            Effect: Allow
+            Principal: {AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"}
+            Action: "kms:*"
+            Resource: "*"
+
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${ProjectName}-state"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: PK, AttributeType: S}, {AttributeName: SK, AttributeType: S}]
+      KeySchema: [{AttributeName: PK, KeyType: HASH}, {AttributeName: SK, KeyType: RANGE}]
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !GetAtt Key.Arn}
+      DeletionProtectionEnabled: true
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration: {Status: Enabled}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: "aws:kms", KMSMasterKeyID: !GetAtt Key.Arn}
+      CorsConfiguration:   # browser uploads the SOW with a presigned POST
+        CorsRules:
+          - AllowedOrigins: [!Sub "https://${Distribution.DomainName}"]
+            AllowedMethods: [POST]
+            AllowedHeaders: ["*"]
+            MaxAge: 600
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
+            Condition: {Bool: {"aws:SecureTransport": "false"}}
+
+  # ---------- UI hosting (S3 + CloudFront OAC) ----------
+  UiBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]
+
+  Oac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        Origins:
+          - Id: ui
+            DomainName: !GetAtt UiBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt Oac.Id
+            S3OriginConfig: {OriginAccessIdentity: ""}
+        DefaultCacheBehavior:
+          TargetOriginId: ui
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad   # Managed-CachingDisabled (UI files change on deploy)
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03   # Managed-SecurityHeadersPolicy
+
+  UiBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UiBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub "${UiBucket.Arn}/*"
+            Condition: {StringEquals: {"AWS:SourceArn": !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"}}
+
+  # ---------- Auth ----------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-users"
+      AdminCreateUserConfig: {AllowAdminCreateUserOnly: true}
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: "ON"
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies: {PasswordPolicy: {MinimumLength: 14, RequireLowercase: true, RequireUppercase: true, RequireNumbers: true, RequireSymbols: true}}
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties: {Domain: !Ref CognitoDomainPrefix, UserPoolId: !Ref UserPool}
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Sub "https://${Distribution.DomainName}/"]
+      LogoutURLs: [!Sub "https://${Distribution.DomainName}/"]
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits: {AccessToken: minutes, IdToken: minutes}
+
+  ApproversGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {GroupName: approvers, UserPoolId: !Ref UserPool}
+
+  RequestersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {GroupName: requesters, UserPoolId: !Ref UserPool}
+
+  # ---------- Roles ----------
+  LambdaLogs:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: ["logs:CreateLogStream", "logs:PutLogEvents", "logs:CreateLogGroup"]
+            Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*"
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: "2012-10-17", Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}]}
+      ManagedPolicyArns: [!Ref LambdaLogs]
+      Policies:
+        - PolicyName: api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
+                Resource: !GetAtt StateTable.Arn
+              - Effect: Allow
+                Action: ["states:StartExecution"]
+                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-run"
+              - Effect: Allow
+                Action: ["states:SendTaskSuccess", "states:SendTaskFailure"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject"]   # PutObject: presigned POST for the SOW is signed with this role
+                Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
+              - Effect: Allow
+                Action: ["kms:Decrypt", "kms:GenerateDataKey"]
+                Resource: !GetAtt Key.Arn
+
+  PhaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: "2012-10-17", Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}]}
+      ManagedPolicyArns: [!Ref LambdaLogs]
+      Policies:
+        - PolicyName: phase
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
+                Resource: !GetAtt StateTable.Arn
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject"]
+                Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
+              - Effect: Allow
+                Action: ["kms:Decrypt", "kms:GenerateDataKey"]
+                Resource: !GetAtt Key.Arn
+              - Effect: Allow
+                Action: ["bedrock-agentcore:InvokeAgentRuntime"]
+                Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+
+  AgentRole:   # no CodeBuild, no Lambda, no STS: the agent can read the SOW, write the scope and call the model
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: bedrock-agentcore.amazonaws.com}
+            Action: "sts:AssumeRole"
+            Condition: {StringEquals: {"aws:SourceAccount": !Ref "AWS::AccountId"}}
+      Policies:
+        - PolicyName: agent
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+                Resource: ["arn:aws:bedrock:*::foundation-model/anthropic.*", !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"]
+              - Effect: Allow
+                Action: ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
+                Resource: !GetAtt AgentRepo.Arn
+              - Effect: Allow
+                Action: ["ecr:GetAuthorizationToken"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "xray:PutTraceSegments", "xray:PutTelemetryRecords"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["dynamodb:PutItem"]   # audit entries only
+                Resource: !GetAtt StateTable.Arn
+              - Effect: Allow
+                Action: ["s3:GetObject"]
+                Resource: !Sub "${ArtifactBucket.Arn}/runs/*/sow.txt"
+              - Effect: Allow
+                Action: ["s3:PutObject", "s3:GetObject"]
+                Resource: !Sub "${ArtifactBucket.Arn}/runs/*/intake/*"
+              - Effect: Allow
+                Action: ["kms:Decrypt", "kms:GenerateDataKey"]
+                Resource: !GetAtt Key.Arn
+
+  ValidateRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: "2012-10-17", Statement: [{Effect: Allow, Principal: {Service: codebuild.amazonaws.com}, Action: "sts:AssumeRole"}]}
+      Policies:
+        - PolicyName: validate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:GetObjectVersion"]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${CodeBucket}/buildspecs.zip"
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject"]
+                Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
+              - Effect: Allow
+                Action: ["s3:ListBucket"]
+                Resource: !GetAtt ArtifactBucket.Arn
+              - Effect: Allow
+                Action: ["kms:Decrypt", "kms:GenerateDataKey"]
+                Resource: !GetAtt Key.Arn
+              - Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: "*"
+
+  SfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: "2012-10-17", Statement: [{Effect: Allow, Principal: {Service: states.amazonaws.com}, Action: "sts:AssumeRole"}]}
+      Policies:
+        - PolicyName: sfn
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["lambda:InvokeFunction"]
+                Resource: [!GetAtt PhaseExtractFn.Arn, !GetAtt PhaseInvokeFn.Arn, !GetAtt GateWaitFn.Arn, !GetAtt PhaseRenderFn.Arn, !GetAtt PhaseStatusFn.Arn]
+              - Effect: Allow
+                Action: ["codebuild:StartBuild", "codebuild:StopBuild", "codebuild:BatchGetBuilds"]
+                Resource: !GetAtt ValidateProject.Arn
+              - Effect: Allow   # required by the .sync CodeBuild integration
+                Action: ["events:PutTargets", "events:PutRule", "events:DescribeRule"]
+                Resource: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventForCodeBuildStartBuildRule"
+              - Effect: Allow
+                Action: ["logs:CreateLogDelivery", "logs:PutLogEvents", "logs:UpdateLogDelivery", "logs:DescribeLogGroups", "logs:CreateLogGroup", "logs:DescribeResourcePolicies", "logs:PutResourcePolicy", "logs:GetLogDelivery", "logs:ListLogDeliveries"]
+                Resource: "*"
+
+  # ---------- Agent runtime ----------
+  AgentRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-agent"
+      ImageScanningConfiguration: {ScanOnPush: true}
+      ImageTagMutability: IMMUTABLE
+
+  AgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Condition: CreateRuntime
+    Properties:
+      AgentRuntimeName: !Sub
+        - "${Name}_agent"
+        - {Name: !Join ["_", !Split ["-", !Ref ProjectName]]}
+      Description: SOW scope extraction agent (Strands)
+      RoleArn: !GetAtt AgentRole.Arn
+      AgentRuntimeArtifact:
+        ContainerConfiguration: {ContainerUri: !Ref AgentImageUri}
+      NetworkConfiguration: {NetworkMode: PUBLIC}
+      EnvironmentVariables:
+        MODEL_ID: !Ref ModelId
+        STATE_TABLE: !Ref StateTable
+        ARTIFACT_BUCKET: !Ref ArtifactBucket
+
+  # ---------- Validation ----------
+  ValidateProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-validate"
+      ServiceRole: !GetAtt ValidateRole.Arn
+      EncryptionKey: !GetAtt Key.Arn
+      Artifacts: {Type: NO_ARTIFACTS}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables: [{Name: ARTIFACT_BUCKET, Value: !Ref ArtifactBucket}]
+      Source:
+        Type: S3
+        Location: !Sub "${CodeBucket}/buildspecs.zip"
+        BuildSpec: validate.yml
+      TimeoutInMinutes: 20
+
+  # ---------- Lambdas ----------
+  ApiRunsFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-api-runs"
+      Runtime: python3.12
+      Handler: api_runs.handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 15
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
+      Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket, STATE_MACHINE_ARN: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-run"}}
+
+  ApiApproveFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-api-approve"
+      Runtime: python3.12
+      Handler: api_approve.handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 15
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
+      Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket, APPROVAL_TTL_SECONDS: !Ref ApprovalTtlSeconds}}
+
+  ApiArtifactsFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-api-artifacts"
+      Runtime: python3.12
+      Handler: api_artifacts.handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 15
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
+      Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket}}
+
+  PhaseExtractFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-phase-extract"
+      Runtime: python3.12
+      Handler: phase_extract.handler
+      Role: !GetAtt PhaseRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
+      Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket}}
+
+  PhaseInvokeFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-phase-invoke"
+      Runtime: python3.12
+      Handler: phase_invoke.handler
+      Role: !GetAtt PhaseRole.Arn
+      Timeout: 900
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTable
+          ARTIFACT_BUCKET: !Ref ArtifactBucket
+          AGENT_RUNTIME_ARN: !If [CreateRuntime, !GetAtt AgentRuntime.AgentRuntimeArn, ""]
+
+  GateWaitFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-gate-wait"
+      Runtime: python3.12
+      Handler: gate_wait.handler
+      Role: !GetAtt PhaseRole.Arn
+      Timeout: 15
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
+      Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket}}
+
+  PhaseRenderFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-phase-render"
+      Runtime: python3.12
+      Handler: phase_render.handler
+      Role: !GetAtt PhaseRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
+      Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket}}
+
+  PhaseStatusFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-phase-status"
+      Runtime: python3.12
+      Handler: phase_status.handler
+      Role: !GetAtt PhaseRole.Arn
+      Timeout: 15
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
+      Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket}}
+
+  # ---------- Orchestration ----------
+  SfnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/vendedlogs/states/${ProjectName}", RetentionInDays: 365}
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-run"
+      RoleArn: !GetAtt SfnRole.Arn
+      DefinitionS3Location: {Bucket: !Ref CodeBucket, Key: statemachine.asl.json}
+      DefinitionSubstitutions:
+        PhaseExtractArn: !GetAtt PhaseExtractFn.Arn
+        PhaseInvokeArn: !GetAtt PhaseInvokeFn.Arn
+        GateWaitArn: !GetAtt GateWaitFn.Arn
+        PhaseRenderArn: !GetAtt PhaseRenderFn.Arn
+        PhaseStatusArn: !GetAtt PhaseStatusFn.Arn
+        ValidateProject: !Ref ValidateProject
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: false
+        Destinations: [{CloudWatchLogsLogGroup: {LogGroupArn: !GetAtt SfnLogGroup.Arn}}]
+
+  # ---------- API ----------
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: [!Sub "https://${Distribution.DomainName}"]
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, OPTIONS]
+
+  Authorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref Api
+      AuthorizerType: JWT
+      Name: cognito
+      IdentitySource: ["$request.header.Authorization"]
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClient]
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+
+  RunsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties: {ApiId: !Ref Api, IntegrationType: AWS_PROXY, IntegrationUri: !GetAtt ApiRunsFn.Arn, PayloadFormatVersion: "2.0"}
+  ApproveIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties: {ApiId: !Ref Api, IntegrationType: AWS_PROXY, IntegrationUri: !GetAtt ApiApproveFn.Arn, PayloadFormatVersion: "2.0"}
+  ArtifactsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties: {ApiId: !Ref Api, IntegrationType: AWS_PROXY, IntegrationUri: !GetAtt ApiArtifactsFn.Arn, PayloadFormatVersion: "2.0"}
+
+  RouteCreateRun:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "POST /runs", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
+  RouteListRuns:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "GET /runs", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
+  RouteStartRun:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "POST /runs/{runId}/start", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
+  RouteGetRun:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "GET /runs/{runId}", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
+  RouteScope:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "GET /runs/{runId}/scope", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
+  RouteAudit:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "GET /runs/{runId}/audit", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
+  RouteApprove:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "POST /runs/{runId}/approvals", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${ApproveIntegration}"}
+  RouteArtifact:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "GET /runs/{runId}/artifacts/{name}", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${ArtifactsIntegration}"}
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref Api
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings: {ThrottlingBurstLimit: 20, ThrottlingRateLimit: 10}
+
+  PermRuns:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: "lambda:InvokeFunction", FunctionName: !Ref ApiRunsFn, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"}
+  PermApprove:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: "lambda:InvokeFunction", FunctionName: !Ref ApiApproveFn, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"}
+  PermArtifacts:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: "lambda:InvokeFunction", FunctionName: !Ref ApiArtifactsFn, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"}
+
+Outputs:
+  UiUrl: {Value: !Sub "https://${Distribution.DomainName}"}
+  UiBucketName: {Value: !Ref UiBucket}
+  ApiUrl: {Value: !GetAtt Api.ApiEndpoint}
+  UserPoolId: {Value: !Ref UserPool}
+  UserPoolClientId: {Value: !Ref UserPoolClient}
+  CognitoDomain: {Value: !Sub "${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"}
+  AgentRepoUri: {Value: !GetAtt AgentRepo.RepositoryUri}

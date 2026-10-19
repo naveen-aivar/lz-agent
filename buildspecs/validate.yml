@@ -1,0 +1,12 @@
+version: 0.2
+# Env: RUN_ID, ARTIFACT_BUCKET. Validates runs/$RUN_ID/bundle-src/{terraform,cloudformation} and writes validation-report.json.
+# A failing check fails the build, which fails the run (stacks are then not downloadable).
+phases:
+  install:
+    commands:
+      - pip install -q cfn-lint checkov
+      - curl -sSLo tf.zip "https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip" && unzip -q tf.zip -d /usr/local/bin
+      - curl -sSLo tflint.zip "https://github.com/terraform-linters/tflint/releases/download/v0.53.0/tflint_linux_amd64.zip" && unzip -q tflint.zip -d /usr/local/bin
+  build:
+    commands:
+      - bash validate.sh

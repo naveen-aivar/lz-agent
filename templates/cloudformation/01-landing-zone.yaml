@@ -1,0 +1,54 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Control Tower landing zone. Deploy in the Organizations MANAGEMENT account, in the home region, after 00-prerequisites.
+
+Parameters:
+  GovernedRegions:
+    Type: CommaDelimitedList
+  LogArchiveAccountId:
+    Type: String
+    AllowedPattern: "[0-9]{12}"
+    ConstraintDescription: Control Tower API launch needs an existing 12-digit account id.
+  AuditAccountId:
+    Type: String
+    AllowedPattern: "[0-9]{12}"
+    ConstraintDescription: Control Tower API launch needs an existing 12-digit account id.
+  LogRetentionDays:
+    Type: Number
+  AccessLogRetentionDays:
+    Type: Number
+  KmsKeyArn:
+    Type: String
+    Default: ""
+    Description: Optional customer-managed key. Its key policy must allow Control Tower, CloudTrail and Config.
+  LandingZoneVersion:
+    Type: String
+    Default: "3.3"
+
+Conditions:
+  HasKms: !Not [!Equals [!Ref KmsKeyArn, ""]]
+
+Resources:
+  LandingZone:
+    Type: AWS::ControlTower::LandingZone
+    Properties:
+      Version: !Ref LandingZoneVersion
+      Manifest:
+        governedRegions: !Ref GovernedRegions
+        organizationStructure:
+          security: {name: Security}
+          sandbox: {name: Sandbox}
+        centralizedLogging:
+          accountId: !Ref LogArchiveAccountId
+          configurations:
+            loggingBucket: {retentionDays: !Ref LogRetentionDays}
+            accessLoggingBucket: {retentionDays: !Ref AccessLogRetentionDays}
+            kmsKeyArn: !If [HasKms, !Ref KmsKeyArn, !Ref "AWS::NoValue"]
+          enabled: true
+        securityRoles:
+          accountId: !Ref AuditAccountId
+        accessManagement:
+          enabled: true
+
+Outputs:
+  LandingZoneArn:
+    Value: !GetAtt LandingZone.Arn
