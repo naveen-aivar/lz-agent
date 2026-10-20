@@ -92,6 +92,7 @@ function scopeHtml(s) {
   return `<div class="card">
     <b>Extracted scope</b> <span class="tag">${esc(s.status)}</span>
     ${s.missingRequired.length ? `<p class="warn">Missing required input: ${esc(s.missingRequired.join(", "))}. Fill these in the stack parameters before deploying.</p>` : ""}
+    ${(s.warnings || []).length ? `<p class="warn">${(s.warnings || []).map((w) => esc(w)).join("<br>")}</p>` : ""}
     <h3>Regions</h3>
     <div>Home <code>${esc(r.home)}</code> · governed ${r.governed.map((x) => `<code>${esc(x)}</code>`).join(" ")}</div>
     <div>Extra allowed: ${r.extraAllowed.map((x) => `<code>${esc(x)}</code>`).join(" ") || "none"} · region deny enforced: ${r.enforceDeny}</div>
@@ -100,7 +101,8 @@ function scopeHtml(s) {
     <div>Retention ${lg.retentionDays} days (access logs ${lg.accessLogRetentionDays}) · log archive ${esc(lg.logArchiveAccountId || "NOT PROVIDED")} · audit ${esc(lg.auditAccountId || "NOT PROVIDED")}</div>
     <h3>OUs created (${s.ous.length})</h3>${list(s.ous, (o) => `<li>${esc(o.name)}${o.parent ? ` <span class="muted">(under ${esc(o.parent)})</span>` : ""} ${tag(o.basis)}</li>`)}
     <h3>Accounts (${(s.accounts || []).length}, for context: the stacks do not create them)</h3>${list(s.accounts || [], (a) => `<li>${esc(a.name)} <span class="muted">${esc(a.kind)}, ${esc(a.provisioning)}, in ${esc(a.ou)}</span> ${tag(a.basis)}</li>`)}
-    <h3>Service control policies (${s.scps.length})</h3>${list(s.scps, (p) => `<li><code>${esc(p.id)}</code> on ${esc(p.targets.join(", "))} ${tag(p.basis)}</li>`)}
+    <h3>Service control policies (${s.scps.length}, applied by the stacks)</h3>${list(s.scps, (p) => `<li><code>${esc(p.id)}</code> on ${esc(p.targets.join(", "))} ${tag(p.basis)}</li>`)}
+    <h3>Custom SCPs (${(s.customScps || []).length}, model-authored, not applied)</h3>${list(s.customScps || [], (p) => `<li><code>${esc(p.id)}</code> ${esc(p.title || "")} on ${esc((p.targets || []).join(", "))} ${tag(p.basis)}<details><summary class="muted">Policy document</summary><pre><code>${esc(JSON.stringify(p.document, null, 2))}</code></pre></details></li>`)}
     <h3>Control Tower controls (${s.controls.length} controls, ${s.summary.controlAttachments} attachments)</h3>${list(s.controls, (c) => `<li><code>${esc(c.id)}</code> on ${esc(c.targets.join(", "))} ${tag(c.basis)}</li>`)}
     <h3>Not codified (${s.unsupported.length})</h3>${list(s.unsupported, (u) => `<li>${esc(u.requirement)}: <span class="muted">${esc(u.reason)}</span></li>`)}
     <h3>Assumptions</h3>${list(s.assumptions, (a) => `<li>${esc(a)}</li>`)}
@@ -128,10 +130,14 @@ async function load() {
   if (!runId) return;
   remember(runId);
   const { run, openGates, approvals } = await api(`/runs/${runId}`);
-  if (run.status === "FAILED") {  // a failed run cannot be resumed: show why, offer no actions
+  if (run.status === "FAILED") {  // a failed run cannot be resumed: show why, and the scan report if validation produced one
+    const report = run.artifacts && run.artifacts.report
+      ? `<p><button class="secondary" data-dl="report">Validation report</button></p>` : "";
     $("run").innerHTML = `<div class="card"><b>${esc(run.customerId)}</b> · <span class="err">FAILED</span>
       <div class="err">${esc(run.error || "No error recorded.")}</div>
+      ${report}
       <div class="muted">This run failed and cannot be resumed. Start a new run.</div></div>`;
+    $("run").querySelectorAll("[data-dl]").forEach((b) => (b.onclick = () => download(runId, b.dataset.dl)));
     const { audit } = await api(`/runs/${runId}/audit`);
     $("audit").innerHTML = `<table><tr><th>Time</th><th>Actor</th><th>Action</th></tr>${audit.map((a) => `<tr><td>${new Date(a.ts * 1000).toLocaleString()}</td><td>${esc(a.actor)}</td><td>${esc(a.action)}</td></tr>`).join("")}</table>`;
     return;
@@ -157,7 +163,7 @@ async function load() {
       <p class="row"><button data-dl="terraform" ${delivered ? "" : "disabled"}>Download Terraform</button>
       <button data-dl="cloudformation" ${delivered ? "" : "disabled"}>Download CloudFormation</button>
       <button class="secondary" data-dl="report" ${run.artifacts && run.artifacts.report ? "" : "disabled"}>Validation report</button></p>
-      <div class="muted">${delivered ? "Both stacks passed validation." : "Available after approval and validation."}</div></div>`;
+      <div class="muted">${delivered ? "Both stacks passed validation. Each download includes the agent session and the code-scan reports." : "Available after approval and validation."}</div></div>`;
   $("run").querySelectorAll("[data-dl]").forEach((b) => (b.onclick = () => download(runId, b.dataset.dl)));
   $("run").querySelectorAll("[data-ap]").forEach((b) => (b.onclick = () => approve(runId)));
   if (diagramText) drawDiagram(diagramText);

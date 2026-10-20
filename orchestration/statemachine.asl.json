@@ -44,7 +44,9 @@
     "MarkDelivered": {
       "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {"FunctionName": "${PhaseStatusArn}", "Payload": {"runId.$": "$.runId", "status": "DELIVERED"}},
-      "ResultPath": null, "End": true
+      "ResultPath": null,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "MarkFailed", "ResultPath": "$.error"}],
+      "End": true
     },
     "MarkFailed": {
       "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",

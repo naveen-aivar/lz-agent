@@ -14,8 +14,8 @@ Procedure:
    including tables, appendices and footnotes, before deciding anything.
 2. Call get_catalog. You may only use SCP ids and control ids from it.
 3. Work through the SOW requirement by requirement and decide, for each, where it lands:
-   regions, logging, OUs, SCPs, Control Tower controls (how many controls, on which OUs), or `unsupported`.
-   Every requirement must end up somewhere; nothing is silently dropped.
+   regions, logging, OUs, catalog SCPs, custom SCPs, Control Tower controls (how many controls, on which OUs),
+   or `unsupported`. Every requirement must end up somewhere; nothing is silently dropped.
 4. Call save_scope with the JSON below. If it returns errors, fix them and call it again.
 
 Rules for the JSON:
@@ -35,8 +35,14 @@ Rules for the JSON:
 - Control targets are OU names only. Security and Sandbox are created by Control Tower: you may target them but not list them in "ous".
   SCP targets are "root" or OU names.
 - Account ids: copy only if the SOW states them; otherwise leave "" and add an openQuestion.
-- unsupported: SOW requirements that the catalogs cannot express (give the reason). Examples: custom SCPs, network design,
-  account vending, IAM Identity Center assignments, tagging policies.
+- Catalog SCP ids come only from get_catalog and go under "scps". When the SOW requires an SCP the catalog does not have,
+  author it under "customScps" (do not invent a catalog id, and do not drop it into unsupported). The document is a real
+  IAM policy: Version "2012-10-17", Statement list, Effect Allow or Deny, Action and Resource are strings or lists of
+  strings, Sid if present is alphanumeric, and there is no Principal. At most 5120 characters. id is a lowercase slug.
+  These files are delivered in a separate custom-scps/ folder and the
+  stacks do not attach them; a reviewer decides whether to attach them.
+- unsupported: SOW requirements that are not a region, OU, account, catalog control, catalog SCP, or a custom SCP.
+  Examples: network design, account vending, IAM Identity Center assignments, tagging policies. Give the reason.
 
 {{
  "schemaVersion": "1",
@@ -47,6 +53,9 @@ Rules for the JSON:
  "ous": [{{"name": "Workloads", "basis": "explicit", "source": "<quote>"}}],
  "accounts": [{{"name": "acme-prod", "ou": "Workloads", "kind": "workload", "provisioning": "account-factory", "purpose": "...", "basis": "explicit", "source": "<quote>"}}],
  "scps": [{{"id": "deny-root-user", "targets": ["Workloads"], "basis": "explicit", "source": "<quote>"}}],
+ "customScps": [{{"id": "deny-marketplace", "title": "Deny AWS Marketplace subscriptions", "targets": ["Workloads"],
+   "document": {{"Version": "2012-10-17", "Statement": [{{"Sid": "DenyMarketplace", "Effect": "Deny", "Action": ["aws-marketplace:Subscribe"], "Resource": "*"}}]}},
+   "basis": "explicit", "source": "<quote>"}}],
  "controls": [{{"id": "AWS-GR_RESTRICT_ROOT_USER", "targets": ["Workloads"], "basis": "explicit", "source": "<quote>"}}],
  "unsupported": [{{"requirement": "...", "reason": "...", "source": "<quote>"}}],
  "assumptions": ["..."],

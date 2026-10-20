@@ -227,6 +227,10 @@ Resources:
                 Action: ["s3:GetObject", "s3:PutObject"]
                 Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
               - Effect: Allow
+                Action: ["s3:ListBucket"]
+                Resource: !GetAtt ArtifactBucket.Arn
+                Condition: {StringLike: {"s3:prefix": ["runs/*"]}}
+              - Effect: Allow
                 Action: ["kms:Decrypt", "kms:GenerateDataKey"]
                 Resource: !GetAtt Key.Arn
               - Effect: Allow
@@ -455,7 +459,7 @@ Resources:
       Runtime: python3.12
       Handler: phase_status.handler
       Role: !GetAtt PhaseRole.Arn
-      Timeout: 15
+      Timeout: 60
       Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
       Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket}}
 

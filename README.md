@@ -8,9 +8,12 @@ Nothing in this repo deploys into a customer account. **Nothing here has been de
 ```
 UI upload -> S3 -> [1] extract text (Lambda, pypdf / python-docx)
   -> [2] agent extracts scope (AgentCore, Strands + Claude)   <- the only LLM step
+       session history is saved with the scope
   -> Gate A: human approves the exact scope (sha256 bound)
   -> [3] render Terraform + CloudFormation (Lambda, no LLM)
+       refuses a missing or incomplete session; custom SCPs go in custom-scps/
   -> [4] validate (CodeBuild: terraform fmt/validate, tflint, cfn-lint, checkov)
+       scan logs are packaged into both zip downloads
   -> DELIVERED: downloads enabled
 ```
 
@@ -20,7 +23,7 @@ UI upload -> S3 -> [1] extract text (Lambda, pypdf / python-docx)
 | Agent reads the whole SOW | `save_scope` refuses until every page was read (`agent/tools.py`); oversized or scanned input fails instead of truncating |
 | Agent does not invent requirements | every `explicit` item needs a verbatim quote that is searched for in the SOW (`lzcore/scope.py`) |
 | Regions to deny | derived in code: all regions - governed - extraAllowed. The agent cannot supply it |
-| Only known controls and SCPs | closed catalogs (`lzcore/catalog.py`). Anything else must go under `unsupported`, which is shown at review |
+| Only known controls and catalog SCPs | closed catalogs (`lzcore/catalog.py`). A policy the catalog cannot express is authored under `customScps` and written to `custom-scps/`, which the stacks do not attach. Anything else must go under `unsupported`, which is shown at review |
 | SCP limits | max 3 custom SCPs per target; 5120-char policy limit checked |
 | Same structure every time | the renderer writes a fixed file set; tests assert it. Static Terraform and CFN files are copied verbatim |
 | Approval is for exactly this scope | gate stores the scope sha256; render re-hashes and re-checks (`phase_render.py`); approver must differ from requester |
@@ -28,11 +31,14 @@ UI upload -> S3 -> [1] extract text (Lambda, pypdf / python-docx)
 ## Bundle layout (identical for every customer)
 ```
 terraform/        versions.tf providers.tf variables.tf prerequisites.tf landing_zone.tf organizations.tf scps.tf
-                  controls.tf outputs.tf  terraform.tfvars  policies/<scp>.json  docs/{SCOPE.md,scope.json}  README.md
+                  controls.tf outputs.tf  terraform.tfvars  policies/<scp>.json  docs/{SCOPE.md,ORG-STRUCTURE.md,scope.json}  README.md
 cloudformation/   00-prerequisites.yaml 01-landing-zone.yaml 02-governance.yaml
-                  parameters/{01-landing-zone,02-governance}.json  docs/{SCOPE.md,scope.json}  README.md
+                  parameters/{01-landing-zone,02-governance}.json  docs/{SCOPE.md,ORG-STRUCTURE.md,scope.json}  README.md
+custom-scps/      README.md  <id>.json          model-authored SCPs, not attached by either stack
+session/          history.json                 agent transcript and tool trace
+scans/            summary.json  <check>.log    added after validation, then zipped into both downloads
 ```
-Terraform is fully driven by `terraform.tfvars` and `policies/`. CloudFormation has no loops, so `02-governance.yaml` is generated in a fixed order. The other CloudFormation files are static.
+Terraform is fully driven by `terraform.tfvars` and `policies/`. CloudFormation has no loops, so `02-governance.yaml` is generated in a fixed order. The other CloudFormation files are static. `custom-scps/`, `session/`, and `scans/` are in both zip files.
 
 ## Repository map
 | Path | What it does |
@@ -44,6 +50,7 @@ Terraform is fully driven by `terraform.tfvars` and `policies/`. CloudFormation 
 | `buildspecs/` | CodeBuild validation (`validate.yml`, `validate.sh`) |
 | `infra/platform/platform.yaml` | the platform: Cognito, CloudFront+S3 (OAC), API Gateway, Lambdas, Step Functions, AgentCore runtime, CodeBuild, DynamoDB, KMS |
 | `ui/` | static SPA |
+| `eval/` | offline evaluation of scope, session, custom-SCP isolation, and scan packaging (`python -m eval`) |
 | `scripts/deploy.sh` | packages and deploys the platform (creates real resources) |
 
 ## What was verified, and what was not
@@ -64,7 +71,8 @@ The AWS Knowledge MCP needs authorizing in your claude.ai connector settings so 
 - The Control Tower API launch needs the Log Archive and Audit accounts to exist already. If the SOW does not give their ids, the scope is marked `needs-input` and the stacks refuse to apply until they are filled in.
 - Custom KMS keys must have a policy allowing Control Tower, CloudTrail and Config; the stacks do not create one.
 - A reviewer who disagrees with the scope cannot edit it. They start a new run with corrected input.
-- Custom SCPs, networking, account vending and Identity Center assignments are reported as `unsupported`, never silently dropped.
+- Networking, account vending and Identity Center assignments are reported as `unsupported`, never silently dropped.
+- Model-authored SCPs are delivered in `custom-scps/` for review. The stacks do not create or attach them.
 
 ## Deploy the platform (creates real resources; review first)
 ```
@@ -74,7 +82,14 @@ scripts/deploy.sh <code-bucket> <cognito-domain-prefix> <bedrock-model-id> v1   
 ```
 Create Cognito users and add them to `requesters` or `approvers` (the approver must be a different person from the requester).
 
+## Evaluation
+`python -m eval` scores a fixed suite of labeled extractions. Gold cases must validate, keep every explicit quote inside the SOW, derive the denied-region list, leave custom SCPs in `custom-scps/` only, include each SOW page in the session before `save_scope`, and carry the scan reports inside both bundles. Trap cases pass only when the checker reports the planted problem.
+
+`python -m eval run sow.txt scope.json session.json [scans-dir]` scores one saved agent run and does not compare it to a gold scope. It checks quote grounding, that the session stores every page, that denied regions were derived, that custom SCPs stayed in `custom-scps/`, and, when a scans directory is passed, that those reports package into both bundles.
+
 ## Tests
 ```
 python -m unittest discover -s orchestration/tests -v
+python -m eval
+python -m eval run sow.txt scope.json session.json
 ```

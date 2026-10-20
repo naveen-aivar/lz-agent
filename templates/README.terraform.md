@@ -14,15 +14,18 @@ and `policies/` change. See `docs/SCOPE.md` for exactly what was extracted from 
 | `scps.tf` | Service control policies from `policies/*.json` and their attachments |
 | `controls.tf` | Control Tower controls enabled on OUs |
 | `terraform.tfvars` | All customer-specific values |
-| `policies/` | One JSON file per SCP |
-| `docs/` | `SCOPE.md`, `scope.json` |
+| `policies/` | One JSON file per catalog SCP. These are the policies the stack attaches |
+| `custom-scps/` | Model-authored SCPs. This stack does not attach them |
+| `session/` | Agent session history for this run |
+| `scans/` | Code-scan reports (`summary.json` and the tool logs) |
+| `docs/` | `SCOPE.md`, `ORG-STRUCTURE.md`, `scope.json` |
 
 ## Before you apply
 1. Use credentials for the Organizations **management account**, in `{{HOME}}`.
 2. An AWS Organization must exist, with no existing Control Tower landing zone.
 3. The Log Archive and Audit accounts must already exist; set their ids in `terraform.tfvars` if blank.
 4. Add a remote backend (`backend "s3"` block) if you do not want local state.
-5. Review `docs/SCOPE.md` (open questions and unsupported requirements).
+5. Review `docs/SCOPE.md` (open questions, unsupported requirements, and any model-authored SCPs in `custom-scps/`).
 
 ## Apply
 ```

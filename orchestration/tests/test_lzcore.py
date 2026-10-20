@@ -165,8 +165,11 @@ class RenderTests(unittest.TestCase):
     def test_structure_is_fixed(self):
         tf = render.render_terraform(self.scope)
         cfn = render.render_cloudformation(self.scope)
-        self.assertEqual({f for f in tf if not f.startswith("policies/")}, render.TF_FIXED)
+        self.assertEqual(render.stable_names(tf), render.TF_FIXED)
+        self.assertEqual(render.stable_names(cfn), render.CFN_FIXED)
         self.assertEqual(set(cfn), render.CFN_FIXED)
+        self.assertIn("session/history.json", tf)
+        self.assertIn("custom-scps/README.md", cfn)
         self.assertEqual({f for f in tf if f.startswith("policies/")}, {"policies/deny-region.json", "policies/deny-root-user.json"})
 
     def test_structure_identical_for_different_customers(self):
@@ -176,7 +179,7 @@ class RenderTests(unittest.TestCase):
         other, errs = sc.validate(g, SOW)
         self.assertEqual(errs, [])
         a, b = render.render_terraform(self.scope), render.render_terraform(other)
-        self.assertEqual({k for k in a if not k.startswith("policies/")}, {k for k in b if not k.startswith("policies/")})
+        self.assertEqual(render.stable_names(a), render.stable_names(b))
         for f in render.TF_STATIC:  # static files byte-identical
             self.assertEqual(a[f], b[f])
 
@@ -204,7 +207,7 @@ class RenderTests(unittest.TestCase):
         tfvars = render.render_terraform(s)["terraform.tfvars"]
         self.assertIn('"Shared"    = { parent = "Workloads" }', tfvars)
         self.assertIn('"Workloads" = {}', tfvars)
-        self.assertEqual(set(render.render_terraform(s)) - {f for f in render.render_terraform(s) if f.startswith("policies/")}, render.TF_FIXED)
+        self.assertEqual(render.stable_names(render.render_terraform(s)), render.TF_FIXED)
 
     def test_org_diagram_shows_tree_and_who_creates_what(self):
         g = ScopeTests._with_accounts(ScopeTests())
@@ -241,6 +244,75 @@ class RenderTests(unittest.TestCase):
     def test_tfvars_has_no_template_leftovers(self):
         for fmt in (render.render_terraform(self.scope), render.render_cloudformation(self.scope)):
             self.assertNotIn("{{", fmt["README.md"])
+
+    def _with_custom(self):
+        g = good()
+        g["customScps"] = [{
+            "id": "deny-marketplace", "title": "Deny AWS Marketplace subscriptions", "targets": ["Workloads"],
+            "document": {"Version": "2012-10-17", "Statement": [
+                {"Sid": "DenyMarketplace", "Effect": "Deny", "Action": ["aws-marketplace:Subscribe"], "Resource": "*"}]},
+            "basis": "explicit", "source": "Block root user usage",
+        }]
+        # The shared SOW does not mention Marketplace; use a quote that is actually in it.
+        return g
+
+    def test_custom_scp_is_isolated_from_the_stacks(self):
+        s, errs = sc.validate(self._with_custom(), SOW)
+        self.assertEqual(errs, [])
+        tf, cfn = render.render_terraform(s), render.render_cloudformation(s)
+        self.assertIn("aws-marketplace:Subscribe", tf["custom-scps/deny-marketplace.json"])
+        self.assertIn("aws-marketplace:Subscribe", cfn["custom-scps/deny-marketplace.json"])
+        self.assertNotIn("policies/deny-marketplace.json", tf)
+        self.assertNotIn('"deny-marketplace"', tf["terraform.tfvars"])
+        self.assertNotIn("deny-marketplace", cfn["02-governance.yaml"])
+        self.assertIn("custom-scps/", render.render_terraform(s)["docs/ORG-STRUCTURE.md"])
+        self.assertEqual(render.stable_names(tf), render.TF_FIXED)
+        self.assertIn("- `deny-marketplace` Deny AWS Marketplace subscriptions", sc.scope_markdown(s))
+
+    def test_custom_scp_rejected_when_it_is_not_a_policy(self):
+        g = self._with_custom()
+        g["customScps"][0]["id"] = "deny-root-user"
+        _, errs = sc.validate(g, SOW)
+        self.assertTrue(any("catalog SCP" in e for e in errs), errs)
+        g = self._with_custom()
+        g["customScps"][0]["document"] = {"Version": "2012-10-17", "Statement": [{"Effect": "Sometimes", "Action": "*", "Resource": "*"}]}
+        _, errs = sc.validate(g, SOW)
+        self.assertTrue(any("Effect must be Allow or Deny" in e for e in errs), errs)
+        g = self._with_custom()
+        g["customScps"][0]["source"] = "a quote the SOW never says"
+        _, errs = sc.validate(g, SOW)
+        self.assertTrue(any("quote not found" in e for e in errs), errs)
+
+    def test_custom_scp_over_the_attach_quota_warns_and_still_validates(self):
+        g = self._with_custom()
+        g["scps"] = [
+            {"id": "deny-root-user", "targets": ["Workloads"], "basis": "explicit", "source": "Block root user usage"},
+            {"id": "deny-leave-org", "targets": ["Workloads"], "basis": "default"},
+            {"id": "deny-iam-users", "targets": ["Workloads"], "basis": "default"},
+        ]
+        s, errs = sc.validate(g, SOW)
+        self.assertEqual(errs, [])
+        self.assertTrue(any("model-authored" in w for w in s["warnings"]), s["warnings"])
+        self.assertIn("## Warnings", sc.scope_markdown(s))
+
+    def test_custom_scp_document_must_be_attachable_later(self):
+        g = self._with_custom()
+        g["customScps"][0]["document"] = {"Version": "2012-10-17", "Statement": [{
+            "Sid": "has space", "Effect": "Deny", "Action": {"bad": True}, "Resource": "*", "Principal": "*",
+        }]}
+        _, errs = sc.validate(g, SOW)
+        self.assertTrue(any("cannot set Principal" in e for e in errs), errs)
+        self.assertTrue(any("Action must be a string" in e for e in errs), errs)
+        self.assertTrue(any("Sid must be alphanumeric" in e for e in errs), errs)
+
+    def test_scans_are_added_beside_the_code(self):
+        scans = {"summary.json": '{"overall": "pass", "checks": [{"name": "tf-fmt", "result": "pass", "log": "scans/tf-fmt.log"}]}',
+                 "tf-fmt.log": "ok\n"}
+        merged = render.with_scans(render.render_terraform(self.scope), scans)
+        self.assertIn("scans/summary.json", merged)
+        self.assertIn("scans/tf-fmt.log", merged)
+        self.assertIn("versions.tf", merged)
+        self.assertEqual(render.stable_names(merged), render.TF_FIXED)
 
 
 if __name__ == "__main__":

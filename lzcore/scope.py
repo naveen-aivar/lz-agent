@@ -3,9 +3,11 @@
 The agent proposes a scope; this module decides whether it is acceptable. It never trusts the agent for:
   * the denied-region list (derived: all regions - governed - extraAllowed)
   * whether a quoted 'explicit' requirement really appears in the SOW (quote must be found in the SOW text)
-  * which SCPs / controls exist (closed catalogs)
+  * which catalog SCPs / controls exist (closed catalogs)
+  * custom SCP documents: accepted only under customScps, size-limited, and never attached by the stacks
 """
 import copy
+import json
 import re
 
 from .catalog import CONTROL_CATALOG, CT_MANAGED_OUS, MAX_CUSTOM_SCPS_PER_TARGET, SCP_CATALOG, SCP_MAX_CHARS, cid, scp_json
@@ -17,6 +19,9 @@ REQUIRED_EVIDENCE = ("regions.home", "regions.governed", "logging.retentionDays"
 ACCOUNT_RE = re.compile(r"^\d{12}$")
 OU_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$")
 ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
+CUSTOM_SCP_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,40}$")
+SCP_SID_RE = re.compile(r"^[A-Za-z0-9]+$")
+_SCP_STMT_KEYS = {"Sid", "Effect", "Action", "NotAction", "Resource", "NotResource", "Condition"}
 ACCOUNT_KINDS = ("management", "log-archive", "audit", "workload", "other")
 PROVISIONING = ("existing", "control-tower", "account-factory", "manual")
 PAGE_CHARS = 30000
@@ -228,7 +233,7 @@ def validate(scope, sow_text=None):
             continue
         pid = p.get("id")
         if pid not in SCP_CATALOG:
-            err(f"scps[{i}].id {pid!r} is not in the SCP catalog; put it under 'unsupported'")
+            err(f"scps[{i}].id {pid!r} is not in the SCP catalog; author it under customScps, or put a non-SCP requirement under 'unsupported'")
             continue
         if pid in ids:
             err(f"duplicate SCP {pid!r}")
@@ -248,13 +253,71 @@ def validate(scope, sow_text=None):
     if not enforce and "deny-region" in ids:
         err("scps contains deny-region but regions.enforceDeny is false")
     scps.sort(key=lambda p: str(p.get("id", "")))
-    per_target = {}
-    for p in scps:
-        for t in p.get("targets", []):
-            per_target[t] = per_target.get(t, 0) + 1
-    for t, n in per_target.items():
+
+    # Model-authored SCPs. Validated here, rendered only under custom-scps/, never attached by the stacks.
+    custom = _list(s, "customScps", errors, "customScps")
+    custom_ids = []
+    for i, p in enumerate(custom):
+        if not isinstance(p, dict):
+            err(f"customScps[{i}] must be an object")
+            continue
+        pid = str(p.get("id", "")).strip()
+        p["id"] = pid
+        label = f"customScps[{i}] ({pid or '?'})"
+        if not CUSTOM_SCP_ID_RE.match(pid):
+            err(f"{label}.id must be a slug (lowercase, digits, hyphens, <= 41 chars)")
+        elif pid in SCP_CATALOG:
+            err(f"{label}.id is a catalog SCP; put catalog policies under scps")
+        elif pid in custom_ids:
+            err(f"duplicate custom SCP {pid!r}")
+        else:
+            custom_ids.append(pid)
+        title = str(p.get("title", "")).strip()
+        p["title"] = title
+        if not title or len(title) > 80:
+            err(f"{label}.title is required (1-80 chars)")
+        t = p.get("targets")
+        if not isinstance(t, list) or not t:
+            err(f"{label}.targets must be a non-empty list")
+            t = []
+        for x in t:
+            if x != "root" and x not in ou_targets:
+                err(f"{label}: unknown target {x!r} (use 'root' or an OU name)")
+        p["targets"] = sorted(set(map(str, t)))
+        _scp_document(p.get("document"), label, errors)
+        if isinstance(p.get("document"), dict) and isinstance(p["document"].get("Statement"), dict):
+            p["document"]["Statement"] = [p["document"]["Statement"]]
+        if isinstance(p.get("document"), dict):
+            compact = json.dumps(p["document"], separators=(",", ":"))
+            if len(compact) > SCP_MAX_CHARS:
+                err(f"{label} document exceeds {SCP_MAX_CHARS} characters")
+        evidence(label, p.get("basis"), p.get("source"))
+    custom[:] = [p for p in custom if isinstance(p, dict)]
+    custom.sort(key=lambda p: str(p.get("id", "")))
+
+    # Catalog policies are attached by the stacks, so they alone must fit the Organizations quota.
+    # Model-authored policies are not attached; crossing the quota with them is a warning, not a rejection.
+    def _tally(policies):
+        counts = {}
+        for p in policies:
+            if not isinstance(p, dict):
+                continue
+            for t in p.get("targets", []):
+                counts[t] = counts.get(t, 0) + 1
+        return counts
+
+    catalog_counts, custom_counts = _tally(scps), _tally(custom)
+    for t, n in catalog_counts.items():
         if n > MAX_CUSTOM_SCPS_PER_TARGET:
-            err(f"target {t!r} has {n} SCPs; the maximum is {MAX_CUSTOM_SCPS_PER_TARGET} (AWS limit of 5 includes FullAWSAccess and Control Tower's)")
+            err(f"target {t!r} has {n} catalog SCPs; the maximum is {MAX_CUSTOM_SCPS_PER_TARGET} (AWS limit of 5 includes FullAWSAccess and Control Tower's)")
+    warnings = []
+    for t, n in custom_counts.items():
+        attached = catalog_counts.get(t, 0)
+        if attached + n > MAX_CUSTOM_SCPS_PER_TARGET:
+            warnings.append(
+                f"target {t!r} has {n} model-authored SCP(s) and {attached} catalog SCP(s). "
+                f"The stacks attach only the catalog policies. Attaching the model-authored files as well "
+                f"would exceed {MAX_CUSTOM_SCPS_PER_TARGET} custom SCPs on that target.")
     if not errors:
         for p in scps:
             if len(scp_json(p["id"], s)) > SCP_MAX_CHARS:
@@ -298,11 +361,61 @@ def validate(scope, sow_text=None):
     missing = [k for k in ("logArchiveAccountId", "auditAccountId") if not lg.get(k)]
     s["status"] = "needs-input" if (missing or s["openQuestions"]) else "complete"
     s["missingRequired"] = missing
-    s["summary"] = {"ous": len(ous), "accounts": len(accounts), "scps": len(scps), "controls": len(controls),
+    s["warnings"] = warnings
+    s["summary"] = {"ous": len(ous), "accounts": len(accounts), "scps": len(scps), "customScps": len(custom),
+                    "controls": len(controls),
                     "controlAttachments": sum(len(c.get("targets", [])) for c in controls),
                     "governedRegions": len(r["governed"]), "deniedRegions": len(r["denied"]),
-                    "unsupported": len(un), "openQuestions": len(s["openQuestions"])}
+                    "unsupported": len(un), "openQuestions": len(s["openQuestions"]), "warnings": len(warnings)}
     return s, errors
+
+
+def _str_or_strs(value):
+    if isinstance(value, str):
+        return bool(value)
+    return isinstance(value, list) and len(value) > 0 and all(isinstance(x, str) and x for x in value)
+
+
+def _scp_document(doc, label, errors):
+    """A model-authored SCP must be an IAM policy document. Returns nothing; appends to errors."""
+    if not isinstance(doc, dict):
+        errors.append(f"{label}.document must be an IAM policy object")
+        return
+    if doc.get("Version") != "2012-10-17":
+        errors.append(f"{label}.document.Version must be '2012-10-17'")
+    extra = set(doc) - {"Version", "Id", "Statement"}
+    if extra:
+        errors.append(f"{label}.document has unsupported keys {sorted(extra)}")
+    stmts = doc.get("Statement")
+    if isinstance(stmts, dict):
+        stmts = [stmts]
+    if not isinstance(stmts, list) or not stmts:
+        errors.append(f"{label}.document.Statement must be a non-empty list")
+        return
+    for i, st in enumerate(stmts):
+        where = f"{label}.document.Statement[{i}]"
+        if not isinstance(st, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        unknown = set(st) - _SCP_STMT_KEYS
+        if "Principal" in st or "NotPrincipal" in st:
+            errors.append(f"{where}: SCPs cannot set Principal")
+            unknown -= {"Principal", "NotPrincipal"}
+        if unknown:
+            errors.append(f"{where} has unsupported keys {sorted(unknown)}")
+        if st.get("Effect") not in ("Allow", "Deny"):
+            errors.append(f"{where}.Effect must be Allow or Deny")
+        if "Action" not in st and "NotAction" not in st:
+            errors.append(f"{where} needs Action or NotAction")
+        for key in ("Action", "NotAction", "Resource", "NotResource"):
+            if key in st and not _str_or_strs(st[key]):
+                errors.append(f"{where}.{key} must be a string or a list of strings")
+        if "Resource" not in st and "NotResource" not in st:
+            errors.append(f"{where} needs Resource or NotResource")
+        if "Sid" in st and not (isinstance(st["Sid"], str) and SCP_SID_RE.match(st["Sid"])):
+            errors.append(f"{where}.Sid must be alphanumeric")
+        if "Condition" in st and not isinstance(st["Condition"], dict):
+            errors.append(f"{where}.Condition must be an object")
 
 
 def scope_markdown(s):
@@ -320,12 +433,16 @@ def scope_markdown(s):
     L += [f"- {o['name']}{' (under ' + o['parent'] + ')' if o.get('parent') else ''} [{o['basis']}]" for o in s["ous"]] or ["- none"]
     L += ["", "## Accounts (for context: the stacks do not create or move accounts)"]
     L += [f"- {a['name']}: {a['kind']}, {a['provisioning']}, in {a['ou']} [{a['basis']}]" for a in s.get("accounts", [])] or ["- none"]
-    L += ["", "## Service control policies"]
+    L += ["", "## Service control policies (applied by the stacks)"]
     L += [f"- `{p['id']}` -> {', '.join(p['targets'])} [{p['basis']}]" for p in s["scps"]] or ["- none"]
+    L += ["", "## Custom SCPs (model-authored, delivered in custom-scps/, not applied by the stacks)"]
+    L += [f"- `{p['id']}` {p.get('title', '')} -> {', '.join(p['targets'])} [{p['basis']}]" for p in s.get("customScps", [])] or ["- none"]
     L += ["", "## Control Tower controls"]
     L += [f"- `{c['id']}` -> {', '.join(c['targets'])} [{c['basis']}]" for c in s["controls"]] or ["- none"]
     L += ["", "## Not codified (requires other tooling or a decision)"]
     L += [f"- {u['requirement']}: {u['reason']}" for u in s["unsupported"]] or ["- none"]
     L += ["", "## Assumptions"] + ([f"- {a}" for a in s["assumptions"]] or ["- none"])
     L += ["", "## Open questions"] + ([f"- {q}" for q in s["openQuestions"]] or ["- none"])
+    if s.get("warnings"):
+        L += ["", "## Warnings"] + [f"- {w}" for w in s["warnings"]]
     return "\n".join(L) + "\n"

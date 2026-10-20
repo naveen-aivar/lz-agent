@@ -11,7 +11,10 @@ what was not codified.
 | `01-landing-zone.yaml` | The Control Tower landing zone |
 | `02-governance.yaml` | Custom OUs, SCPs and controls (generated) |
 | `parameters/01-landing-zone.json`, `parameters/02-governance.json` | Parameter values |
-| `docs/` | `SCOPE.md`, `scope.json` |
+| `custom-scps/` | Model-authored SCPs. This stack does not attach them |
+| `session/` | Agent session history for this run |
+| `scans/` | Code-scan reports (`summary.json` and the tool logs) |
+| `docs/` | `SCOPE.md`, `ORG-STRUCTURE.md`, `scope.json` |
 
 ## Before you deploy
 1. Use credentials for the Organizations **management account**, in `{{HOME}}`.

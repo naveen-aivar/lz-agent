@@ -3,6 +3,9 @@
 Fixed layouts (EXPECTED_*), so every customer gets the same folder and file structure:
   terraform/       static .tf files copied verbatim from templates/terraform + terraform.tfvars + policies/<scp>.json
   cloudformation/  00-prerequisites.yaml, 01-landing-zone.yaml (static) + 02-governance.yaml (generated) + parameters/
+  custom-scps/     model-authored SCP JSON. Not referenced by the stacks.
+  session/         agent session history
+  scans/           added after validation (see with_scans); not part of the fixed render
 """
 import io
 import json
@@ -18,9 +21,21 @@ TEMPLATES = Path(os.environ.get("TEMPLATES_DIR", Path(__file__).resolve().parent
 TF_STATIC = ("versions.tf", "providers.tf", "variables.tf", "prerequisites.tf", "landing_zone.tf",
              "organizations.tf", "scps.tf", "controls.tf", "outputs.tf")
 CFN_STATIC = ("00-prerequisites.yaml", "01-landing-zone.yaml")
-TF_FIXED = set(TF_STATIC) | {"README.md", "terraform.tfvars", "docs/SCOPE.md", "docs/ORG-STRUCTURE.md", "docs/scope.json"}
+_EXTRAS = {"custom-scps/README.md", "session/history.json"}
+TF_FIXED = set(TF_STATIC) | {"README.md", "terraform.tfvars", "docs/SCOPE.md", "docs/ORG-STRUCTURE.md", "docs/scope.json"} | _EXTRAS
 CFN_FIXED = set(CFN_STATIC) | {"README.md", "02-governance.yaml", "parameters/01-landing-zone.json",
-                               "parameters/02-governance.json", "docs/SCOPE.md", "docs/ORG-STRUCTURE.md", "docs/scope.json"}
+                               "parameters/02-governance.json", "docs/SCOPE.md", "docs/ORG-STRUCTURE.md", "docs/scope.json"} | _EXTRAS
+
+CUSTOM_SCP_README = """# Custom SCPs (model-authored)
+
+These policies were written by the model from the SOW and approved with the scope.
+The Terraform and CloudFormation stacks do not create or attach them.
+Catalog policies in `policies/` (Terraform) and in `02-governance.yaml` (CloudFormation) are the ones those stacks apply.
+
+Review each JSON file in this folder before you attach it yourself with AWS Organizations.
+"""
+
+_NOT_RECORDED = {"status": "not-recorded"}
 
 
 # ---------- helpers ----------
@@ -44,8 +59,33 @@ def _docs(scope):
             "docs/scope.json": json.dumps(scope, indent=2, sort_keys=True) + "\n"}
 
 
+def _extras(scope, session):
+    """Files that ride along with both stacks: model SCPs (separate folder) and the agent session."""
+    files = {"custom-scps/README.md": CUSTOM_SCP_README}
+    for p in scope.get("customScps", []):
+        files[f"custom-scps/{p['id']}.json"] = json.dumps(p["document"], indent=2) + "\n"
+    body = session if isinstance(session, dict) else _NOT_RECORDED
+    files["session/history.json"] = json.dumps(body, indent=2, sort_keys=True) + "\n"
+    return files
+
+
+def stable_names(files):
+    """Names present for every customer. Catalog policy JSON, custom SCP JSON, and scan logs vary."""
+    return {f for f in files if not f.startswith(("policies/", "scans/")) and not (f.startswith("custom-scps/") and f.endswith(".json"))}
+
+
+def with_scans(files, scans):
+    """Copy code-scan reports into the bundle under scans/. `scans` keys are file names, not a scans/ prefix."""
+    out = dict(files)
+    for name, content in scans.items():
+        if not name or name.startswith(("/", "\\")) or ".." in name.split("/"):
+            raise ValueError(f"invalid scan path {name!r}")
+        out[f"scans/{name}"] = content if isinstance(content, str) else content.decode("utf-8", "replace")
+    return out
+
+
 # ---------- terraform ----------
-def render_terraform(scope):
+def render_terraform(scope, session=None):
     r, lg = scope["regions"], scope["logging"]
     files = {f: (TEMPLATES / "terraform" / f).read_text() for f in TF_STATIC}
     files["README.md"] = _readme("README.terraform.md", scope)
@@ -75,6 +115,7 @@ def render_terraform(scope):
     for p in scope["scps"]:
         files[f"policies/{p['id']}.json"] = scp_json(p["id"], scope, pretty=True)
     files.update(_docs(scope))
+    files.update(_extras(scope, session))
     return files
 
 
@@ -83,7 +124,7 @@ def _param_file(pairs):
     return json.dumps([{"ParameterKey": k, "ParameterValue": str(v)} for k, v in pairs], indent=2) + "\n"
 
 
-def render_cloudformation(scope):
+def render_cloudformation(scope, session=None):
     r, lg = scope["regions"], scope["logging"]
     files = {f: (TEMPLATES / "cloudformation" / f).read_text() for f in CFN_STATIC}
     files["README.md"] = _readme("README.cloudformation.md", scope)
@@ -162,6 +203,7 @@ def render_cloudformation(scope):
         L += ["  NothingToDeploy:", "    Type: AWS::CloudFormation::WaitConditionHandle"]
     files["02-governance.yaml"] = "\n".join(L) + "\n"
     files.update(_docs(scope))
+    files.update(_extras(scope, session))
     return files
 
 
@@ -177,5 +219,5 @@ def zip_bytes(files, root):
     return buf.getvalue()
 
 
-def render_all(scope):
-    return {"terraform": render_terraform(scope), "cloudformation": render_cloudformation(scope)}
+def render_all(scope, session=None):
+    return {"terraform": render_terraform(scope, session), "cloudformation": render_cloudformation(scope, session)}

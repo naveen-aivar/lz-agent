@@ -1,5 +1,7 @@
 version: 0.2
-# Env: RUN_ID, ARTIFACT_BUCKET. Validates runs/$RUN_ID/bundle-src/{terraform,cloudformation} and writes validation-report.json.
+# Env: RUN_ID, ARTIFACT_BUCKET. Validates runs/$RUN_ID/bundle-src/{terraform,cloudformation}
+# and writes the scan logs under runs/$RUN_ID/scans/ plus validation-report.json.
+# The status Lambda then packages scans/ into both zip artifacts.
 # A failing check fails the build, which fails the run (stacks are then not downloadable).
 phases:
   install:

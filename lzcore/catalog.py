@@ -1,5 +1,7 @@
-"""Closed catalogs. The agent can only choose from these ids; it cannot author SCP JSON or invent control ids.
-Anything in a SOW that is not in a catalog must be reported under scope.unsupported (never silently dropped).
+"""Closed catalogs. The agent can only choose these control ids and these catalog SCP ids.
+A SOW requirement that is an SCP but not in the catalog is authored under scope.customScps (validated,
+rendered to custom-scps/, and not attached by the stacks). Anything else goes under scope.unsupported
+and is never silently dropped.
 
 UNVERIFIED: control ids and guidance levels were written from memory of the Control Tower catalog and have not been
 checked against the current catalog (the AWS Knowledge MCP was not available when this was written).
@@ -124,5 +126,15 @@ def catalog_for_agent():
         "scps": {k: {"title": v["title"], **({"note": v["note"]} if "note" in v else {})} for k, v in SCP_CATALOG.items()},
         "controls": {k: {"kind": v[0], "guidance": v[1], "title": v[2]} for k, v in CONTROL_CATALOG.items()},
         "controlTowerManagedOus": list(CT_MANAGED_OUS),
-        "limits": {"maxCustomScpsPerTarget": MAX_CUSTOM_SCPS_PER_TARGET},
+        "limits": {"maxCustomScpsPerTarget": MAX_CUSTOM_SCPS_PER_TARGET, "scpMaxChars": SCP_MAX_CHARS},
+        "customScpAuthoring": {
+            "folder": "custom-scps/",
+            "appliedByStacks": False,
+            "rules": "When the catalog has no matching SCP, author the policy under customScps: "
+                     "id is a lowercase slug not in this catalog, document is an IAM policy "
+                     "(Version 2012-10-17) of at most scpMaxChars characters. "
+                     "Action and Resource are strings or lists of strings, Sid is alphanumeric, and Principal is not allowed. "
+                     "The stacks do not attach these files. They do not count against the per-target attach quota; "
+                     "a warning is raised when attaching them as well would exceed it.",
+        },
     }

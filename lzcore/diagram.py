@@ -81,6 +81,10 @@ def org_markdown(scope):
     note = ""
     if scope.get("missingRequired"):
         note = f"\n> Not ready to apply: missing {', '.join(scope['missingRequired'])}.\n"
+    custom = scope.get("customScps") or []
+    if custom:
+        ids = ", ".join(p["id"] for p in custom)
+        note += f"\nModel-authored SCPs are not attached by these stacks and are not drawn here. They are in `custom-scps/`: {ids}.\n"
     return (f"# Organization structure: {scope['customer']['orgName']}\n{note}\n"
             "Generated from the approved scope (`docs/scope.json`). The stacks create only the OUs marked `stack`; "
             "accounts are shown for context.\n\n"
