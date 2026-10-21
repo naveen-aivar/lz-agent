@@ -72,7 +72,7 @@ def _list(sub):
         kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
     runs.sort(key=lambda r: r["createdAt"], reverse=True)
     keep = ("runId", "customerId", "status", "createdAt")
-    return _resp(200, {"runs": [{**{k: r.get(k) for k in keep}, "error": str(r.get("error", ""))[:200]} for r in runs[:25]]})
+    return _resp(200, {"runs": [{**{k: r.get(k) for k in keep}, "error": str(r.get("error", ""))[:200]} for r in runs]})
 
 
 def _start(run_id, sub):

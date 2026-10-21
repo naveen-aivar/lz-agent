@@ -117,6 +117,8 @@ td.name { font-weight:700; } td.num, th.num { text-align:right; font-variant-num
 .items { list-style:none; display:grid; } .items li { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; padding:7px 0; border-bottom:1px solid var(--border); font-size:13px; } .items li:last-child { border-bottom:0; }
 .items .main { font-weight:600; } .items .meta { color:var(--dim); } .items .block { display:block; }
 .bullets { padding-left:18px; display:grid; gap:6px; font-size:13px; color:var(--ink); }
+.quote { color:var(--dim); font-size:12px; line-height:1.45; margin-top:6px; border-left:2px solid var(--border); padding:1px 0 1px 8px; overflow-wrap:anywhere; }
+.notice ul { margin:8px 0 0; padding-left:18px; display:grid; gap:4px; color:inherit; }
 .sec { padding:16px 0; border-top:1px solid var(--border); } .sec:first-child { border-top:0; padding-top:0; }
 .sec h3 { font-size:13px; font-weight:700; margin-bottom:8px; display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; } .sec h3 small { color:var(--faint); font-weight:500; font-size:12px; }
 .empty { color:var(--faint); text-align:center; padding:36px 20px; }
@@ -177,7 +179,7 @@ dialog.full .body { height:calc(92vh - 58px); overflow:auto; padding:24px; text-
     <div class="brand-logo" style="font-size:22px">IN<span>GRAM</span></div>
     <div id="gateNotice" class="notice notice-warn" style="margin:0" hidden></div>
     <h1>Landing Zone Agent</h1>
-    <p>Turn a customer's statement of work into AWS landing zone code. The agent reads the whole SOW, draws the organization it describes, and generates Terraform and CloudFormation with a security scan attached.</p>
+    <p>Turn a customer's statement of work into AWS landing zone code. The agent reads it one page at a time, draws the organization it describes, and generates Terraform and CloudFormation with a security scan attached.</p>
     <ul>
       <li><b>✓</b><span>Every requirement is traced to a quote in the SOW, or listed as not covered.</span></li>
       <li><b>✓</b><span>Terraform and CloudFormation that match, validated before you can download them.</span></li>

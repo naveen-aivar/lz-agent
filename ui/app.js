@@ -118,7 +118,7 @@ function viewDashboard() {
   const rate = del + bad ? `${((del / (del + bad)) * 100).toFixed(1)}%` : "–";
   layout("dashboard", "Dashboard", `
     <div class="page-title">Landing Zone</div>
-    <p class="page-sub">Turn a customer's statement of work into landing zone code. The agent reads the whole SOW, draws the AWS organization it describes, and generates Terraform and CloudFormation with a security scan attached.</p>
+    <p class="page-sub">Turn a customer's statement of work into landing zone code. The agent reads it one page at a time, draws the AWS organization it describes, and generates Terraform and CloudFormation with a security scan attached.</p>
     <div class="grid-kpi">${kpi("Runs (30 days)", recent.length, `${del} delivered · ${bad} failed`)}${kpi("Success rate", rate, "of finished runs", del + bad ? "green" : "")}
       ${kpi("In progress", run, run ? "Generating now" : "Nothing running", run ? "amber" : "")}${kpi("Failed", bad, bad ? "Open a run to see why" : "No failures", bad ? "red" : "")}</div>
     <div class="two">
@@ -223,17 +223,56 @@ async function openRun(id, { silent = false } = {}) {
   }
 }
 
+function auditDetail(a) {
+  const d = a && a.detail;
+  if (d && typeof d === "object") return d;
+  if (typeof d === "string" && d) { try { return JSON.parse(d); } catch { return {}; } }
+  return {};
+}
+function pageProgress(audit) {
+  let page = 0, total = 0;
+  for (const a of audit || []) {
+    if (a.action !== "intake.page_saved") continue;
+    const d = auditDetail(a);
+    const n = Number(d.page), of = Number(d.of);
+    if (n > page) page = n;
+    if (of) total = of;
+  }
+  return page ? { page, total: total || page } : null;
+}
 function stepsHtml(run, audit) {
   const has = (a) => audit.some((x) => x.action === a);
+  const prog = pageProgress(audit);
+  const understand = prog ? (prog.page < prog.total ? `Page ${prog.page} of ${prog.total} saved` : "Assembling the scope") : "Map every requirement";
   const done = [has("sow.extracted"), has("phase.completed"), has("bundle.rendered"), run.status === "DELIVERED"];
-  const steps = [["Read the SOW", "Extract the text"], ["Understand the scope", "Map every requirement"], ["Generate the code", "Terraform and CloudFormation"], ["Validate and scan", "Lint and security scan"]];
+  const steps = [["Read the SOW", "Extract the text"], ["Understand the scope", understand], ["Generate the code", "Terraform and CloudFormation"], ["Validate and scan", "Lint and security scan"]];
   const next = done.indexOf(false), failed = run.status === "FAILED";
   return `<div class="steps">${steps.map(([name, sub], i) => {
     const state = done[i] ? "done" : i === next ? (failed ? "failed" : run.status === "AWAITING_INPUT" ? "" : "active") : "";
+    const active = i === 1 && prog ? understand : "In progress";
     return `<div class="step ${state}"><div class="step-rail"><span class="step-node"></span><span class="step-line"></span></div>
-      <div class="step-body"><div class="step-name">${esc(name)}</div><div class="step-sub">${esc(done[i] ? "Done" : state === "failed" ? "Stopped here" : state === "active" ? "In progress" : sub)}</div></div>
+      <div class="step-body"><div class="step-name">${esc(name)}</div><div class="step-sub">${esc(done[i] ? "Done" : state === "failed" ? "Stopped here" : state === "active" ? active : sub)}</div></div>
       <span class="step-check">${done[i] ? "✓" : state === "failed" ? "✕" : ""}</span></div>`;
   }).join("")}</div>`;
+}
+function readingCard(audit) {
+  const prog = pageProgress(audit);
+  const extracted = (audit || []).some((x) => x.action === "sow.extracted");
+  let title, sub;
+  if (prog && prog.page < prog.total) {
+    title = `Page ${prog.page} of ${prog.total} saved`;
+    sub = "Each page is saved before the next one is read. You can leave this page: the run continues and stays under Runs.";
+  } else if (prog) {
+    title = `All ${prog.total} pages saved`;
+    sub = "The scope is being assembled from those pages. You can leave this page: the run continues and stays under Runs.";
+  } else if (extracted) {
+    title = "Reading the statement of work, one page at a time";
+    sub = "The text is extracted. The first page has not been saved yet. You can leave this page: the run continues and stays under Runs.";
+  } else {
+    title = "Extracting the statement of work";
+    sub = "This usually takes a few minutes. You can leave this page: the run continues and stays under Runs.";
+  }
+  return `<div class="card"><div class="card-head"><h2><span class="spin" aria-hidden="true"></span> ${esc(title)}</h2></div><p class="meta" style="color:var(--dim)">${esc(sub)}</p></div>`;
 }
 
 function renderRun() {
@@ -248,15 +287,16 @@ function renderRun() {
   const s = scope && scope.summary;
   const kpis = s ? `<div class="grid-kpi">${kpi("OUs", s.ous)}${kpi("Accounts", s.accounts)}${kpi("Controls enabled", s.controlAttachments)}${kpi("Catalog SCPs", s.scps)}${kpi("Custom SCPs", s.customScps || 0, "for review", s.customScps ? "amber" : "")}</div>` : "";
   const failure = run.status === "FAILED" ? `<div class="notice notice-err" role="alert"><strong>This run failed.</strong> ${esc(run.error || "No reason was recorded.")}<br>A failed run can't be resumed. <a href="#/dashboard">Start a new run</a>, or open the Activity tab to see where it stopped.</div>` : "";
-  const body = !scope && !isDone(run)
-    ? `<div class="card"><div class="card-head"><h2><span class="spin"></span> The agent is reading the SOW</h2></div><p class="meta" style="color:var(--dim)">This usually takes a few minutes. You can leave this page: the run continues and stays under Runs.</p></div>`
-    : `<div class="panel panel-pad"><div class="tabs" role="tablist" aria-label="Run details">${tabs.map(([id, label, n]) =>
+  const notes = (scope && scope.reviewNotes) || [];
+  const review = notes.length ? `<div class="notice notice-warn"><strong>${esc(plural(notes.length, "review note"))}.</strong> These checks are on the saved scope. <button class="btn-link" type="button" data-tab="scope">Read them</button></div>` : "";
+  const waiting = !scope && !isDone(run) ? readingCard(audit) : "";
+  const body = `<div class="panel panel-pad"><div class="tabs" role="tablist" aria-label="Run details">${tabs.map(([id, label, n]) =>
         `<button class="tab" role="tab" id="tab-${id}" aria-selected="${S.tab === id}" aria-controls="panel-${id}" data-tab="${id}" tabindex="${S.tab === id ? 0 : -1}">${esc(label)}${n ? `<span class="count">${n}</span>` : ""}</button>`).join("")}</div>
       <div role="tabpanel" id="panel-${S.tab}" aria-labelledby="tab-${S.tab}">${panel(S.tab)}</div></div>`;
   layout("runs", name, `<div class="crumbs"><a href="#/runs">← Runs</a></div>
     <div class="page-title">${esc(name)} ${stateBadge(run)}</div>
     <p class="page-sub" style="margin-bottom:18px">Started ${esc(when(run.createdAt))} · Run <code>${esc(run.runId.slice(0, 8))}</code></p>
-    ${failure}
+    ${failure}${review}${waiting}
     <div class="grid-3"><div class="card"><div class="card-head"><h2>Progress</h2></div>${stepsHtml(run, audit)}</div>${deliverables(run)}${inputs(scope)}</div>
     ${kpis}${body}`);
   if (S.tab === "organization" && diagram) drawDiagram(diagram);
@@ -316,23 +356,31 @@ function limited(items, render, max, label) {
   if (items.length <= max) return `<ul class="items">${items.map(render).join("")}</ul>`;
   return `<ul class="items">${items.slice(0, max).map(render).join("")}</ul><details><summary style="padding:6px 0">Show all ${items.length} ${label}</summary><ul class="items">${items.slice(max).map(render).join("")}</ul></details>`;
 }
+const quoteLine = (item) => item && item.source ? `<div class="quote">${esc(item.source)}</div>` : "";
+function evidenceLine(s, key) {
+  const e = s.evidence && s.evidence[key];
+  if (!e || !e.source) return "";
+  return `<div class="quote">${basisBadge(e.basis)}<div>${esc(e.source)}</div></div>`;
+}
 function scopePanel(s) {
   const r = s.regions, lg = s.logging, created = "Created by the stacks from the email you provide";
   const sec = (title, sub, inner) => `<section class="sec"><h3>${title}${sub ? `<small>${sub}</small>` : ""}</h3>${inner}</section>`;
+  const notes = s.reviewNotes || [];
   return `<div>
-    ${sec("Regions", "", `<dl class="kv"><dt>Home</dt><dd><code>${esc(r.home)}</code></dd><dt>Governed</dt><dd>${r.governed.map((x) => `<code>${esc(x)}</code>`).join(" ")}</dd>
+    ${sec("Regions", "", `<dl class="kv"><dt>Home</dt><dd><code>${esc(r.home)}</code>${evidenceLine(s, "regions.home")}</dd><dt>Governed</dt><dd>${r.governed.map((x) => `<code>${esc(x)}</code>`).join(" ")}${evidenceLine(s, "regions.governed")}</dd>
       <dt>Also allowed</dt><dd>${r.extraAllowed.length ? r.extraAllowed.map((x) => `<code>${esc(x)}</code>`).join(" ") : "None"}</dd>
       <dt>Region deny</dt><dd>${r.enforceDeny ? `On: ${r.denied.length} regions denied (derived from the governed regions)` : "Off"}</dd></dl>
       <details style="margin-top:8px"><summary>Denied regions</summary><p class="hint" style="margin-top:6px">${esc(r.denied.join(", "))}</p></details>`)}
-    ${sec("Logging", "", `<dl class="kv"><dt>Log retention</dt><dd>${lg.retentionDays} days</dd><dt>Access log retention</dt><dd>${lg.accessLogRetentionDays} days</dd>
+    ${sec("Logging", "", `<dl class="kv"><dt>Log retention</dt><dd>${lg.retentionDays} days${evidenceLine(s, "logging.retentionDays")}</dd><dt>Access log retention</dt><dd>${lg.accessLogRetentionDays} days</dd>
       <dt>Log archive account</dt><dd>${esc(lg.logArchiveAccountId || created)}</dd><dt>Audit account</dt><dd>${esc(lg.auditAccountId || created)}</dd><dt>Encryption key</dt><dd>${esc(lg.kmsKeyArn || "Control Tower default")}</dd></dl>`)}
-    ${sec("Organizational units", plural(s.ous.length, "unit"), limited(s.ous, (o) => `<li><span class="main">${esc(o.name)}</span>${o.parent ? `<span class="meta">inside ${esc(o.parent)}</span>` : ""}${basisBadge(o.basis)}</li>`, 8, "units"))}
-    ${sec("Accounts", plural((s.accounts || []).length, "account"), limited(s.accounts || [], (a) => `<li><span class="main">${esc(a.name)}</span><span class="meta">${esc(a.kind)} in ${esc(a.ou)}${a.provisioning === "existing" ? ", already exists" : ""}</span>${basisBadge(a.basis)}</li>`, 8, "accounts"))}
-    ${sec("Service control policies from the catalog", plural(s.scps.length, "policy", "policies"), s.scps.length ? limited(s.scps, (p) => `<li><code>${esc(p.id)}</code><span class="meta">on ${esc(p.targets.join(", "))}</span>${basisBadge(p.basis)}</li>`, 8, "policies") : '<p class="hint">None.</p>')}
-    ${sec("Control Tower controls", `${s.summary.controls} controls, ${s.summary.controlAttachments} attachments`, limited(s.controls, (c) => `<li><code>${esc(c.id)}</code><span class="meta">on ${esc(c.targets.join(", "))}</span>${basisBadge(c.basis)}</li>`, 6, "controls"))}
-    ${sec("Not covered by the generated code", plural(s.unsupported.length, "requirement"), s.unsupported.length ? limited(s.unsupported, (u) => `<li class="block"><span class="main">${esc(u.requirement)}</span><div class="meta">${esc(u.reason)}</div></li>`, 5, "requirements") : '<p class="hint">Every requirement is covered.</p>')}
+    ${sec("Organizational units", plural(s.ous.length, "unit"), limited(s.ous, (o) => `<li class="block"><span class="main">${esc(o.name)}</span>${o.parent ? `<span class="meta">inside ${esc(o.parent)}</span>` : ""}${basisBadge(o.basis)}${quoteLine(o)}</li>`, 8, "units"))}
+    ${sec("Accounts", plural((s.accounts || []).length, "account"), limited(s.accounts || [], (a) => `<li class="block"><span class="main">${esc(a.name)}</span><span class="meta">${esc(a.kind)} in ${esc(a.ou)}${a.provisioning === "existing" ? ", already exists" : ""}</span>${basisBadge(a.basis)}${quoteLine(a)}</li>`, 8, "accounts"))}
+    ${sec("Service control policies from the catalog", plural(s.scps.length, "policy", "policies"), s.scps.length ? limited(s.scps, (p) => `<li class="block"><code>${esc(p.id)}</code><span class="meta">on ${esc(p.targets.join(", "))}</span>${basisBadge(p.basis)}${quoteLine(p)}</li>`, 8, "policies") : '<p class="hint">None.</p>')}
+    ${sec("Control Tower controls", `${s.summary.controls} controls, ${s.summary.controlAttachments} attachments`, limited(s.controls, (c) => `<li class="block"><code>${esc(c.id)}</code><span class="meta">on ${esc(c.targets.join(", "))}</span>${basisBadge(c.basis)}${quoteLine(c)}</li>`, 6, "controls"))}
+    ${sec("Not covered by the generated code", plural(s.unsupported.length, "requirement"), s.unsupported.length ? limited(s.unsupported, (u) => `<li class="block"><span class="main">${esc(u.requirement)}</span><div class="meta">${esc(u.reason)}</div>${basisBadge(u.basis)}${quoteLine(u)}</li>`, 5, "requirements") : '<p class="hint">Every requirement is covered.</p>')}
     ${sec("Assumptions", "", s.assumptions.length ? `<ul class="bullets">${s.assumptions.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>` : '<p class="hint">None.</p>')}
     ${sec("Open questions", "to confirm with the customer", s.openQuestions.length ? `<ul class="bullets">${s.openQuestions.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>` : '<p class="hint">None.</p>')}
+    ${notes.length ? sec("Review notes", "checks on this scope", `<ul class="bullets">${notes.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>`) : ""}
   </div>`;
 }
 
@@ -340,12 +388,16 @@ function scpPanel(s) {
   const list = s.customScps || [];
   const note = `<div class="notice notice-info"><strong>Written by an AI model from the SOW.</strong> Review each policy against its quote, fill in its inputs, and test it on a non-production account first. The generated code never applies them: they ship in <code>custom-scps/</code>.</div>`;
   if (!list.length) return note + '<div class="empty">This SOW has no requirements that need a custom policy beyond the catalog.</div>';
-  return note + list.map((e, i) => `<div class="card scp"><div class="top"><div><h4>${esc(e.title)}</h4><div class="desc">${esc(e.description || "")}</div></div>
+  return note + list.map((e, i) => {
+    const inputs = e.inputs || [], warnings = e.warnings || [];
+    return `<div class="card scp"><div class="top"><div><h4>${esc(e.title)}</h4><div class="desc">${esc(e.description || "")}</div></div>
       <button class="btn btn-sm" type="button" data-copy="${i}">⧉ Copy policy</button></div>
     <div class="row"><code>${esc(e.id)}</code><span>attach to</span>${e.targets.map((t) => badge("blue", t)).join("")}${basisBadge(e.basis)}</div>
-    ${e.inputs.length ? `<div class="row"><span>Fill in before use</span>${e.inputs.map((x) => `<span class="badge badge-amber" title="${esc(x.description)}">${esc(x.name)}</span>`).join("")}</div>` : ""}
-    ${e.warnings.length ? `<div class="notice notice-warn" style="margin:10px 0 0">${e.warnings.map(esc).join(" ")}</div>` : ""}
-    <details style="margin-top:10px"><summary>Policy JSON <span class="hint">${esc(plural((e.policy.Statement || []).length, "statement"))}</span></summary><pre><code>${esc(JSON.stringify(e.policy, null, 2))}</code></pre></details></div>`).join("");
+    ${quoteLine(e)}
+    ${inputs.length ? `<div class="hint" style="margin-top:10px">Fill in before use</div><ul class="bullets">${inputs.map((x) => `<li><code>${esc(x.name)}</code> ${esc(x.description || "")}</li>`).join("")}</ul>` : ""}
+    ${warnings.length ? `<div class="notice notice-warn" style="margin:10px 0 0"><ul>${warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul></div>` : ""}
+    <details style="margin-top:10px"><summary>Policy JSON <span class="hint">${esc(plural((e.policy.Statement || []).length, "statement"))}</span></summary><pre><code>${esc(JSON.stringify(e.policy, null, 2))}</code></pre></details></div>`;
+  }).join("");
 }
 
 const CHECKS = { "tf-fmt": "Terraform format", "tf-init": "Terraform init", "tf-validate": "Terraform validate", "tf-lint": "Terraform lint", "tf-security": "Terraform security scan", "cfn-lint": "CloudFormation lint", "cfn-security": "CloudFormation security scan" };
@@ -372,13 +424,28 @@ function securityPanel(rep) {
 
 const ACTIONS = { "run.created": "Run created", "run.started": "Analysis started", "sow.extracted": "SOW text extracted", "phase.started": "Agent started", "phase.completed": "Scope saved",
   "phase.failed": "Agent step failed", "bundle.rendered": "Code generated", "run.delivered": "Ready to download", "run.failed": "Run failed", "artifact.downloaded": "Download",
+  "intake.page_saved": "Page saved", "intake.saved": "Scope assembled", "intake.rejected": "Scope rejected",
+  "tool.save_page": "Page findings saved", "tool.save_page.rejected": "Page findings rejected", "tool.save_custom_policies": "Custom policies drafted",
   "tool.get_catalog": "Read the catalog", "tool.read_sow_page": "Read a SOW page", "tool.read_run_state": "Checked progress", "tool.save_scope": "Saved the scope",
   "tool.save_scope.rejected": "Scope rejected, retrying", "tool.save_scope.review": "Review hints sent to the agent" };
+function eventText(a) {
+  const d = auditDetail(a);
+  let extra = "";
+  if (a.action === "intake.page_saved" && d.page) extra = `Page ${d.page} of ${d.of || d.page}`;
+  else if (a.action === "sow.extracted" && d.chars) extra = `${Number(d.chars).toLocaleString()} characters`;
+  else if (a.action === "artifact.downloaded" && d.name) extra = String(d.name);
+  else if (a.action === "tool.save_custom_policies" && d.count != null) extra = plural(Number(d.count), "policy", "policies");
+  else if (Array.isArray(d.errors) && d.errors.length) extra = d.errors.slice(0, 3).map((e) => String(e)).join("; ");
+  return { label: ACTIONS[a.action] || a.action, extra };
+}
 function activityPanel(audit) {
-  const rows = audit.filter((a) => S.steps || !a.action.startsWith("tool."));
+  const quiet = (a) => a.action.startsWith("tool.") && !a.action.endsWith(".rejected");
+  const rows = audit.filter((a) => S.steps || !quiet(a));
   return `<label class="check" style="margin-bottom:10px"><input type="checkbox" id="steps" ${S.steps ? "checked" : ""}> Show the agent's individual steps</label>
-    <div class="tbl-wrap"><table><thead><tr><th>When</th><th>Who</th><th>Event</th></tr></thead><tbody>${rows.map((a) =>
-      `<tr><td style="white-space:nowrap;color:var(--dim)">${esc(new Date(a.ts * 1000).toLocaleTimeString())}</td><td>${esc(a.actor === claims.sub ? "You" : ["system", "agent"].includes(a.actor) ? a.actor[0].toUpperCase() + a.actor.slice(1) : "A user")}</td><td>${esc(ACTIONS[a.action] || a.action)}</td></tr>`).join("")}</tbody></table></div>`;
+    <div class="tbl-wrap"><table><thead><tr><th>When</th><th>Who</th><th>Event</th></tr></thead><tbody>${rows.map((a) => {
+      const ev = eventText(a);
+      return `<tr><td style="white-space:nowrap;color:var(--dim)">${esc(new Date(a.ts * 1000).toLocaleTimeString())}</td><td>${esc(a.actor === claims.sub ? "You" : ["system", "agent"].includes(a.actor) ? a.actor[0].toUpperCase() + a.actor.slice(1) : "A user")}</td><td>${esc(ev.label)}${ev.extra ? `<div class="hint">${esc(ev.extra)}</div>` : ""}</td></tr>`;
+    }).join("")}</tbody></table></div>`;
 }
 
 /* ---------- actions ---------- */
