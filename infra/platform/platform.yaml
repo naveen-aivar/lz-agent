@@ -255,6 +255,11 @@ Resources:
               - Effect: Allow
                 Action: ["s3:PutObject", "s3:GetObject"]
                 Resource: !Sub "${ArtifactBucket.Arn}/runs/*/intake/*"
+              - Effect: Allow   # boto3/S3 may evaluate bucket-level access on GetObject against KMS-encrypted objects
+                Action: ["s3:ListBucket"]
+                Resource: !GetAtt ArtifactBucket.Arn
+                Condition:
+                  StringLike: {s3:prefix: ["runs/*"]}
               - Effect: Allow
                 Action: ["kms:Decrypt", "kms:GenerateDataKey"]
                 Resource: !GetAtt Key.Arn

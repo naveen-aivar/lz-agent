@@ -45,12 +45,29 @@ def _page_b():
 
 
 class PageScopeTests(unittest.TestCase):
-    def test_quote_must_be_the_slice_not_a_nearby_phrase(self):
+    def test_wrong_offsets_accepted_when_source_is_verbatim_on_page(self):
+        page = "Block root user usage in production accounts today."
+        quote = "Block root user usage"
+        raw = {"scps": [{"id": "deny-root-user", "targets": ["Workloads"], "basis": "explicit",
+                         "source": quote, "start": page.index("production"), "end": page.index("production") + 10}]}
+        _, errors = accept_page(raw, page)
+        self.assertEqual(errors, [])
+
+    def test_hallucinated_source_rejected(self):
         page = "Block root user usage in production accounts today."
         raw = {"scps": [{"id": "deny-root-user", "targets": ["Workloads"], "basis": "explicit",
-                         "source": "Block root user usage", "start": page.index("production"), "end": page.index("production") + 10}]}
+                         "source": "Block root user usage in staging", "start": 0, "end": 33}]}
         _, errors = accept_page(raw, page)
-        self.assertTrue(any("not the quote" in e for e in errors))
+        self.assertTrue(errors)
+
+    def test_dot_leader_quote_rejected(self):
+        page = "Contents .......... section one .......... page 3"
+        dots = ".......... section"
+        start = page.index(dots)
+        raw = {"scalars": {"regions.home": {"value": "us-east-1", "basis": "explicit",
+                                            "source": dots, "start": start, "end": start + len(dots)}}}
+        _, errors = accept_page(raw, page)
+        self.assertTrue(any("table-of-contents" in e for e in errors))
 
     def test_default_basis_and_page_policy_json_are_rejected(self):
         page = "Block root user usage."

@@ -60,6 +60,38 @@ def _email(obj):
     return False
 
 
+def _dot_leader_quote(quote: str) -> bool:
+    """PDF/TOC lines made of dots and spaces are not valid evidence."""
+    compact = quote.strip()
+    if len(compact) < 8:
+        return False
+    alnum = sum(1 for c in compact if c.isalnum())
+    return alnum < 8
+
+
+def _locate_quote(quote: str, page_text: str, hint_start: int | None) -> tuple[int, int] | None:
+    """Return (start, end) when quote appears verbatim on the page."""
+    if quote not in page_text:
+        return None
+    hits: list[int] = []
+    pos = 0
+    while True:
+        i = page_text.find(quote, pos)
+        if i < 0:
+            break
+        hits.append(i)
+        pos = i + 1
+    if not hits:
+        return None
+    if len(hits) == 1:
+        s = hits[0]
+        return s, s + len(quote)
+    if isinstance(hint_start, int):
+        s = min(hits, key=lambda h: abs(h - hint_start))
+        return s, s + len(quote)
+    return None
+
+
 def _span(label, item, page_text):
     """Explicit quotes must equal page_text[start:end]. Inferred items need that span plus a reason."""
     basis = item.get("basis")
@@ -73,12 +105,29 @@ def _span(label, item, page_text):
             return None, f"{label}: inferred needs source explaining the inference"
     if not isinstance(quote, str):
         return None, f"{label}: needs a verbatim quote from this page"
+    if _dot_leader_quote(quote):
+        return None, (
+            f"{label}: quote looks like table-of-contents filler (mostly dots/spaces); "
+            "omit this field or cite real text from this page"
+        )
     start, end = item.get("start"), item.get("end")
+    hint = start if isinstance(start, int) else None
     if type(start) is not int or type(end) is not int or not (0 <= start < end <= len(page_text)):
-        return None, f"{label}: start and end must be integer offsets into this page"
+        loc = _locate_quote(quote, page_text, hint)
+        if loc is None:
+            return None, f"{label}: start and end must be integer offsets into this page"
+        start, end = loc
+    elif page_text[start:end] != quote:
+        loc = _locate_quote(quote, page_text, start)
+        if loc is None:
+            got = page_text[start:end]
+            return None, (
+                f"{label}: page[{start}:{end}] is {got[:80]!r}, not the quote; "
+                "source must be a verbatim substring of this page"
+            )
+        start, end = loc
     if page_text[start:end] != quote:
-        got = page_text[start:end]
-        return None, f"{label}: page[{start}:{end}] is {got[:80]!r}, not the quote"
+        return None, f"{label}: source must match page[start:end] exactly (including newlines)"
     if len(norm_text(quote)) < 8:
         return None, f"{label}: quote must be at least 8 characters"
     source = quote if basis == "explicit" else f"{reason.strip()} (sow: {quote})"
@@ -496,7 +545,7 @@ def accept_custom_policies(raw, requests):
     return out, []
 
 
-def run_intake(pages, load_page, save_page, ask_page, sow_text, ask_custom=None, attempts=2):
+def run_intake(pages, load_page, save_page, ask_page, sow_text, ask_custom=None, attempts=3):
     """Read each page with a fresh model call. A page that is already saved is not sent again.
 
     ask_page(page_number, page_text, errors) returns ("ok", finding) when the tool already checked the page,

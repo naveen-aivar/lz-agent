@@ -6,7 +6,9 @@ cd "$(dirname "$0")/.."
 
 CODE_BUCKET=${1:?existing S3 bucket for code}; DOMAIN=${2:?cognito domain prefix}; MODEL=${3:?bedrock model/inference-profile id}
 TAG=${4:-}
-STACK=lz-agent
+# CloudFormation stack name (console). Override with CFN_STACK. ProjectName sets Lambda/DynamoDB/etc. prefixes; override with PROJECT_NAME.
+STACK="${CFN_STACK:-naveen-landing-zone}"
+PROJECT="${PROJECT_NAME:-naveen-landing-zone}"
 
 echo "Packaging Lambdas (python3.12, linux x86_64 wheels) and buildspecs"
 rm -rf build && mkdir -p build/pkg
@@ -29,7 +31,7 @@ fi
 
 aws cloudformation deploy --stack-name "$STACK" --template-file infra/platform/platform.yaml \
   --capabilities CAPABILITY_IAM \
-  --parameter-overrides CodeBucket="$CODE_BUCKET" CognitoDomainPrefix="$DOMAIN" ModelId="$MODEL" AgentImageUri="$IMAGE_URI"
+  --parameter-overrides ProjectName="$PROJECT" CodeBucket="$CODE_BUCKET" CognitoDomainPrefix="$DOMAIN" ModelId="$MODEL" AgentImageUri="$IMAGE_URI"
 
 # CloudFormation does not see a changed zip under the same S3 key, so push the new code to the Zip Lambdas directly
 for fn in $(aws cloudformation describe-stack-resources --stack-name "$STACK" --query "StackResources[?ResourceType=='AWS::Lambda::Function'].PhysicalResourceId" --output text); do
