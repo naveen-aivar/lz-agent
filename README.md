@@ -1,13 +1,13 @@
 # Landing Zone Agent Platform
 
-Upload a SOW (PDF, DOCX, TXT, MD) or paste requirements. An agent reads **all of it** and extracts the Control Tower scope. Deterministic code then generates a **Terraform stack and a CloudFormation stack** with a fixed file layout. Both stacks are validated and offered for download. Customers deploy them through their own pipeline.
+Upload a SOW (PDF, DOCX, TXT, MD) or paste requirements. An agent reads **all of it, one page at a time**, and extracts the Control Tower scope. Deterministic code then generates a **Terraform stack and a CloudFormation stack** with a fixed file layout. Both stacks are validated and offered for download. Customers deploy them through their own pipeline.
 
 Nothing in this repo deploys into a customer account. **Nothing here has been deployed or run against a live AWS account.**
 
 ## Flow
 ```
 UI upload -> S3 -> [1] extract text (Lambda, pypdf / python-docx)
-  -> [2] agent extracts scope (AgentCore, Strands + Claude)   <- the only LLM step
+  -> [2] agent extracts scope, one SOW page per model call (AgentCore, Strands + Claude)
   -> [3] render Terraform + CloudFormation (Lambda, no LLM)
   -> [4] validate (CodeBuild: terraform fmt/validate, tflint, cfn-lint, checkov) -> report with scanned / passed / failed counts
   -> DELIVERED: downloads enabled (each stack zip carries its own scan reports; a separate reports zip has them all)
@@ -16,8 +16,8 @@ UI upload -> S3 -> [1] extract text (Lambda, pypdf / python-docx)
 ## How the scope is kept honest (`lzcore/`)
 | Concern | Enforced by |
 |---|---|
-| Agent reads the whole SOW | `save_scope` refuses until every page was read (`agent/tools.py`); oversized or scanned input fails instead of truncating |
-| Agent does not invent requirements | every `explicit` item needs a verbatim quote that is searched for in the SOW (`lzcore/scope.py`) |
+| Agent reads the whole SOW | each page is its own model call and is saved before the next page (`lzcore/page_scope.py`); a retry skips pages already saved. Oversized or scanned input fails instead of truncating |
+| Agent does not invent requirements | every `explicit` quote must be an exact character slice of the page that produced it, and that quote must still occur in the SOW (`lzcore/page_scope.py`, `lzcore/scope.py`) |
 | Regions to deny | derived in code: all regions - governed - extraAllowed. The agent cannot supply it |
 | Only known SCP ids and control ids | catalog SCPs and Control Tower controls come from closed catalogs (`lzcore/catalog.py`). Any other SCP is written by the model under `customScps`: validated (`lzcore/customscp.py`), delivered for review, never applied by the stacks. Everything else goes under `unsupported` |
 | SCP limits | max 3 catalog SCPs per target; 5120-char limit checked on every policy, catalog and custom |
@@ -40,9 +40,9 @@ See `docs/AWS-REVIEW.md` for how the design was checked against the AWS document
 ## Repository map
 | Path | What it does |
 |---|---|
-| `lzcore/` | shared deterministic core: `regions`, `catalog`, `scope` (schema + validation), `customscp` (AI-written SCP validation), `diagram` (org tree), `render`, `extract` |
+| `lzcore/` | shared deterministic core: `regions`, `catalog`, `scope` (schema + validation), `page_scope` (one page at a time, then merge), `customscp` (AI-written SCP validation), `diagram` (org tree), `render`, `extract` |
 | `templates/` | static Terraform/CFN files and the two bundle READMEs |
-| `agent/` | Strands agent (4 tools: read SOW page, catalog, save scope, run state) and ARM64 container |
+| `agent/` | Strands agent (one page per call, then a deterministic merge) and ARM64 container |
 | `orchestration/` | Step Functions definition, Lambdas, tests |
 | `buildspecs/` | CodeBuild validation (`validate.yml`, `validate.sh`, `report.py` builds the scan report and bundles) |
 | `infra/platform/platform.yaml` | the platform: Cognito, CloudFront+S3 (OAC), API Gateway, Lambdas, Step Functions, AgentCore runtime, CodeBuild, DynamoDB, KMS |
@@ -61,7 +61,7 @@ resource schemas (`terraform validate`, `cfn-lint`), which also corrected severa
 
 ## Known limitations
 - Scanned PDFs are rejected (no OCR). SOWs over 400k characters are rejected.
-- The agent phase runs inside a 15-minute Lambda. Very large SOWs could exceed it.
+- The agent phase runs inside a 15-minute Lambda. Pages already saved are kept, and the one automatic retry continues from the next unsaved page. A second timeout fails the run.
 - Every account the stacks create needs a unique root email in a variable; the scope is marked `needs-input` and the stacks refuse to apply until they are filled in. AWS accounts cannot be deleted cheaply (closing takes up to 90 days), so the stacks protect them from destroy.
 - Custom KMS keys must have a policy allowing Control Tower, CloudTrail and Config; the stacks do not create one.
 - A reviewer who disagrees with the scope cannot edit it. They start a new run with corrected input.

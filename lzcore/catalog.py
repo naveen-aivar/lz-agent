@@ -1,5 +1,6 @@
-"""Closed catalogs. The agent can only choose from these ids; it cannot author SCP JSON or invent control ids.
-Anything in a SOW that is not in a catalog must be reported under scope.unsupported (never silently dropped).
+"""Closed catalogs. The agent can only choose SCP ids and control ids from these lists.
+Catalog SCP JSON is built here. A requirement this SCP list cannot express is a custom SCP (customscp.py):
+validated, delivered for review, and not attached by the stacks. Anything else is reported under scope.unsupported.
 
 Verification against the Control Tower controls reference (docs.aws.amazon.com/controltower/latest/controlreference):
   * VERIFIED ids (the reference page shows the identifier): AWS-GR_RESTRICT_ROOT_USER, AWS-GR_RESTRICT_ROOT_USER_ACCESS_KEYS,
@@ -17,10 +18,26 @@ STANDARD_OUS = (SECURITY_OU, SANDBOX_OU)  # created by the generated stacks (4.0
 MAX_CUSTOM_SCPS_PER_TARGET = 3  # AWS allows 5 per target including FullAWSAccess and Control Tower's own
 SCP_MAX_CHARS = 5120
 
+# Control Tower region-deny NotAction list. Source: the controls reference, "Deny access to AWS based on the
+# requested AWS Region" (primary-region-deny-policy). Global services terminate outside the governed regions.
 GLOBAL_SERVICES_NOT_ACTION = [
-    "a4b:*", "account:*", "aws-portal:*", "budgets:*", "ce:*", "cloudfront:*", "cur:*", "globalaccelerator:*",
-    "health:*", "iam:*", "organizations:*", "route53:*", "route53domains:*", "shield:*", "sts:*", "support:*",
-    "trustedadvisor:*", "waf:*", "wafv2:*",
+    "a4b:*", "access-analyzer:*", "account:*", "acm:*", "activate:*", "artifact:*", "aws-marketplace-management:*",
+    "aws-marketplace:*", "aws-portal:*", "billing:*", "billingconductor:*", "budgets:*", "ce:*", "chatbot:*", "chime:*",
+    "cloudfront:*", "cloudtrail:LookupEvents", "compute-optimizer:*", "config:*", "consoleapp:*", "consolidatedbilling:*",
+    "cur:*", "datapipeline:GetAccountLimits", "devicefarm:*", "directconnect:*", "ec2:DescribeRegions",
+    "ec2:DescribeTransitGateways", "ec2:DescribeVpnGateways", "ecr-public:*", "fms:*", "freetier:*", "globalaccelerator:*",
+    "health:*", "iam:*", "importexport:*", "invoicing:*", "iq:*", "kms:*", "license-manager:ListReceivedLicenses",
+    "lightsail:Get*", "mobileanalytics:*", "networkmanager:*", "notifications-contacts:*", "notifications:*",
+    "organizations:*", "payments:*", "pricing:*", "quicksight:DescribeAccountSubscription", "resource-explorer-2:*",
+    "route53-recovery-cluster:*", "route53-recovery-control-config:*", "route53-recovery-readiness:*", "route53:*",
+    "route53domains:*", "s3:CreateMultiRegionAccessPoint", "s3:DeleteMultiRegionAccessPoint",
+    "s3:DescribeMultiRegionAccessPointOperation", "s3:GetAccountPublicAccessBlock", "s3:GetBucketLocation",
+    "s3:GetBucketPolicyStatus", "s3:GetBucketPublicAccessBlock", "s3:GetMultiRegionAccessPoint",
+    "s3:GetMultiRegionAccessPointPolicy", "s3:GetMultiRegionAccessPointPolicyStatus", "s3:GetStorageLensConfiguration",
+    "s3:GetStorageLensDashboard", "s3:ListAllMyBuckets", "s3:ListMultiRegionAccessPoints", "s3:ListStorageLensConfigurations",
+    "s3:PutAccountPublicAccessBlock", "s3:PutMultiRegionAccessPointPolicy", "savingsplans:*", "shield:*", "sso:*", "sts:*",
+    "support:*", "supportapp:*", "supportplans:*", "sustainability:*", "tag:GetResources", "tax:*", "trustedadvisor:*",
+    "vendor-insights:ListEntitledSecurityProfiles", "waf-regional:*", "waf:*", "wafv2:*",
 ]
 CT_EXEMPT_PRINCIPALS = ["arn:aws:iam::*:role/AWSControlTowerExecution", "arn:aws:iam::*:role/aws-controltower-*"]
 
@@ -57,7 +74,7 @@ SCP_CATALOG = {
     },
     "deny-root-user": {
         "title": "Deny all actions by the root user in member accounts",
-        "build": lambda s: _policy(_stmt("DenyRoot", "*", condition={"StringLike": {"aws:PrincipalArn": ["arn:aws:iam::*:root"]}})),
+        "build": lambda s: _policy(_stmt("DenyRoot", "*", condition={"StringLike": {"aws:PrincipalARN": ["arn:aws:iam::*:root"]}})),
     },
     "deny-iam-users": {
         "title": "Deny creation of IAM users, access keys and login profiles",
@@ -75,7 +92,8 @@ SCP_CATALOG = {
         "title": "Prevent disabling GuardDuty",
         "build": lambda s: _policy(_stmt("ProtectGuardDuty", [
             "guardduty:DeleteDetector", "guardduty:DisassociateFromMasterAccount", "guardduty:UpdateDetector",
-            "guardduty:DeleteMembers", "guardduty:StopMonitoringMembers"])),
+            "guardduty:DeleteMembers", "guardduty:StopMonitoringMembers"],
+            condition={"ArnNotLike": {"aws:PrincipalARN": CT_EXEMPT_PRINCIPALS}})),
     },
     "deny-s3-public-access-change": {
         "title": "Prevent removing account-level S3 Block Public Access",

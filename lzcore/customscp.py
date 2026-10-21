@@ -15,10 +15,22 @@ ID_RE = re.compile(r"^[a-z][a-z0-9-]{2,60}$")
 INPUT_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,40}$")
 PLACEHOLDER_RE = re.compile(r"\{\{([A-Z][A-Z0-9_]*)\}\}")
 STATEMENT_KEYS = {"Sid", "Effect", "Action", "NotAction", "Resource", "NotResource", "Condition"}
+SID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
+ACCOUNT_ID_RE = re.compile(r"(?<!\d)\d{12}(?!\d)")
+LITERAL_ROLE_RE = re.compile(r"role/([A-Za-z0-9+=,.@_-]+)")
 
 
 def policy_text(policy):
     return json.dumps(policy, separators=(",", ":"), sort_keys=True)
+
+
+def _strings(value):
+    """A policy element that must be a non-empty string or a non-empty list of strings. Returns an error or None."""
+    if isinstance(value, str) and value.strip():
+        return None
+    if isinstance(value, list) and value and all(isinstance(item, str) and item.strip() for item in value):
+        return None
+    return "must be a non-empty string or a list of strings"
 
 
 def validate_policy(policy):
@@ -46,14 +58,48 @@ def validate_policy(policy):
             errors.append(f"{where}: only Effect 'Deny' is accepted for generated SCPs")
         if ("Action" in st) == ("NotAction" in st):
             errors.append(f"{where}: give exactly one of Action or NotAction")
-        if not ("Resource" in st or "NotResource" in st):
-            errors.append(f"{where}: Resource (or NotResource) is required")
+        else:
+            key = "Action" if "Action" in st else "NotAction"
+            bad = _strings(st[key])
+            if bad:
+                errors.append(f"{where}.{key} {bad}")
+        if ("Resource" in st) == ("NotResource" in st):
+            errors.append(f"{where}: give exactly one of Resource or NotResource")
+        else:
+            key = "Resource" if "Resource" in st else "NotResource"
+            bad = _strings(st[key])
+            if bad:
+                errors.append(f"{where}.{key} {bad}")
+        if "Sid" in st and (not isinstance(st["Sid"], str) or not SID_RE.match(st["Sid"])):
+            errors.append(f"{where}.Sid must be alphanumeric")
+        if "Condition" in st:
+            cond = st["Condition"]
+            if not isinstance(cond, dict) or not cond:
+                errors.append(f"{where}.Condition must be a non-empty object")
+            else:
+                for op, body in cond.items():
+                    if not isinstance(body, dict) or not body:
+                        errors.append(f"{where}.Condition.{op} must be a non-empty object")
+                        continue
+                    for ck, cv in body.items():
+                        bad = _strings(cv)
+                        if bad:
+                            errors.append(f"{where}.Condition.{op}.{ck} {bad}")
         if st.get("Action") in ("*", ["*"]) and not st.get("Condition"):
             warnings.append(f"{where}: denies every action with no Condition; it blocks all principals in the target")
         if "NotAction" in st and not st.get("Condition"):
             warnings.append(f"{where}: NotAction without a Condition is broad; check the exempted actions")
-    if len(policy_text(policy)) > SCP_MAX_CHARS:
-        errors.append(f"policy is {len(policy_text(policy))} characters when minified; the SCP limit is {SCP_MAX_CHARS}")
+    text = policy_text(policy) if isinstance(policy, dict) else ""
+    if text and ACCOUNT_ID_RE.search(text):
+        errors.append("policy contains a 12-digit account id; write it as a {{NAME}} placeholder")
+    if text and PLACEHOLDER_RE.search(text):
+        warnings.append("policy still contains {{INPUT}} placeholders; attaching it before they are replaced makes an "
+                        "exemption match nobody, so the Deny applies to every principal")
+    for name in sorted(set(LITERAL_ROLE_RE.findall(text))):
+        if "*" not in name:
+            warnings.append(f"role name {name!r} is hardcoded; use a {{{{NAME}}}} placeholder")
+    if len(text) > SCP_MAX_CHARS:
+        errors.append(f"policy is {len(text)} characters when minified; the SCP limit is {SCP_MAX_CHARS}")
     return errors, warnings
 
 
@@ -144,7 +190,7 @@ and test it before it is attached to anything.
 
 ## Before you use a policy
 1. Read it against the SOW quote in `index.json`. Nothing here proves the policy does what the SOW intends.
-2. Replace each `{{{{INPUT_NAME}}}}` placeholder in the policy file with a real value (role names, account ids, ...).
+2. Replace each `{{{{INPUT_NAME}}}}` placeholder before use. An exemption that still contains one matches nobody, so the Deny applies to every principal.
 3. Check the limits: an OU or account can have at most 5 SCPs including `FullAWSAccess` and the ones Control Tower manages,
    and each SCP is at most {SCP_MAX_CHARS} characters. Catalog SCPs already attached count toward this.
 4. Test on a **non-production** account first (attach to its OU, watch CloudTrail for unexpected `AccessDenied`), then

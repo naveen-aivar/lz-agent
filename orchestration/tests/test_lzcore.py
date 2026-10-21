@@ -409,6 +409,7 @@ class RenderTests(unittest.TestCase):
             "inputs": [{"name": "ADMIN_ROLE_NAME", "description": "Role allowed to delete keys", "example": "MT-Administrator"}]}]
         s, errs = sc.validate(g, SOW)
         self.assertEqual(errs, [])
+        self.assertTrue(any("placeholders" in w for w in s["customScps"][0]["warnings"]))
         for files in (render.render_terraform(s), render.render_cloudformation(s)):
             self.assertIn("custom-scps/protect-kms.json", files)
             self.assertIn("{{ADMIN_ROLE_NAME}}", files["custom-scps/protect-kms.json"])
@@ -431,6 +432,9 @@ class RenderTests(unittest.TestCase):
             (base(policy=stmt(Effect="Allow")), "only Effect 'Deny'"),
             (base(policy=stmt(Principal="*")), "no Principal"),
             (base(policy=stmt(NotAction="s3:*")), "exactly one of Action or NotAction"),
+            (base(policy=stmt(NotResource="*")), "exactly one of Resource or NotResource"),
+            (base(policy={"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Action": {"s3": "*"}, "Resource": "*"}]}), "Action must be"),
+            (base(policy=stmt(Resource="arn:aws:s3:::bucket-111122223333")), "12-digit account id"),
             (base(policy={"Version": "2008-10-17", "Statement": [{"Effect": "Deny", "Action": "*", "Resource": "*"}]}), "Version"),
             (base(policy=stmt(Resource="x" * 6000)), "SCP limit"),
             (base(policy=stmt(Condition={"StringEquals": {"a": "{{UNDECLARED}}"}})), "not declared under inputs"),
@@ -451,6 +455,41 @@ class RenderTests(unittest.TestCase):
         s, errs = sc.validate(g, SOW)
         self.assertEqual(errs, [])
         self.assertTrue(any("no Condition" in w for w in s["customScps"][0]["warnings"]))
+
+    def test_custom_scp_warns_before_the_attach_budget_is_exceeded(self):
+        def custom(targets):
+            return {"id": "protect-kms", "title": "t", "targets": targets, "basis": "explicit", "source": "Block root user usage",
+                    "inputs": [], "policy": {"Version": "2012-10-17", "Statement": [
+                        {"Effect": "Deny", "Action": "s3:DeleteBucket", "Resource": "*"}]}}
+
+        over = good()
+        over["scps"] = [{"id": i, "targets": ["Workloads"], "basis": "explicit", "source": "Block root user usage"} for i in
+                        ("deny-root-user", "deny-leave-org", "deny-iam-users")]
+        over["customScps"] = [custom(["Workloads"])]
+        s, errs = sc.validate(over, SOW)
+        self.assertEqual(errs, [])
+        self.assertTrue(any("would have 4" in w for w in s["customScps"][0]["warnings"]))
+
+        under = good()
+        under["scps"] = [{"id": "deny-root-user", "targets": ["Workloads"], "basis": "explicit", "source": "Block root user usage"},
+                         {"id": "deny-leave-org", "targets": ["Workloads"], "basis": "explicit", "source": "Block root user usage"}]
+        under["customScps"] = [custom(["Workloads"])]
+        s, errs = sc.validate(under, SOW)
+        self.assertEqual(errs, [])
+        self.assertFalse(any("would have" in w for w in s["customScps"][0]["warnings"]))
+
+    def test_region_deny_matches_the_control_tower_exemption_list(self):
+        from lzcore.catalog import GLOBAL_SERVICES_NOT_ACTION, build_scp
+        s, errs = sc.validate(good(), SOW)
+        self.assertEqual(errs, [])
+        doc = build_scp("deny-region", s)
+        stmt = doc["Statement"][0]
+        self.assertEqual(stmt["NotAction"], list(GLOBAL_SERVICES_NOT_ACTION))
+        self.assertIn("notifications:*", stmt["NotAction"])
+        self.assertIn("aws:PrincipalARN", stmt["Condition"]["ArnNotLike"])
+        self.assertLess(len(sc.scp_json("deny-region", s)), 5120)
+        guard = build_scp("deny-guardduty-disable", s)["Statement"][0]
+        self.assertIn("arn:aws:iam::*:role/AWSControlTowerExecution", guard["Condition"]["ArnNotLike"]["aws:PrincipalARN"])
 
 
 if __name__ == "__main__":

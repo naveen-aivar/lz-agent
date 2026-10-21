@@ -260,7 +260,7 @@ def validate(scope, sow_text=None):
             continue
         pid = p.get("id")
         if pid not in SCP_CATALOG:
-            err(f"scps[{i}].id {pid!r} is not in the SCP catalog; put it under 'unsupported'")
+            err(f"scps[{i}].id {pid!r} is not in the SCP catalog; put it under 'customScps'")
             continue
         if pid in ids:
             err(f"duplicate SCP {pid!r}")
@@ -336,7 +336,7 @@ def validate(scope, sow_text=None):
         for e in custom:
             for t in e["targets"]:
                 total = per_target.get(t, 0) + per_custom[t]
-                if total > MAX_CUSTOM_SCPS_PER_TARGET + 1:
+                if total > MAX_CUSTOM_SCPS_PER_TARGET:
                     e["warnings"].append(f"{t!r} would have {total} generated SCPs (catalog + custom); AWS allows 5 per target "
                                          "including FullAWSAccess and the ones Control Tower manages")
         custom.sort(key=lambda e: e["id"])
@@ -427,4 +427,6 @@ def scope_markdown(s):
     L += [f"- {u['requirement']}: {u['reason']}" for u in s["unsupported"]] or ["- none"]
     L += ["", "## Assumptions"] + ([f"- {a}" for a in s["assumptions"]] or ["- none"])
     L += ["", "## Open questions"] + ([f"- {q}" for q in s["openQuestions"]] or ["- none"])
+    if s.get("reviewNotes"):
+        L += ["", "## Review notes"] + [f"- {n}" for n in s["reviewNotes"]]
     return "\n".join(L) + "\n"
