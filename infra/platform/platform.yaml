@@ -18,9 +18,6 @@ Parameters:
     Description: Bedrock inference-profile id for the Claude model (verify it in your region before deploying).
   CognitoDomainPrefix:
     Type: String
-  ApprovalTtlSeconds:
-    Type: Number
-    Default: 86400
 
 Conditions:
   CreateRuntime: !Not [!Equals [!Ref AgentImageUri, ""]]
@@ -165,14 +162,6 @@ Resources:
       IdTokenValidity: 60
       TokenValidityUnits: {AccessToken: minutes, IdToken: minutes}
 
-  ApproversGroup:
-    Type: AWS::Cognito::UserPoolGroup
-    Properties: {GroupName: approvers, UserPoolId: !Ref UserPool}
-
-  RequestersGroup:
-    Type: AWS::Cognito::UserPoolGroup
-    Properties: {GroupName: requesters, UserPoolId: !Ref UserPool}
-
   # ---------- Roles ----------
   LambdaLogs:
     Type: AWS::IAM::ManagedPolicy
@@ -200,9 +189,6 @@ Resources:
               - Effect: Allow
                 Action: ["states:StartExecution"]
                 Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-run"
-              - Effect: Allow
-                Action: ["states:SendTaskSuccess", "states:SendTaskFailure"]
-                Resource: "*"
               - Effect: Allow
                 Action: ["s3:GetObject", "s3:PutObject"]   # PutObject: presigned POST for the SOW is signed with this role
                 Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
@@ -309,7 +295,7 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: ["lambda:InvokeFunction"]
-                Resource: [!GetAtt PhaseExtractFn.Arn, !GetAtt PhaseInvokeFn.Arn, !GetAtt GateWaitFn.Arn, !GetAtt PhaseRenderFn.Arn, !GetAtt PhaseStatusFn.Arn]
+                Resource: [!GetAtt PhaseExtractFn.Arn, !GetAtt PhaseInvokeFn.Arn, !GetAtt PhaseRenderFn.Arn, !GetAtt PhaseStatusFn.Arn]
               - Effect: Allow
                 Action: ["codebuild:StartBuild", "codebuild:StopBuild", "codebuild:BatchGetBuilds"]
                 Resource: !GetAtt ValidateProject.Arn
@@ -376,17 +362,6 @@ Resources:
       Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
       Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket, STATE_MACHINE_ARN: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-run"}}
 
-  ApiApproveFn:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub "${ProjectName}-api-approve"
-      Runtime: python3.12
-      Handler: api_approve.handler
-      Role: !GetAtt ApiRole.Arn
-      Timeout: 15
-      Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
-      Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket, APPROVAL_TTL_SECONDS: !Ref ApprovalTtlSeconds}}
-
   ApiArtifactsFn:
     Type: AWS::Lambda::Function
     Properties:
@@ -425,17 +400,6 @@ Resources:
           ARTIFACT_BUCKET: !Ref ArtifactBucket
           AGENT_RUNTIME_ARN: !If [CreateRuntime, !GetAtt AgentRuntime.AgentRuntimeArn, ""]
 
-  GateWaitFn:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub "${ProjectName}-gate-wait"
-      Runtime: python3.12
-      Handler: gate_wait.handler
-      Role: !GetAtt PhaseRole.Arn
-      Timeout: 15
-      Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
-      Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket}}
-
   PhaseRenderFn:
     Type: AWS::Lambda::Function
     Properties:
@@ -473,7 +437,6 @@ Resources:
       DefinitionSubstitutions:
         PhaseExtractArn: !GetAtt PhaseExtractFn.Arn
         PhaseInvokeArn: !GetAtt PhaseInvokeFn.Arn
-        GateWaitArn: !GetAtt GateWaitFn.Arn
         PhaseRenderArn: !GetAtt PhaseRenderFn.Arn
         PhaseStatusArn: !GetAtt PhaseStatusFn.Arn
         ValidateProject: !Ref ValidateProject
@@ -507,9 +470,6 @@ Resources:
   RunsIntegration:
     Type: AWS::ApiGatewayV2::Integration
     Properties: {ApiId: !Ref Api, IntegrationType: AWS_PROXY, IntegrationUri: !GetAtt ApiRunsFn.Arn, PayloadFormatVersion: "2.0"}
-  ApproveIntegration:
-    Type: AWS::ApiGatewayV2::Integration
-    Properties: {ApiId: !Ref Api, IntegrationType: AWS_PROXY, IntegrationUri: !GetAtt ApiApproveFn.Arn, PayloadFormatVersion: "2.0"}
   ArtifactsIntegration:
     Type: AWS::ApiGatewayV2::Integration
     Properties: {ApiId: !Ref Api, IntegrationType: AWS_PROXY, IntegrationUri: !GetAtt ApiArtifactsFn.Arn, PayloadFormatVersion: "2.0"}
@@ -532,9 +492,6 @@ Resources:
   RouteAudit:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref Api, RouteKey: "GET /runs/{runId}/audit", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
-  RouteApprove:
-    Type: AWS::ApiGatewayV2::Route
-    Properties: {ApiId: !Ref Api, RouteKey: "POST /runs/{runId}/approvals", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${ApproveIntegration}"}
   RouteArtifact:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref Api, RouteKey: "GET /runs/{runId}/artifacts/{name}", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${ArtifactsIntegration}"}
@@ -550,9 +507,6 @@ Resources:
   PermRuns:
     Type: AWS::Lambda::Permission
     Properties: {Action: "lambda:InvokeFunction", FunctionName: !Ref ApiRunsFn, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"}
-  PermApprove:
-    Type: AWS::Lambda::Permission
-    Properties: {Action: "lambda:InvokeFunction", FunctionName: !Ref ApiApproveFn, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"}
   PermArtifacts:
     Type: AWS::Lambda::Permission
     Properties: {Action: "lambda:InvokeFunction", FunctionName: !Ref ApiArtifactsFn, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"}

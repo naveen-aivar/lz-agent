@@ -44,8 +44,10 @@ cat > build/config.json <<EOF
 {"apiUrl":"$(out ApiUrl)","clientId":"$(out UserPoolClientId)","cognitoDomain":"$(out CognitoDomain)"}
 EOF
 UI=$(out UiBucketName)
-aws s3 cp ui/index.html "s3://$UI/index.html" --content-type text/html --only-show-errors
-aws s3 cp ui/app.js "s3://$UI/app.js" --content-type application/javascript --only-show-errors
+# no-cache: browsers must revalidate the UI files on every load, or a stale app.js can meet a new index.html (blank page)
+sed "s|src=\"app.js\"|src=\"app.js?v=$(date +%s)\"|" ui/index.html > build/index.html  # version the script so a cached app.js cannot meet a new page
+aws s3 cp build/index.html "s3://$UI/index.html" --content-type text/html --cache-control no-cache --only-show-errors
+aws s3 cp ui/app.js "s3://$UI/app.js" --content-type application/javascript --cache-control no-cache --only-show-errors
 aws s3 cp build/config.json "s3://$UI/config.json" --content-type application/json --cache-control no-store --only-show-errors
 echo "UI: $(out UiUrl)"
 [ -n "$TAG" ] || echo "First pass done. Re-run with an image tag (e.g. v1) to build the agent image and create the AgentCore runtime."

@@ -1,5 +1,5 @@
 {
-  "Comment": "SOW -> scope (agent) -> human approval -> deterministic render of Terraform + CloudFormation -> validation -> delivered.",
+  "Comment": "SOW -> scope (agent) -> deterministic render of Terraform + CloudFormation -> validation -> delivered. The stacks are shipped to the customer, never deployed from here.",
   "StartAt": "ExtractText",
   "States": {
     "ExtractText": {
@@ -14,13 +14,6 @@
       "Parameters": {"FunctionName": "${PhaseInvokeArn}", "Payload": {"runId.$": "$.runId", "phase": "intake"}},
       "ResultPath": null,
       "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 15, "MaxAttempts": 1, "BackoffRate": 2}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "MarkFailed", "ResultPath": "$.error"}],
-      "Next": "GateA"
-    },
-    "GateA": {
-      "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
-      "Parameters": {"FunctionName": "${GateWaitArn}", "Payload": {"runId.$": "$.runId", "gate": "A", "taskToken.$": "$$.Task.Token"}},
-      "ResultPath": null, "TimeoutSeconds": 604800,
       "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "MarkFailed", "ResultPath": "$.error"}],
       "Next": "RenderStacks"
     },

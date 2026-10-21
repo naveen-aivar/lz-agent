@@ -20,7 +20,7 @@ def invoke(payload, context):
         return {"status": "error", "error": f"unknown phase {phase}"}
     tools.set_run(run_id)
     agent = Agent(
-        model=BedrockModel(model_id=MODEL_ID, max_tokens=16384),
+        model=BedrockModel(model_id=MODEL_ID, max_tokens=32768),
         system_prompt=SYSTEM,
         tools=[tools.read_run_state, tools.read_sow_page, tools.get_catalog, tools.save_scope, *tools.aws_docs_tools()],
     )

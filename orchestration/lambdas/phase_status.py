@@ -22,11 +22,17 @@ def handler(event, _ctx):
         except (ValueError, AttributeError):
             pass
         cause = str(cause)[:500]
-    if status == "DELIVERED":
-        try:
-            record_artifact(run_id, "report", f"runs/{run_id}/validation-report.json")
+    for name, key in (("report", "validation-report.json"), ("reports", "validation-reports.zip")):
+        try:  # the scan reports exist whenever validation ran, including when it failed
+            record_artifact(run_id, name, f"runs/{run_id}/{key}")
         except Exception:
             pass
+    if status == "DELIVERED":
+        for fmt in ("terraform", "cloudformation"):  # CodeBuild replaced the zips with versions that carry their scan reports
+            try:
+                record_artifact(run_id, fmt, f"runs/{run_id}/{fmt}.zip")
+            except Exception:
+                pass
     table().update_item(Key={"PK": f"RUN#{run_id}", "SK": "META"}, UpdateExpression="SET #s = :s, #e = :e",
                         ExpressionAttributeNames={"#s": "status", "#e": "error"},
                         ExpressionAttributeValues={":s": status, ":e": cause})

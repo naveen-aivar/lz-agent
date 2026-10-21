@@ -1,9 +1,7 @@
-"""Shared helpers: single-table state (DynamoDB), audit log, approval verification.
+"""Shared helpers: single-table state (DynamoDB) and the audit log.
 
 Table layout (PK / SK):
   RUN#<id> / META                 run record (customer, format, requester, artifacts{phase:{key,sha}})
-  RUN#<id> / GATE#<gate>          pending gate (task token, subject artifact sha) - written by gate_wait
-  RUN#<id> / APPROVAL#<gate>      recorded approval (approver, sha, expiry) - written by api_approve only
   RUN#<id> / AUDIT#<ts>#<uuid>    append-only audit entries
 """
 import hashlib
@@ -22,7 +20,7 @@ _s3 = None
 def table():
     global _ddb
     if _ddb is None:
-        import boto3  # lazy: keeps verify_approval importable without AWS libs (unit tests)
+        import boto3  # lazy: keeps this module importable without AWS libs (unit tests)
 
         _ddb = boto3.resource("dynamodb").Table(TABLE_NAME)
     return _ddb
@@ -78,16 +76,3 @@ def record_artifact(run_id: str, phase: str, key: str) -> str:
         ExpressionAttributeValues={":a": {"key": key, "sha": sha}},
     )
     return sha
-
-
-def verify_approval(approval: dict | None, subject_sha: str, now_ts: int, requester: str | None = None) -> tuple[bool, str]:
-    """Pure decision function used by phase_render to check the approval. Fails closed."""
-    if not approval:
-        return False, "no approval recorded"
-    if approval.get("sha") != subject_sha:
-        return False, "artifact changed since approval"
-    if int(approval.get("expires", 0)) <= now_ts:
-        return False, "approval expired"
-    if requester and approval.get("approver") == requester:
-        return False, "approver must differ from requester"
-    return True, "ok"

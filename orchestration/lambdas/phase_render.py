@@ -1,11 +1,11 @@
-"""Deterministic stack generation from the APPROVED scope. No LLM. Both formats, fixed layout."""
+"""Deterministic stack generation from the saved scope. No LLM. Both formats, fixed layout."""
 import json
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
-from common import ARTIFACT_BUCKET, audit, get_run, now, record_artifact, s3, table, verify_approval, sha256_s3
+from common import ARTIFACT_BUCKET, audit, get_run, record_artifact, s3, table
 from lzcore import render, scope as scopelib
 
 
@@ -17,15 +17,9 @@ def handler(event, _ctx):
     run_id = event["runId"]
     run = get_run(run_id)
     intake = run["artifacts"]["intake"]
-    approval = table().get_item(Key={"PK": f"RUN#{run_id}", "SK": "APPROVAL#A"}).get("Item")
-    ok, reason = verify_approval(approval, sha256_s3(intake["key"]), now(), requester=run["requester"])
-    if not ok:
-        audit(run_id, "system", "render.denied", {"reason": reason})
-        raise PermissionError(f"scope approval check failed: {reason}")
-
     scope, errors = scopelib.validate(json.loads(_get(intake["key"])), _get(run["artifacts"]["sow"]["key"]))
-    if errors:  # defense in depth: the approved scope must still validate
-        raise ValueError("approved scope no longer validates: " + "; ".join(errors[:5]))
+    if errors:  # defense in depth: the saved scope must still validate
+        raise ValueError("saved scope no longer validates: " + "; ".join(errors[:5]))
 
     slug = scope["customer"]["orgSlug"]
     base = f"runs/{run_id}"

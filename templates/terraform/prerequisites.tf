@@ -1,4 +1,5 @@
-# Service roles that Control Tower requires before a landing zone can be created through the API.
+# Service roles that Control Tower requires before a landing zone can be created through the API
+# (landing zone 4.0 and later no longer needs AWSControlTowerConfigAggregatorRoleForOrganizations).
 data "aws_partition" "current" {}
 
 resource "aws_iam_role" "ct_admin" {
@@ -78,22 +79,4 @@ resource "aws_iam_role_policy" "ct_stackset" {
       Resource = "arn:${data.aws_partition.current.partition}:iam::*:role/AWSControlTowerExecution"
     }]
   })
-}
-
-resource "aws_iam_role" "ct_config_aggregator" {
-  name = "AWSControlTowerConfigAggregatorRoleForOrganizations"
-  path = "/service-role/"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "config.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "ct_config_aggregator" {
-  role       = aws_iam_role.ct_config_aggregator.name
-  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSConfigRoleForOrganizations"
 }

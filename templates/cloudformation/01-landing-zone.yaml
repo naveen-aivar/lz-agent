@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Control Tower landing zone. Deploy in the Organizations MANAGEMENT account, in the home region, after 00-prerequisites.
+Description: Control Tower landing zone (version 4.0). Deploy in the Organizations MANAGEMENT account, in the home region, after 00-prerequisites.
 
 Parameters:
   GovernedRegions:
@@ -7,11 +7,11 @@ Parameters:
   LogArchiveAccountId:
     Type: String
     AllowedPattern: "[0-9]{12}"
-    ConstraintDescription: Control Tower API launch needs an existing 12-digit account id.
+    ConstraintDescription: The 12-digit LogArchiveAccountId output of the 00-prerequisites stack.
   AuditAccountId:
     Type: String
     AllowedPattern: "[0-9]{12}"
-    ConstraintDescription: Control Tower API launch needs an existing 12-digit account id.
+    ConstraintDescription: The 12-digit AuditAccountId output of the 00-prerequisites stack.
   LogRetentionDays:
     Type: Number
   AccessLogRetentionDays:
@@ -19,35 +19,44 @@ Parameters:
   KmsKeyArn:
     Type: String
     Default: ""
-    Description: Optional customer-managed key. Its key policy must allow Control Tower, CloudTrail and Config.
+    Description: Optional customer managed key. Its key policy must allow Control Tower, CloudTrail and Config.
   LandingZoneVersion:
     Type: String
-    Default: "3.3"
+    Default: "4.0"
 
 Conditions:
   HasKms: !Not [!Equals [!Ref KmsKeyArn, ""]]
 
 Resources:
+  # Every service integration needs an explicit "enabled" flag; an enabled one needs its central account id.
   LandingZone:
     Type: AWS::ControlTower::LandingZone
     Properties:
       Version: !Ref LandingZoneVersion
+      RemediationTypes: [INHERITANCE_DRIFT]  # accounts moved or created into a registered OU are enrolled automatically
       Manifest:
         governedRegions: !Ref GovernedRegions
-        organizationStructure:
-          security: {name: Security}
-          sandbox: {name: Sandbox}
+        accessManagement:
+          enabled: true
+        backup:
+          enabled: false
         centralizedLogging:
+          enabled: true
           accountId: !Ref LogArchiveAccountId
           configurations:
             loggingBucket: {retentionDays: !Ref LogRetentionDays}
             accessLoggingBucket: {retentionDays: !Ref AccessLogRetentionDays}
             kmsKeyArn: !If [HasKms, !Ref KmsKeyArn, !Ref "AWS::NoValue"]
-          enabled: true
         securityRoles:
-          accountId: !Ref AuditAccountId
-        accessManagement:
           enabled: true
+          accountId: !Ref AuditAccountId
+        config:
+          enabled: true
+          accountId: !Ref AuditAccountId
+          configurations:
+            loggingBucket: {retentionDays: !Ref LogRetentionDays}
+            accessLoggingBucket: {retentionDays: !Ref AccessLogRetentionDays}
+            kmsKeyArn: !If [HasKms, !Ref KmsKeyArn, !Ref "AWS::NoValue"]
 
 Outputs:
   LandingZoneArn:

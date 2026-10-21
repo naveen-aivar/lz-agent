@@ -1,22 +1,20 @@
 """Deterministic Mermaid diagram of the AWS Organizations tree implied by a validated scope. No LLM involved.
 
 It draws only what the scope says, and marks who creates each node so the picture matches what the stacks will do:
-  stack     custom OUs the generated Terraform / CloudFormation create
-  ct        Security and Sandbox OUs and accounts that Control Tower creates
-  existing  accounts that must already exist (for example the management account)
-  planned   accounts the SOW names but these stacks do NOT create (Account Factory or manual)
+  stack     OUs and accounts the generated Terraform / CloudFormation create (accounts from the emails you provide)
+  shared    the Security OU with the Log Archive and Audit accounts: created by the stacks, set up by Control Tower
+  existing  what must already exist (the management account)
 """
 import re
 
-from .catalog import CT_MANAGED_OUS, cid
+from .catalog import SECURITY_OU, cid
+from .scope import creatable_accounts
 
 LEGEND = (
-    ("stack", "Created by the generated stacks (custom OUs)"),
-    ("ct", "Created by AWS Control Tower (Security, Sandbox, shared accounts)"),
-    ("existing", "Must already exist (for example the management account)"),
-    ("planned", "Named in the SOW but NOT created by these stacks (Account Factory or manual)"),
+    ("stack", "Created by the generated stacks (OUs, workload accounts)"),
+    ("shared", "Security OU and shared accounts: created by the stacks, set up by Control Tower"),
+    ("existing", "Already exists (the management account)"),
 )
-_ACCOUNT_CLASS = {"control-tower": "ct", "existing": "existing", "account-factory": "planned", "manual": "planned"}
 
 
 def _t(text, limit=60):
@@ -40,37 +38,36 @@ def _ou_label(name, scope, extra="", parent=""):
 def org_mermaid(scope):
     lg = scope["logging"]
     ids = {"log-archive": lg.get("logArchiveAccountId", ""), "audit": lg.get("auditAccountId", "")}
+    created = {a["name"] for a in creatable_accounts(scope)}
     scp_root = [p["id"] for p in scope["scps"] if "root" in p["targets"]]
     root_label = "Root" + ("<br/>SCPs: " + _t(", ".join(scp_root), 80) if scp_root else "")
 
     L = ["flowchart TD", f'  ROOT["{root_label}"]:::existing']
     node = {"root": "ROOT"}
-    for name in sorted(CT_MANAGED_OUS):
-        node[name] = cid("Ou", name)
-        L.append(f'  {node[name]}["{_ou_label(name, scope, " OU")}"]:::ct')
-    custom = sorted(scope["ous"], key=lambda o: (bool(o.get("parent")), o["name"]))  # top-level first, then children
-    for o in custom:
+    ous = sorted(scope["ous"], key=lambda o: (bool(o.get("parent")), o["name"]))  # top-level first, then children
+    for o in ous:
         node[o["name"]] = cid("Ou", o["name"])
-        L.append(f'  {node[o["name"]]}["{_ou_label(o["name"], scope, " OU", o.get("parent", ""))}"]:::stack')
-    for name in sorted(CT_MANAGED_OUS):
-        L.append(f"  ROOT --> {node[name]}")
-    for o in custom:
+        cls = "shared" if o["name"] == SECURITY_OU else "stack"
+        L.append(f'  {node[o["name"]]}["{_ou_label(o["name"], scope, " OU", o.get("parent", ""))}"]:::{cls}')
+    for o in ous:
         L.append(f'  {node[o.get("parent") or "root"]} --> {node[o["name"]]}')
 
     for a in scope.get("accounts", []):
         nid = cid("Acct", a["name"])
-        detail = f'{a["kind"]} · {a["provisioning"]}'
-        if a["kind"] in ids:
-            detail += f' · id: {ids[a["kind"]] or "NOT PROVIDED"}'
-        cls = _ACCOUNT_CLASS[a["provisioning"]]
+        if a["kind"] == "management":
+            detail, cls = "management · already exists", "existing"
+        else:
+            detail = a["kind"] + (" · email required" if a["name"] in created else " · existing id")
+            if a["kind"] in ids and ids[a["kind"]]:
+                detail += f' · id: {ids[a["kind"]]}'
+            cls = "shared" if a["kind"] in ids else "stack"
         L.append(f'  {nid}("{_t(a["name"])}<br/>{_t(detail, 80)}"):::{cls}')
-        L.append(f'  {node[a["ou"]]} {"-.->" if cls == "planned" else "-->"} {nid}')
+        L.append(f'  {node[a["ou"]]} --> {nid}')
 
     L += [
-        "  classDef stack fill:#dbeafe,stroke:#1d4ed8,color:#0f172a",
-        "  classDef ct fill:#ede9fe,stroke:#6d28d9,color:#0f172a",
-        "  classDef existing fill:#e2e8f0,stroke:#334155,color:#0f172a",
-        "  classDef planned fill:#ffffff,stroke:#64748b,stroke-dasharray:5 5,color:#0f172a",
+        "  classDef stack fill:#0e1e33,stroke:#2b8ef0,color:#e6e9ef",
+        "  classDef shared fill:#1f1b3d,stroke:#9b8cf7,color:#e6e9ef",
+        "  classDef existing fill:#1a1f29,stroke:#8b94a3,color:#e6e9ef",
     ]
     return "\n".join(L) + "\n"
 
@@ -82,6 +79,6 @@ def org_markdown(scope):
     if scope.get("missingRequired"):
         note = f"\n> Not ready to apply: missing {', '.join(scope['missingRequired'])}.\n"
     return (f"# Organization structure: {scope['customer']['orgName']}\n{note}\n"
-            "Generated from the approved scope (`docs/scope.json`). The stacks create only the OUs marked `stack`; "
-            "accounts are shown for context.\n\n"
+            "Generated from the scope (`docs/scope.json`). The stacks create every OU and account shown except "
+            "the management account; accounts are created from the emails you provide.\n\n"
             f"```mermaid\n{org_mermaid(scope)}```\n\n## Legend\n{legend}\n")

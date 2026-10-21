@@ -65,7 +65,7 @@ def get_catalog() -> str:
 
 @tool
 def save_scope(scope_json: str) -> str:
-    """Validate and save the scope (JSON string). Returns the list of errors to fix, or 'saved'."""
+    """Validate and save the scope (JSON string). Returns the errors to fix, or 'saved' plus any REVIEW hints."""
     sow, pages = _sow()
     missing = sorted(set(range(1, len(pages) + 1)) - _state["read"])
     if missing:
@@ -81,7 +81,14 @@ def save_scope(scope_json: str) -> str:
     body = json.dumps(normalized, indent=2, sort_keys=True)
     _s3.put_object(Bucket=BUCKET, Key=f"runs/{_state['run']}/intake/scope.json", Body=body.encode(), ServerSideEncryption="aws:kms")
     log_tool_event("tool.save_scope", {"summary": normalized["summary"], "status": normalized["status"]})
-    return f"saved. summary={json.dumps(normalized['summary'])} status={normalized['status']}"
+    out = f"saved. summary={json.dumps(normalized['summary'])} status={normalized['status']}"
+    hints = scopelib.review_hints(normalized)
+    if hints and _state.get("hints_shown", 0) < 2:  # a nudge, never a loop: shown at most twice, and the scope is already saved
+        _state["hints_shown"] = _state.get("hints_shown", 0) + 1
+        log_tool_event("tool.save_scope.review", {"hints": hints[:10]})
+        out += ("\nREVIEW before you finish (the scope above is saved). Fix these and call save_scope again, or, if you disagree "
+                "with one, leave it and say why in a short reply:\n- " + "\n- ".join(hints[:10]))
+    return out
 
 
 def aws_docs_tools():

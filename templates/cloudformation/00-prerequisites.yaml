@@ -1,7 +1,86 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Service roles that Control Tower requires before a landing zone can be created through the API.
+Description: Control Tower prerequisites (landing zone 4.0). The Security OU, the Log Archive and Audit accounts and the service roles, created before the landing zone.
+
+Metadata:  # the email may be empty only when an existing account id is given; the Rules section below enforces that
+  cfn-lint:
+    config:
+      ignore_checks: [W1030]
+
+Parameters:
+  OrganizationRootId:
+    Type: String
+    AllowedPattern: "r-[0-9a-z]{4,32}"
+    Description: "aws organizations list-roots --query 'Roots[0].Id' --output text"
+  LogArchiveAccountName:
+    Type: String
+  LogArchiveAccountEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: Root email for the new Log Archive account. It must never have been used for another AWS account.
+  LogArchiveAccountId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]{12}$"
+    Description: Optional. Only if the Log Archive account already exists and is already in the Security OU. Empty creates it from the email.
+  AuditAccountName:
+    Type: String
+  AuditAccountEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: Root email for the new Audit account. It must never have been used for another AWS account.
+  AuditAccountId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]{12}$"
+    Description: Optional. Only if the Audit account already exists and is already in the Security OU. Empty creates it from the email.
+
+Rules:
+  LogArchiveNeedsEmail:
+    RuleCondition: !Equals [!Ref LogArchiveAccountId, ""]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref LogArchiveAccountEmail, ""]]
+        AssertDescription: LogArchiveAccountEmail is required unless LogArchiveAccountId is given.
+  AuditNeedsEmail:
+    RuleCondition: !Equals [!Ref AuditAccountId, ""]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AuditAccountEmail, ""]]
+        AssertDescription: AuditAccountEmail is required unless AuditAccountId is given.
+
+Conditions:
+  CreateLogArchive: !Equals [!Ref LogArchiveAccountId, ""]
+  CreateAudit: !Equals [!Ref AuditAccountId, ""]
 
 Resources:
+  # Landing zone 4.0 does not create OUs: the Security OU must exist, directly under the root, with both accounts in it.
+  SecurityOu:
+    Type: AWS::Organizations::OrganizationalUnit
+    Properties:
+      Name: Security
+      ParentId: !Ref OrganizationRootId
+
+  # AWS accounts cannot be recreated cheaply (closing one takes up to 90 days), so they are retained if the stack is deleted.
+  LogArchiveAccount:
+    Type: AWS::Organizations::Account
+    Condition: CreateLogArchive
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AccountName: !Ref LogArchiveAccountName
+      Email: !Ref LogArchiveAccountEmail
+      ParentIds: [!Ref SecurityOu]
+
+  AuditAccount:
+    Type: AWS::Organizations::Account
+    Condition: CreateAudit
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AccountName: !Ref AuditAccountName
+      Email: !Ref AuditAccountEmail
+      ParentIds: [!Ref SecurityOu]
+
   ControlTowerAdmin:
     Type: AWS::IAM::Role
     Properties:
@@ -64,16 +143,13 @@ Resources:
                 Action: sts:AssumeRole
                 Resource: !Sub "arn:${AWS::Partition}:iam::*:role/AWSControlTowerExecution"
 
-  ControlTowerConfigAggregatorRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: AWSControlTowerConfigAggregatorRoleForOrganizations
-      Path: /service-role/
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: {Service: config.amazonaws.com}
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSConfigRoleForOrganizations"
+Outputs:
+  SecurityOuId:
+    Description: Put this in parameters/02-governance.json
+    Value: !Ref SecurityOu
+  LogArchiveAccountId:
+    Description: Put this in parameters/01-landing-zone.json
+    Value: !If [CreateLogArchive, !GetAtt LogArchiveAccount.AccountId, !Ref LogArchiveAccountId]
+  AuditAccountId:
+    Description: Put this in parameters/01-landing-zone.json
+    Value: !If [CreateAudit, !GetAtt AuditAccount.AccountId, !Ref AuditAccountId]

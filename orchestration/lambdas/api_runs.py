@@ -26,11 +26,11 @@ def _resp(code, body):
 
 def _claims(event):
     c = event["requestContext"]["authorizer"]["jwt"]["claims"]
-    return c["sub"], "approvers" in c.get("cognito:groups", "")
+    return c["sub"]
 
 
-def _can_view(run, sub, is_approver):
-    return run["requester"] == sub or is_approver
+def _can_view(run, sub):
+    return run["requester"] == sub  # each user sees their own runs
 
 
 def _create(event, sub):
@@ -60,13 +60,13 @@ def _create(event, sub):
     return _resp(201, {"runId": run_id, "upload": upload})
 
 
-def _list(sub, approver):
-    """Newest runs first: the caller's own, or all of them for approvers. A scan is fine at this volume."""
+def _list(sub):
+    """The caller's runs, newest first. A scan is fine at this volume."""
     kwargs = {"FilterExpression": "SK = :m", "ExpressionAttributeValues": {":m": "META"}}
     runs = []
     while True:
         page = table().scan(**kwargs)
-        runs += [r for r in page["Items"] if _can_view(r, sub, approver)]
+        runs += [r for r in page["Items"] if _can_view(r, sub)]
         if "LastEvaluatedKey" not in page:
             break
         kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
@@ -99,28 +99,26 @@ def _start(run_id, sub):
     return _resp(202, {"runId": run_id})
 
 
-def _get(run_id, sub, approver):
+def _get(run_id, sub):
     items = table().query(KeyConditionExpression=Key("PK").eq(f"RUN#{run_id}"))["Items"]
     meta = next((i for i in items if i["SK"] == "META"), None)
-    if not meta or not _can_view(meta, sub, approver):
+    if not meta or not _can_view(meta, sub):
         return _resp(404, {"error": "not found"})
     meta.pop("requirements", None)
-    gates = [{"gate": i["SK"][5:], "sha": i["sha"]} for i in items if i["SK"].startswith("GATE#")]
-    approvals = [{"gate": i["SK"][9:], "approver": i["approver"], "at": i["approvedAt"]} for i in items if i["SK"].startswith("APPROVAL#")]
-    return _resp(200, {"run": meta, "openGates": gates, "approvals": approvals})
+    return _resp(200, {"run": meta})
 
 
-def _audit(run_id, sub, approver):
+def _audit(run_id, sub):
     run = get_run(run_id)
-    if not run or not _can_view(run, sub, approver):
+    if not run or not _can_view(run, sub):
         return _resp(404, {"error": "not found"})
     items = table().query(KeyConditionExpression=Key("PK").eq(f"RUN#{run_id}") & Key("SK").begins_with("AUDIT#"))["Items"]
     return _resp(200, {"audit": items})
 
 
-def _scope(run_id, sub, approver):
+def _scope(run_id, sub):
     run = get_run(run_id)
-    if not run or not _can_view(run, sub, approver):
+    if not run or not _can_view(run, sub):
         return _resp(404, {"error": "not found"})
     art = run["artifacts"].get("intake")
     if not art:
@@ -131,17 +129,17 @@ def _scope(run_id, sub, approver):
 
 
 def handler(event, _ctx):
-    sub, approver = _claims(event)
+    sub = _claims(event)
     route = event["routeKey"]
     if route == "POST /runs":
         return _create(event, sub)
     if route == "GET /runs":
-        return _list(sub, approver)
+        return _list(sub)
     run_id = event["pathParameters"]["runId"]
     if route.endswith("/start"):
         return _start(run_id, sub)
     if route.endswith("/audit"):
-        return _audit(run_id, sub, approver)
+        return _audit(run_id, sub)
     if route.endswith("/scope"):
-        return _scope(run_id, sub, approver)
-    return _get(run_id, sub, approver)
+        return _scope(run_id, sub)
+    return _get(run_id, sub)
