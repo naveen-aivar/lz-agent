@@ -59,6 +59,12 @@ def get_run(run_id: str) -> dict | None:
     return table().get_item(Key={"PK": f"RUN#{run_id}", "SK": "META"}).get("Item")
 
 
+def artifact(run: dict | None, name: str) -> dict | None:
+    if not run:
+        return None
+    return (run.get("artifacts") or {}).get(name)
+
+
 def sha256_s3(key: str) -> str:
     h = hashlib.sha256()
     body = s3().get_object(Bucket=ARTIFACT_BUCKET, Key=key)["Body"]

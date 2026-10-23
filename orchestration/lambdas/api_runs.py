@@ -1,7 +1,9 @@
-"""POST /runs, POST /runs/{id}/start, GET /runs/{id}, GET /runs/{id}/audit, GET /runs/{id}/scope
+"""POST /runs, POST /runs/{id}/start, POST /runs/{id}/deploy, GET /runs/{id}, GET /runs/{id}/audit, GET /runs/{id}/scope
 
 Create returns an S3 presigned POST for the SOW (pdf/docx/txt/md, <= 10 MB). The workflow only starts on /start,
 after the upload has landed, so the pipeline never races the upload.
+
+/deploy starts a deploy run (AWS Transform required) against a DELIVERED design run.
 """
 import json
 import os
@@ -71,7 +73,7 @@ def _list(sub):
             break
         kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
     runs.sort(key=lambda r: r["createdAt"], reverse=True)
-    keep = ("runId", "customerId", "status", "createdAt")
+    keep = ("runId", "customerId", "status", "createdAt", "runKind", "designRunId")
     return _resp(200, {"runs": [{**{k: r.get(k) for k in keep}, "error": str(r.get("error", ""))[:200]} for r in runs[:25]]})
 
 
@@ -97,6 +99,54 @@ def _start(run_id, sub):
                         ExpressionAttributeValues={":e": ex["executionArn"]})
     audit(run_id, sub, "run.started", {})
     return _resp(202, {"runId": run_id})
+
+
+def _deploy(design_run_id, sub, event):
+    design = get_run(design_run_id)
+    if not design or design["requester"] != sub:
+        return _resp(404, {"error": "not found"})
+    if design.get("runKind") == "deploy":
+        return _resp(400, {"error": "path must be a design run id, not a deploy run"})
+    if design.get("status") != "DELIVERED":
+        return _resp(409, {"error": "design run must be DELIVERED before deploy attestation"})
+    if not (design.get("artifacts") or {}).get("intake"):
+        return _resp(409, {"error": "design run has no approved scope"})
+
+    if not os.environ.get("TRANSFORM_WORKSPACE_ID", "").strip():
+        return _resp(503, {"error": "deploy requires TRANSFORM_WORKSPACE_ID on the platform stack"})
+
+    deploy_id = uuid.uuid4().hex
+    item = {
+        "PK": f"RUN#{deploy_id}",
+        "SK": "META",
+        "runId": deploy_id,
+        "runKind": "deploy",
+        "designRunId": design_run_id,
+        "customerId": design.get("customerId", ""),
+        "requester": sub,
+        "status": "RUNNING",
+        "createdAt": now(),
+        "artifacts": {},
+        "error": "",
+        "transformWorkspaceId": os.environ["TRANSFORM_WORKSPACE_ID"].strip(),
+    }
+    table().put_item(Item=item)
+    sm = os.environ.get("DEPLOY_STATE_MACHINE_ARN")
+    if not sm:
+        return _resp(503, {"error": "deploy workflow not configured"})
+    ex = sfn.start_execution(
+        stateMachineArn=sm,
+        name=deploy_id,
+        input=json.dumps({"runId": deploy_id, "continueCount": 0}),
+    )
+    table().update_item(
+        Key={"PK": f"RUN#{deploy_id}", "SK": "META"},
+        UpdateExpression="SET executionArn = :e",
+        ExpressionAttributeValues={":e": ex["executionArn"]},
+    )
+    audit(deploy_id, sub, "deploy.started", {"designRunId": design_run_id})
+    audit(design_run_id, sub, "design.deploy_requested", {"deployRunId": deploy_id})
+    return _resp(202, {"runId": deploy_id, "designRunId": design_run_id})
 
 
 def _get(run_id, sub):
@@ -138,6 +188,8 @@ def handler(event, _ctx):
     run_id = event["pathParameters"]["runId"]
     if route.endswith("/start"):
         return _start(run_id, sub)
+    if route.endswith("/deploy"):
+        return _deploy(run_id, sub, event)
     if route.endswith("/audit"):
         return _audit(run_id, sub)
     if route.endswith("/scope"):

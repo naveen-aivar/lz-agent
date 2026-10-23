@@ -1,5 +1,6 @@
 """Agent tools. Every tool writes an audit entry. save_scope is gated by deterministic validation in lzcore:
 all SOW pages must have been read, quotes must exist in the SOW, ids must be in the closed catalogs."""
+import hashlib
 import json
 import os
 import time
@@ -10,6 +11,12 @@ from strands import tool
 
 from lzcore import scope as scopelib
 from lzcore.catalog import catalog_for_agent
+from lzcore.foundation_assessment import (
+    build_foundation_assessment,
+    classification_from_agent,
+    validate_agent_classification,
+)
+from lzcore.iac_plan import suggest_changes, validate as validate_iac_plan
 from lzcore.regions import ALL_REGIONS
 
 TABLE = os.environ["STATE_TABLE"]
@@ -17,11 +24,56 @@ BUCKET = os.environ["ARTIFACT_BUCKET"]
 
 _ddb = boto3.resource("dynamodb").Table(TABLE)
 _s3 = boto3.client("s3")
-_state = {"run": None, "pages": None, "read": set(), "sow": None}
+_state = {
+    "run": None,
+    "pages": None,
+    "read": set(),
+    "sow": None,
+    "mode": "intake",
+    "design_run_id": None,
+    "transform_workspace_id": None,
+    "transform_analyze_job_id": None,
+    "transform_deploy_job_id": None,
+}
 
 
 def set_run(run_id: str) -> None:
-    _state.update(run=run_id, pages=None, read=set(), sow=None)
+    _state.update(run=run_id, pages=None, read=set(), sow=None, mode="intake", design_run_id=None)
+
+
+def set_deploy_run(run_id: str) -> None:
+    meta = _ddb.get_item(Key={"PK": f"RUN#{run_id}", "SK": "META"}).get("Item") or {}
+    if meta.get("runKind") != "deploy":
+        raise ValueError("not a deploy run")
+    design_run_id = meta.get("designRunId")
+    if not design_run_id:
+        raise ValueError("deploy run missing designRunId")
+    _state.update(
+        run=run_id,
+        pages=None,
+        read=set(),
+        sow=None,
+        mode="deploy",
+        design_run_id=design_run_id,
+        transform_workspace_id=meta.get("transformWorkspaceId"),
+        transform_analyze_job_id=meta.get("transformAnalyzeJobId"),
+        transform_deploy_job_id=meta.get("transformDeployJobId"),
+        polls_this_invoke=0,
+    )
+
+
+def _record_artifact(phase: str, key: str) -> None:
+    h = hashlib.sha256()
+    body = _s3.get_object(Bucket=BUCKET, Key=key)["Body"]
+    for chunk in iter(lambda: body.read(1024 * 1024), b""):
+        h.update(chunk)
+    sha = h.hexdigest()
+    _ddb.update_item(
+        Key={"PK": f"RUN#{_state['run']}", "SK": "META"},
+        UpdateExpression="SET artifacts.#p = :a",
+        ExpressionAttributeNames={"#p": phase},
+        ExpressionAttributeValues={":a": {"key": key, "sha": sha}},
+    )
 
 
 def log_tool_event(action: str, detail: dict) -> None:
@@ -89,6 +141,167 @@ def save_scope(scope_json: str) -> str:
         out += ("\nREVIEW before you finish (the scope above is saved). Fix these and call save_scope again, or, if you disagree "
                 "with one, leave it and say why in a short reply:\n- " + "\n- ".join(hints[:10]))
     return out
+
+
+def _deployment_prefix() -> str:
+    return f"runs/{_state['run']}/deployment"
+
+
+def _load_json(key: str) -> dict:
+    return json.loads(_s3.get_object(Bucket=BUCKET, Key=key)["Body"].read().decode())
+
+
+@tool
+def read_deploy_context() -> str:
+    """Deploy run: classification, gap analysis, and deterministic suggested IaC changes."""
+    if _state.get("mode") != "deploy":
+        raise ValueError("only available in deploy phase")
+    base = _deployment_prefix()
+    gaps = _load_json(f"{base}/gap-analysis.json")
+    scope_key = f"runs/{_state['design_run_id']}/intake/scope.json"
+    scope = _load_json(scope_key)
+    snapshot = _load_json(f"{base}/foundation.json")
+    suggested = suggest_changes(scope, gaps)
+    heuristic = None
+    try:
+        heuristic = _load_json(f"{base}/classification-heuristic.json")
+    except Exception:
+        pass
+    saved_assessment = None
+    try:
+        saved_assessment = _load_json(f"{base}/foundation-assessment.json")
+    except Exception:
+        pass
+    transform_ctx: dict = {
+        "workspaceId": _state.get("transform_workspace_id") or os.environ.get("TRANSFORM_WORKSPACE_ID"),
+        "analyzeJobId": _state.get("transform_analyze_job_id"),
+        "deployJobId": _state.get("transform_deploy_job_id"),
+    }
+    try:
+        transform_ctx["analyzePoll"] = _load_json(f"{base}/transform-poll-analyze.json")
+    except Exception:
+        pass
+    if snapshot.get("transform"):
+        transform_ctx["mergedFoundation"] = snapshot["transform"]
+
+    log_tool_event("tool.read_deploy_context", {"designRunId": _state["design_run_id"]})
+    return json.dumps(
+        {
+            "runId": _state["run"],
+            "designRunId": _state["design_run_id"],
+            "gaps": gaps,
+            "heuristicClassification": heuristic,
+            "foundationAssessmentSaved": saved_assessment,
+            "scopeSummary": scope.get("summary"),
+            "suggestedChanges": suggested,
+            "transform": transform_ctx,
+            "instruction": (
+                "You must decide greenfield vs brownfield using the org snapshot, gaps, heuristic hint, "
+                "and Transform MCP analyze job output, then call save_foundation_assessment before save_iac_change_plan."
+            ),
+        },
+        default=str,
+    )
+
+
+@tool
+def save_foundation_assessment(assessment_json: str) -> str:
+    """Save authoritative greenfield/brownfield assessment for this deploy run (required before the IaC plan)."""
+    if _state.get("mode") != "deploy":
+        raise ValueError("only available in deploy phase")
+    try:
+        submission = json.loads(assessment_json)
+    except ValueError as e:
+        return f"REFUSED: invalid JSON: {e}"
+    normalized, errors = validate_agent_classification(submission)
+    if errors:
+        log_tool_event("tool.save_foundation_assessment.rejected", {"errors": errors[:20]})
+        return "ERRORS (fix and call save_foundation_assessment again):\n- " + "\n- ".join(errors[:40])
+
+    base = _deployment_prefix()
+    scope_key = f"runs/{_state['design_run_id']}/intake/scope.json"
+    scope = _load_json(scope_key)
+    snapshot = _load_json(f"{base}/foundation.json")
+    gaps = _load_json(f"{base}/gap-analysis.json")
+    classification = classification_from_agent(normalized)
+    assessment = build_foundation_assessment(
+        scope=scope,
+        snapshot=snapshot,
+        classification=classification,
+        gaps=gaps,
+    )
+    assessment["decidedBy"] = "agent"
+    assessment["rationale"] = normalized["rationale"]
+    if normalized.get("transformAnalyzeInsights"):
+        assessment["transformAnalyzeInsights"] = normalized["transformAnalyzeInsights"]
+    if normalized.get("notes"):
+        assessment["notes"] = list(assessment.get("notes") or []) + normalized["notes"]
+
+    assess_key = f"{base}/foundation-assessment.json"
+    class_key = f"{base}/classification.json"
+    for key, payload in (
+        (assess_key, assessment),
+        (class_key, classification),
+    ):
+        _s3.put_object(
+            Bucket=BUCKET,
+            Key=key,
+            Body=json.dumps(payload, indent=2, sort_keys=True).encode(),
+            ServerSideEncryption="aws:kms",
+        )
+    _record_artifact("foundation-assessment", assess_key)
+    log_tool_event(
+        "tool.save_foundation_assessment",
+        {"environment": assessment["environment"], "rationaleLen": len(normalized["rationale"])},
+    )
+    return f"saved. environment={assessment['environment']}"
+
+
+@tool
+def read_approved_scope() -> str:
+    """Return the approved design scope.json (truncated lists if huge)."""
+    if _state.get("mode") != "deploy":
+        raise ValueError("only available in deploy phase")
+    scope = _load_json(f"runs/{_state['design_run_id']}/intake/scope.json")
+    log_tool_event("tool.read_approved_scope", {})
+    return json.dumps(scope, default=str)[:120_000]
+
+
+@tool
+def save_iac_change_plan(plan_json: str) -> str:
+    """Validate and save iac-change-plan.json for this deploy run."""
+    if _state.get("mode") != "deploy":
+        raise ValueError("only available in deploy phase")
+    try:
+        plan = json.loads(plan_json)
+    except ValueError as e:
+        return f"REFUSED: invalid JSON: {e}"
+    normalized, errors = validate_iac_plan(plan, run_id=_state["run"], design_run_id=_state["design_run_id"])
+    if errors:
+        log_tool_event("tool.save_iac_change_plan.rejected", {"errors": errors[:20]})
+        return "ERRORS (fix and call save_iac_change_plan again):\n- " + "\n- ".join(errors[:40])
+    key = f"{_deployment_prefix()}/iac-change-plan.json"
+    _s3.put_object(
+        Bucket=BUCKET,
+        Key=key,
+        Body=json.dumps(normalized, indent=2, sort_keys=True).encode(),
+        ServerSideEncryption="aws:kms",
+    )
+    log_tool_event("tool.save_iac_change_plan", {"strategy": normalized.get("strategy"), "changes": len(normalized.get("changes") or [])})
+    return f"saved. strategy={normalized.get('strategy')} changes={len(normalized.get('changes') or [])}"
+
+
+def deploy_tools():
+    from deploy_workflow_tools import workflow_tools
+
+    return [
+        *workflow_tools(),
+        read_deploy_context,
+        read_approved_scope,
+        get_catalog,
+        save_foundation_assessment,
+        save_iac_change_plan,
+    ]
 
 
 def aws_docs_tools():

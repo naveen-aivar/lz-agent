@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 # Deploys the PLATFORM into the account/region of your current AWS credentials. Creates real resources: review first.
 # Usage: scripts/deploy.sh <code-bucket> <cognito-domain-prefix> <bedrock-model-id> [image-tag]
+# Required: TRANSFORM_WORKSPACE_ID=<uuid> for deploy runs. Optional: BEDROCK_API_KEY_SECRET_ARN, TRANSFORM_ORCHESTRATOR_AGENT.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CODE_BUCKET=${1:?existing S3 bucket for code}; DOMAIN=${2:?cognito domain prefix}; MODEL=${3:?bedrock model/inference-profile id}
 TAG=${4:-}
-STACK=lz-agent
+STACK="${CFN_STACK:-lz-agent}"
+PROJECT="${PROJECT_NAME:-lz-agent}"
 
 echo "Packaging Lambdas (python3.12, linux x86_64 wheels) and buildspecs"
 rm -rf build && mkdir -p build/pkg
 pip install -q --target build/pkg --platform manylinux2014_x86_64 --python-version 3.12 --only-binary=:all: pypdf python-docx
+pip install -q --target build/pkg -r orchestration/requirements.txt
 cp orchestration/lambdas/*.py build/pkg/
 cp -R lzcore templates build/pkg/
 find build/pkg -name __pycache__ -type d -prune -exec rm -rf {} +
 (cd build/pkg && zip -qr ../orchestration.zip .)
 (cd buildspecs && zip -qr ../build/buildspecs.zip .)
-cp orchestration/statemachine.asl.json build/
-for f in orchestration.zip buildspecs.zip statemachine.asl.json; do aws s3 cp "build/$f" "s3://$CODE_BUCKET/$f" --only-show-errors; done
+cp orchestration/statemachine.asl.json orchestration/deployment.asl.json build/
+for f in orchestration.zip buildspecs.zip statemachine.asl.json deployment.asl.json; do aws s3 cp "build/$f" "s3://$CODE_BUCKET/$f" --only-show-errors; done
 
 IMAGE_URI=""
 if [ -n "$TAG" ]; then
@@ -27,9 +30,17 @@ if [ -n "$TAG" ]; then
   IMAGE_URI="$REPO_URI:$TAG"
 fi
 
+: "${TRANSFORM_WORKSPACE_ID:?set TRANSFORM_WORKSPACE_ID (AWS Transform workspace UUID) before deploy}"
+DEPLOY_PARAMS=(ProjectName="$PROJECT" CodeBucket="$CODE_BUCKET" CognitoDomainPrefix="$DOMAIN" ModelId="$MODEL" AgentImageUri="$IMAGE_URI" TransformWorkspaceId="$TRANSFORM_WORKSPACE_ID")
+if [ -n "${BEDROCK_API_KEY_SECRET_ARN:-}" ]; then
+  DEPLOY_PARAMS+=(BedrockApiKeySecretArn="$BEDROCK_API_KEY_SECRET_ARN")
+fi
+if [ -n "${TRANSFORM_ORCHESTRATOR_AGENT:-}" ]; then
+  DEPLOY_PARAMS+=(TransformOrchestratorAgent="$TRANSFORM_ORCHESTRATOR_AGENT")
+fi
 aws cloudformation deploy --stack-name "$STACK" --template-file infra/platform/platform.yaml \
   --capabilities CAPABILITY_IAM \
-  --parameter-overrides CodeBucket="$CODE_BUCKET" CognitoDomainPrefix="$DOMAIN" ModelId="$MODEL" AgentImageUri="$IMAGE_URI"
+  --parameter-overrides "${DEPLOY_PARAMS[@]}"
 
 # CloudFormation does not see a changed zip under the same S3 key, so push the new code to the Zip Lambdas directly
 for fn in $(aws cloudformation describe-stack-resources --stack-name "$STACK" --query "StackResources[?ResourceType=='AWS::Lambda::Function'].PhysicalResourceId" --output text); do

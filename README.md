@@ -2,7 +2,7 @@
 
 Upload a SOW (PDF, DOCX, TXT, MD) or paste requirements. An agent reads **all of it** and extracts the Control Tower scope. Deterministic code then generates a **Terraform stack and a CloudFormation stack** with a fixed file layout. Both stacks are validated and offered for download. Customers deploy them through their own pipeline.
 
-Nothing in this repo deploys into a customer account. **Nothing here has been deployed or run against a live AWS account.**
+Design runs do not deploy into customer accounts from this platform. **Deploy runs** use **AWS Transform** (required workspace id on the stack) for analyze/apply; see `docs/deployment-agent-scope.md` (stakeholder scope) and `docs/deployment-agent-transform.md` (technical flow).
 
 ## Flow
 ```
@@ -42,15 +42,16 @@ See `docs/AWS-REVIEW.md` for how the design was checked against the AWS document
 |---|---|
 | `lzcore/` | shared deterministic core: `regions`, `catalog`, `scope` (schema + validation), `customscp` (AI-written SCP validation), `diagram` (org tree), `render`, `extract` |
 | `templates/` | static Terraform/CFN files and the two bundle READMEs |
-| `agent/` | Strands agent (4 tools: read SOW page, catalog, save scope, run state) and ARM64 container |
+| `agent/` | Strands AgentCore: **intake** (SOW → scope) and **deploy** (discover, Transform, plan, render via tools + Transform MCP); ARM64 container |
 | `orchestration/` | Step Functions definition, Lambdas, tests |
 | `buildspecs/` | CodeBuild validation (`validate.yml`, `validate.sh`, `report.py` builds the scan report and bundles) |
 | `infra/platform/platform.yaml` | the platform: Cognito, CloudFront+S3 (OAC), API Gateway, Lambdas, Step Functions, AgentCore runtime, CodeBuild, DynamoDB, KMS |
 | `ui/` | static SPA |
 | `scripts/deploy.sh` | packages and deploys the platform (creates real resources) |
+| `testing/main.py` | local Transform MCP + Strands smoke test (not deployed) |
 
 ## What was verified, and what was not
-Verified locally: 20 unit tests; a sample bundle passes `terraform validate`, `terraform fmt -check` and `cfn-lint` (all three bundle templates and the platform template); DOCX and PDF extraction work on generated files; scanned/blank PDFs are rejected.
+Verified locally: orchestration unit tests (`orchestration/tests`); a sample bundle passes `terraform validate`, `terraform fmt -check` and `cfn-lint` (all three bundle templates and the platform template); DOCX and PDF extraction work on generated files; scanned/blank PDFs are rejected.
 
 See `docs/AWS-REVIEW.md`: the manifest, prerequisites, baselines and resources were checked against the AWS documentation and the real
 resource schemas (`terraform validate`, `cfn-lint`), which also corrected several mistakes in the first version. **Still not verified:**
@@ -70,11 +71,14 @@ resource schemas (`terraform validate`, `cfn-lint`), which also corrected severa
 
 ## Deploy the platform (creates real resources; review first)
 ```
+export TRANSFORM_WORKSPACE_ID=<aws-transform-workspace-uuid>
 aws s3 mb s3://<code-bucket>
 scripts/deploy.sh <code-bucket> <cognito-domain-prefix> <bedrock-model-id>        # pass 1: platform + ECR
-scripts/deploy.sh <code-bucket> <cognito-domain-prefix> <bedrock-model-id> v1     # pass 2: agent image + runtime
+scripts/deploy.sh <code-bucket> <cognito-domain-prefix> <bedrock-model-id> v1     # pass 2: agent image + runtime (required for intake and deploy agent)
 ```
-Create Cognito users. Any signed-in user can start a run, and each user sees only their own runs. There is no approval step: the generated code is shipped to the customer, never deployed from here.
+Pass 2 creates the AgentCore runtime. **Design** (`POST /runs/{id}/start`) and **deploy** (`POST /runs/{designId}/deploy`) both call that runtime; pass 1 alone is not enough for agent phases.
+
+Create Cognito users. Any signed-in user can start a run, and each user sees only their own runs. Design runs ship generated code to the customer; deploy runs use AWS Transform in the platform account (see `docs/deployment-agent-scope.md`).
 
 ## Tests
 ```

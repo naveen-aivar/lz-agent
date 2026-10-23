@@ -1,0 +1,3 @@
+strands-agents>=1.62.0
+awslabs.aws-transform-mcp-server>=0.2.3
+boto3>=1.39.0

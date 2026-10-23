@@ -1,0 +1,97 @@
+{
+  "Comment": "Deploy agent loop (capped). Attestation runs inside phase_invoke when agent returns ok; MarkDelivered only updates DynamoDB status.",
+  "TimeoutSeconds": 86400,
+  "StartAt": "RunDeployAgent",
+  "States": {
+    "RunDeployAgent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PhaseInvokeArn}",
+        "Payload": {"runId.$": "$.runId", "phase": "deploy"}
+      },
+      "ResultPath": "$.lastAgent",
+      "ResultSelector": {
+        "runId.$": "$.Payload.runId",
+        "agentContinue.$": "$.Payload.agentContinue",
+        "awaitingHitl.$": "$.Payload.awaitingHitl",
+        "waitSeconds.$": "$.Payload.waitSeconds"
+      },
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "MarkFailed", "ResultPath": "$.error"}],
+      "Next": "MergeAgentResult"
+    },
+    "MergeAgentResult": {
+      "Type": "Pass",
+      "Parameters": {
+        "runId.$": "$.runId",
+        "continueCount.$": "$.continueCount",
+        "agentContinue.$": "$.lastAgent.agentContinue",
+        "awaitingHitl.$": "$.lastAgent.awaitingHitl",
+        "waitSeconds.$": "$.lastAgent.waitSeconds"
+      },
+      "Next": "DeployAgentChoice"
+    },
+    "DeployAgentChoice": {
+      "Type": "Choice",
+      "Choices": [
+        {"Variable": "$.agentContinue", "BooleanEquals": true, "Next": "IncrementContinue"}
+      ],
+      "Default": "MarkDelivered"
+    },
+    "IncrementContinue": {
+      "Type": "Pass",
+      "Parameters": {
+        "runId.$": "$.runId",
+        "continueCount.$": "States.MathAdd($.continueCount, 1)",
+        "agentContinue.$": "$.agentContinue",
+        "awaitingHitl.$": "$.awaitingHitl",
+        "waitSeconds.$": "$.waitSeconds"
+      },
+      "Next": "ContinueLimitChoice"
+    },
+    "ContinueLimitChoice": {
+      "Type": "Choice",
+      "Choices": [
+        {"Variable": "$.continueCount", "NumericGreaterThanEquals": 200, "Next": "MarkFailedContinueLimit"}
+      ],
+      "Default": "DeployAgentWait"
+    },
+    "DeployAgentWait": {
+      "Type": "Wait",
+      "SecondsPath": "$.waitSeconds",
+      "Next": "RunDeployAgent"
+    },
+    "MarkDelivered": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PhaseDeployArn}",
+        "Payload": {"runId.$": "$.runId", "status": "DELIVERED"}
+      },
+      "ResultPath": null,
+      "End": true
+    },
+    "MarkFailedContinueLimit": {
+      "Type": "Pass",
+      "Parameters": {
+        "runId.$": "$.runId",
+        "error": {
+          "Error": "DeployContinueLimitExceeded",
+          "Cause": "Transform/agent wait/resume exceeded 200 cycles; check Transform jobs and agent checkpoint."
+        }
+      },
+      "Next": "MarkFailed"
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PhaseDeployArn}",
+        "Payload": {"runId.$": "$.runId", "status": "FAILED", "error.$": "$.error"}
+      },
+      "ResultPath": null,
+      "Next": "Failed"
+    },
+    "Failed": {"Type": "Fail", "Error": "DeployRunFailed", "Cause": "See deploy run audit log"}
+  }
+}

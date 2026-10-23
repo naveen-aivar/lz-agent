@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Landing Zone Agent platform. SOW in, validated Terraform and CloudFormation stacks out. No deployment into customer accounts.
+Description: Landing Zone Agent — design runs (SOW to IaC) and deploy runs (AWS Transform + attestation).
 
 Parameters:
   ProjectName:
@@ -18,9 +18,22 @@ Parameters:
     Description: Bedrock inference-profile id for the Claude model (verify it in your region before deploying).
   CognitoDomainPrefix:
     Type: String
+  BedrockApiKeySecretArn:
+    Type: String
+    Default: ""
+    Description: Optional Secrets Manager secret (plain key or {"apiKey":"..."}) for AWS_BEARER_TOKEN_BEDROCK.
+  TransformWorkspaceId:
+    Type: String
+    MinLength: 1
+    Description: AWS Transform workspace UUID for all deploy runs (SigV4; enable Transform on the platform role).
+  TransformOrchestratorAgent:
+    Type: String
+    Default: ""
+    Description: Transform orchestrator agent name for landing-zone jobs (recommended).
 
 Conditions:
   CreateRuntime: !Not [!Equals [!Ref AgentImageUri, ""]]
+  HasBedrockApiKeySecret: !Not [!Equals [!Ref BedrockApiKeySecretArn, ""]]
 
 Resources:
   # ---------- Data ----------
@@ -188,7 +201,9 @@ Resources:
                 Resource: !GetAtt StateTable.Arn
               - Effect: Allow
                 Action: ["states:StartExecution"]
-                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-run"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-run"
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-deploy"
               - Effect: Allow
                 Action: ["s3:GetObject", "s3:PutObject"]   # PutObject: presigned POST for the SOW is signed with this role
                 Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
@@ -218,8 +233,20 @@ Resources:
               - Effect: Allow
                 Action: ["bedrock-agentcore:InvokeAgentRuntime"]
                 Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeOrganization
+                  - organizations:ListRoots
+                  - organizations:ListOrganizationalUnitsForParent
+                  - organizations:ListAccounts
+                  - organizations:ListPolicies
+                  - organizations:ListTargetsForPolicy
+                Resource: "*"
+              - Effect: Allow
+                Action: ["controltower:ListLandingZones"]
+                Resource: "*"
 
-  AgentRole:   # no CodeBuild, no Lambda, no STS: the agent can read the SOW, write the scope and call the model
+  AgentRole:   # AgentCore: SOW intake + full deploy workflow (Orgs discover, Transform API, deployment artifacts)
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -247,17 +274,35 @@ Resources:
                 Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "xray:PutTraceSegments", "xray:PutTelemetryRecords"]
                 Resource: "*"
               - Effect: Allow
-                Action: ["dynamodb:PutItem"]   # audit entries only
+                Action: ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"]
                 Resource: !GetAtt StateTable.Arn
               - Effect: Allow
                 Action: ["s3:GetObject"]
-                Resource: !Sub "${ArtifactBucket.Arn}/runs/*/sow.txt"
+                Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
               - Effect: Allow
-                Action: ["s3:PutObject", "s3:GetObject"]
-                Resource: !Sub "${ArtifactBucket.Arn}/runs/*/intake/*"
+                Action: ["s3:PutObject"]
+                Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeOrganization
+                  - organizations:ListRoots
+                  - organizations:ListOrganizationalUnitsForParent
+                  - organizations:ListAccounts
+                  - organizations:ListPolicies
+                  - organizations:ListTargetsForPolicy
+                Resource: "*"
+              - Effect: Allow
+                Action: ["controltower:ListLandingZones"]
+                Resource: "*"
               - Effect: Allow
                 Action: ["kms:Decrypt", "kms:GenerateDataKey"]
                 Resource: !GetAtt Key.Arn
+              - !If
+                - HasBedrockApiKeySecret
+                - Effect: Allow
+                  Action: ["secretsmanager:GetSecretValue"]
+                  Resource: !Ref BedrockApiKeySecretArn
+                - !Ref AWS::NoValue
 
   ValidateRole:
     Type: AWS::IAM::Role
@@ -295,7 +340,12 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: ["lambda:InvokeFunction"]
-                Resource: [!GetAtt PhaseExtractFn.Arn, !GetAtt PhaseInvokeFn.Arn, !GetAtt PhaseRenderFn.Arn, !GetAtt PhaseStatusFn.Arn]
+                Resource:
+                  - !GetAtt PhaseExtractFn.Arn
+                  - !GetAtt PhaseInvokeFn.Arn
+                  - !GetAtt PhaseRenderFn.Arn
+                  - !GetAtt PhaseStatusFn.Arn
+                  - !GetAtt PhaseDeployFn.Arn
               - Effect: Allow
                 Action: ["codebuild:StartBuild", "codebuild:StopBuild", "codebuild:BatchGetBuilds"]
                 Resource: !GetAtt ValidateProject.Arn
@@ -330,6 +380,9 @@ Resources:
         MODEL_ID: !Ref ModelId
         STATE_TABLE: !Ref StateTable
         ARTIFACT_BUCKET: !Ref ArtifactBucket
+        BEDROCK_API_KEY_SECRET_ARN: !Ref BedrockApiKeySecretArn
+        TRANSFORM_WORKSPACE_ID: !Ref TransformWorkspaceId
+        TRANSFORM_ORCHESTRATOR_AGENT: !Ref TransformOrchestratorAgent
 
   # ---------- Validation ----------
   ValidateProject:
@@ -360,7 +413,13 @@ Resources:
       Role: !GetAtt ApiRole.Arn
       Timeout: 15
       Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
-      Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket, STATE_MACHINE_ARN: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-run"}}
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTable
+          ARTIFACT_BUCKET: !Ref ArtifactBucket
+          STATE_MACHINE_ARN: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-run"
+          DEPLOY_STATE_MACHINE_ARN: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-deploy"
+          TRANSFORM_WORKSPACE_ID: !Ref TransformWorkspaceId
 
   ApiArtifactsFn:
     Type: AWS::Lambda::Function
@@ -392,7 +451,7 @@ Resources:
       Runtime: python3.12
       Handler: phase_invoke.handler
       Role: !GetAtt PhaseRole.Arn
-      Timeout: 900
+      Timeout: 900  # AgentCore deploy/intake + deploy attestation in one invoke
       Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
       Environment:
         Variables:
@@ -423,6 +482,21 @@ Resources:
       Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
       Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket}}
 
+  PhaseDeployFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-phase-deploy"
+      Runtime: python3.12
+      Handler: phase_deploy_status.handler
+      Role: !GetAtt PhaseRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTable
+          ARTIFACT_BUCKET: !Ref ArtifactBucket
+
   # ---------- Orchestration ----------
   SfnLogGroup:
     Type: AWS::Logs::LogGroup
@@ -440,6 +514,20 @@ Resources:
         PhaseRenderArn: !GetAtt PhaseRenderFn.Arn
         PhaseStatusArn: !GetAtt PhaseStatusFn.Arn
         ValidateProject: !Ref ValidateProject
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: false
+        Destinations: [{CloudWatchLogsLogGroup: {LogGroupArn: !GetAtt SfnLogGroup.Arn}}]
+
+  DeployStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-deploy"
+      RoleArn: !GetAtt SfnRole.Arn
+      DefinitionS3Location: {Bucket: !Ref CodeBucket, Key: deployment.asl.json}
+      DefinitionSubstitutions:
+        PhaseDeployArn: !GetAtt PhaseDeployFn.Arn
+        PhaseInvokeArn: !GetAtt PhaseInvokeFn.Arn
       LoggingConfiguration:
         Level: ALL
         IncludeExecutionData: false
@@ -483,6 +571,9 @@ Resources:
   RouteStartRun:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref Api, RouteKey: "POST /runs/{runId}/start", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
+  RouteDeployRun:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "POST /runs/{runId}/deploy", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
   RouteGetRun:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref Api, RouteKey: "GET /runs/{runId}", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
