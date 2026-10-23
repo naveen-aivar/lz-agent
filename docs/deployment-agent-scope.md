@@ -78,10 +78,20 @@ Optional future enhancements (not committed):
 
 ## API / operator flow (MVP)
 
-1. Complete a **design run** to **DELIVERED** (scope + stacks + validation report).  
-2. Configure platform with **`TransformWorkspaceId`** (and recommended **`TransformOrchestratorAgent`**).  
-3. `POST /runs/{designRunId}/deploy` → **deploy agent** (discover, Transform analyze/deploy with SFN wait/resume, plan, render) → attestation in **`phase_invoke`** → **DELIVERED**.  
-4. Download **`foundation-assessment`**, **`deployment-report`**, **`iac-change-plan`**, **`iac-manifest`**, and stacks on the **deploy run** when delivered.
+### Design (Architecture Design Agent)
+
+1. `POST /runs` — upload SOW or paste requirements.  
+2. `POST /runs/{runId}/start` — Step Functions **design** workflow → **DELIVERED**.  
+3. Download scope, Terraform/CloudFormation zips, validation report.
+
+### Deploy (Landing Zone Deployment Agent)
+
+1. Design run must be **DELIVERED**; platform must have **`TransformWorkspaceId`**.  
+2. `POST /runs/{designRunId}/deploy` — new deploy run + **deploy** Step Functions.  
+3. Agent loop (Transform analyze → plan → Transform deploy, with SFN wait/resume for HITL) → attestation in **`phase_invoke`** → deploy run **DELIVERED** or **FAILED**.  
+4. On **DELIVERED**, download on the **deploy run** id: **`foundation-assessment`**, **`deployment-report`**, **`iac-change-plan`**, **`iac-manifest`**, optional stack zips.
+
+Full technical sequence: [deployment-agent-transform.md](./deployment-agent-transform.md).
 
 ## Open next steps (from product review)
 

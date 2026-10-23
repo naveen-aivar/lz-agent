@@ -5,13 +5,44 @@ Upload a SOW (PDF, DOCX, TXT, MD) or paste requirements. An agent reads **all of
 Design runs do not deploy into customer accounts from this platform. **Deploy runs** use **AWS Transform** (required workspace id on the stack) for analyze/apply; see `docs/deployment-agent-scope.md` (stakeholder scope) and `docs/deployment-agent-transform.md` (technical flow).
 
 ## Flow
+
+Two **run kinds** share the API and S3 artifact bucket but use different Step Functions state machines.
+
+### Architecture design run (`POST /runs` → `/start`)
+
+State machine: `orchestration/statemachine.asl.json` (`{ProjectName}-run`).
+
 ```
-UI upload -> S3 -> [1] extract text (Lambda, pypdf / python-docx)
-  -> [2] agent extracts scope (AgentCore, Strands + Claude)   <- the only LLM step
-  -> [3] render Terraform + CloudFormation (Lambda, no LLM)
-  -> [4] validate (CodeBuild: terraform fmt/validate, tflint, cfn-lint, checkov) -> report with scanned / passed / failed counts
-  -> DELIVERED: downloads enabled (each stack zip carries its own scan reports; a separate reports zip has them all)
+UI upload → S3
+  → [1] extract text (Lambda: pypdf / python-docx)
+  → [2] intake agent (AgentCore `phase: intake`) → scope.json (validated in lzcore)
+  → [3] render Terraform + CloudFormation (Lambda, deterministic)
+  → [4] validate (CodeBuild: fmt, terraform validate, cfn-lint, …) → validation-report.json
+  → DELIVERED — download scope + stack zips + scan reports
 ```
+
+The intake agent is the **only LLM step on the design path**. Stacks are **not** applied from this platform.
+
+### Landing zone deploy run (`POST /runs/{designRunId}/deploy`)
+
+Requires a **DELIVERED** design run and **`TRANSFORM_WORKSPACE_ID`** on the stack.  
+State machine: `orchestration/deployment.asl.json` (`{ProjectName}-deploy`).
+
+```
+API creates deploy run (runKind=deploy, links designRunId)
+  → loop: phase_invoke (AgentCore `phase: deploy`)
+        Strands agent + Transform MCP + tools:
+          pre-discover → Transform analyze (poll/HITL) → merge
+          → foundation assessment + iac-change-plan → render bundles
+          → Transform deploy (poll/HITL) → post-discover → finish_deploy_workflow
+        if Transform still running: SFN waits (30s/60s) and re-invokes same session (max 200 cycles)
+  → on agent ok: attestation in phase_invoke (deployment-report.json, rule-based pass/fail)
+  → phase_deploy → DELIVERED or FAILED
+```
+
+Details: [docs/deployment-agent-transform.md](docs/deployment-agent-transform.md) and [docs/deployment-agent-scope.md](docs/deployment-agent-scope.md).
+
+PoC note: org discover/attest use the **AgentCore runtime IAM role** (platform account org), not cross-account STS.
 
 ## How the scope is kept honest (`lzcore/`)
 | Concern | Enforced by |
