@@ -79,9 +79,26 @@ const badge = (cls, text) => `<span class="badge badge-${cls}">${esc(text)}</spa
 const basisBadge = (b) => ({ explicit: badge("blue", "Quoted from the SOW"), inferred: badge("muted", "Inferred"), default: badge("amber", "Default, not in the SOW") }[b] || "");
 const kpi = (label, value, hint = "", tone = "") => `<div class="kpi ${tone ? "kpi-" + tone : ""}"><div class="kpi-label">${esc(label)}</div><div class="kpi-value">${esc(value)}</div>${hint ? `<div class="kpi-hint">${esc(hint)}</div>` : ""}</div>`;
 const isDone = (run) => run.status === "DELIVERED" || run.status === "FAILED";
-const STATE = { DELIVERED: ["green", "Ready to download"], FAILED: ["red", "Failed"], RUNNING: ["amber", "In progress"], AWAITING_INPUT: ["blue", "Starting"] };
-const stateBadge = (run) => { const [c, t] = STATE[run.status] || ["muted", run.status]; return badge(c, t); };
+const isDeployRun = (run) => run.runKind === "deploy";
+const STATE = {
+  DELIVERED: ["green", "Ready to download"],
+  FAILED: ["red", "Failed"],
+  RUNNING: ["amber", "In progress"],
+  AWAITING_INPUT: ["blue", "Starting"],
+};
+const stateBadge = (run) => {
+  const [c, t] = STATE[run.status] || ["muted", run.status];
+  return badge(c, t);
+};
+const runTypeBadge = (run) => (isDeployRun(run) ? badge("violet", "Deploy") : badge("muted", "Design"));
 const runName = (r) => pretty(r.customerId);
+const parseAuditDetail = (a) => {
+  try {
+    return typeof a.detail === "string" ? JSON.parse(a.detail || "{}") : a.detail || {};
+  } catch {
+    return {};
+  }
+};
 
 function layout(nav, crumb, html) {
   ["dashboard", "runs"].forEach((n) => $("nav-" + n).classList.toggle("active", n === nav));
@@ -101,13 +118,26 @@ async function loadReport(id, run) {
   }
   return reportCache.get(a.sha);
 }
+async function loadDeploymentReport(id, run) {
+  const a = run.artifacts && run.artifacts["deployment-report"];
+  if (!a) return null;
+  const key = `dep:${a.sha}`;
+  if (!reportCache.has(key)) {
+    try {
+      reportCache.set(key, (await api(`/runs/${id}/artifacts/deployment-report`)).deploymentReport);
+    } catch {
+      return null;
+    }
+  }
+  return reportCache.get(key);
+}
 
 /* ---------- dashboard ---------- */
 function runsTable(runs, { limit } = {}) {
   const rows = limit ? runs.slice(0, limit) : runs;
   if (!rows.length) return '<div class="empty">No runs yet. Upload a SOW above to start one.</div>';
-  return `<div class="tbl-wrap"><table><thead><tr><th>Customer</th><th>Started</th><th>State</th><th>Run</th><th></th></tr></thead><tbody>${rows.map((r) => `
-    <tr class="click" data-open="${esc(r.runId)}"><td class="name">${esc(runName(r))}</td><td>${esc(ago(r.createdAt))}</td><td>${stateBadge(r)}</td><td><code>${esc(r.runId.slice(0, 8))}</code></td>
+  return `<div class="tbl-wrap"><table><thead><tr><th>Customer</th><th>Type</th><th>Started</th><th>State</th><th>Run</th><th></th></tr></thead><tbody>${rows.map((r) => `
+    <tr class="click" data-open="${esc(r.runId)}"><td class="name">${esc(runName(r))}${isDeployRun(r) && r.designRunId ? `<div class="hint">from design <code>${esc(r.designRunId.slice(0, 8))}</code></div>` : ""}</td><td>${runTypeBadge(r)}</td><td>${esc(ago(r.createdAt))}</td><td>${stateBadge(r)}</td><td><code>${esc(r.runId.slice(0, 8))}</code></td>
     <td>${r.status === "FAILED" && r.error ? `<span style="color:var(--red)">${esc(r.error.length > 90 ? r.error.slice(0, 90) + "…" : r.error)}</span>` : `<a href="#/run/${esc(r.runId)}">View →</a>`}</td></tr>`).join("")}</tbody></table></div>`;
 }
 
@@ -138,7 +168,7 @@ function viewDashboard() {
           <li class="block"><span class="main">Custom SCPs for review</span><div class="meta">Policies the catalog can't express, written from the SOW and delivered for a person to check.</div></li>
           <li class="block"><span class="main">Scan evidence</span><div class="meta">How many security checks ran, passed and failed, bundled with the code.</div></li>
         </ul>
-        <p class="hint" style="margin-top:10px">Nothing is deployed from here. You ship the code to the customer.</p>
+        <p class="hint" style="margin-top:10px">Design runs produce code only. After validation, you can start an optional <strong>Deploy</strong> run (AWS Transform) from the run detail page.</p>
       </div>
     </div>
     <div class="card" style="margin-top:14px"><div class="card-head"><h2>Recent runs</h2><a class="card-aside" href="#/runs">All runs →</a></div>${runsTable(S.runs, { limit: 5 })}</div>`);
@@ -194,7 +224,7 @@ async function createRun() {
 function viewRuns() {
   S.runId = ""; S.data = null; clearTimeout(S.timer);
   layout("runs", "Runs", `<div class="page-title">Run history</div>
-    <p class="page-sub">Every run you started. Open one to see the organization it understood, the scan results and the downloads. Start a new run from the Dashboard.</p>
+    <p class="page-sub">Design runs generate IaC from a SOW; deploy runs apply Transform in your org and produce a foundation attestation. Open any run for progress, downloads, and activity.</p>
     <div class="panel panel-pad">${runsTable(S.runs)}</div>`);
 }
 
@@ -205,14 +235,27 @@ async function openRun(id, { silent = false } = {}) {
     const { run } = await api(`/runs/${id}`);
     const { audit } = await api(`/runs/${id}/audit`);
     let scope = null, diagram = "";
-    if (run.artifacts && run.artifacts.intake) {
+    if (isDeployRun(run) && run.designRunId) {
+      try {
+        const design = (await api(`/runs/${run.designRunId}`)).run;
+        if (design.artifacts && design.artifacts.intake) {
+          const r = await api(`/runs/${run.designRunId}/scope`);
+          scope = r.scope;
+          diagram = r.orgDiagram || "";
+        }
+      } catch { /* design scope optional while loading */ }
+    } else if (run.artifacts && run.artifacts.intake) {
       try { const r = await api(`/runs/${id}/scope`); scope = r.scope; diagram = r.orgDiagram || ""; } catch { /* still being written */ }
     }
-    const report = await loadReport(id, run);
+    const report = isDeployRun(run) ? null : await loadReport(id, run);
+    const deploymentReport = isDeployRun(run) ? await loadDeploymentReport(id, run) : null;
     if (S.runId !== id) return;  // the user moved on while this was loading
     const first = !S.data || S.data.run.runId !== id, hadScope = S.data && S.data.scope;
-    S.data = { run, audit, scope, diagram, report };
-    if (first || (!hadScope && scope)) S.tab = scope ? "organization" : "activity";
+    S.data = { run, audit, scope, diagram, report, deploymentReport };
+    if (first || (!hadScope && scope)) {
+      if (isDeployRun(run)) S.tab = deploymentReport ? "deployment" : scope ? "organization" : "activity";
+      else S.tab = scope ? "organization" : "activity";
+    }
     renderRun();
     clearTimeout(S.timer);
     if (!isDone(run)) S.timer = setTimeout(() => openRun(id, { silent: true }), 4000);
@@ -237,6 +280,7 @@ function stepsHtml(run, audit) {
 }
 
 function renderRun() {
+  if (isDeployRun(S.data.run)) return renderDeployRun();
   const { run, audit, scope, diagram, report } = S.data;
   const name = scope ? scope.customer.orgName : runName(run);
   const tabs = [];
@@ -254,12 +298,96 @@ function renderRun() {
         `<button class="tab" role="tab" id="tab-${id}" aria-selected="${S.tab === id}" aria-controls="panel-${id}" data-tab="${id}" tabindex="${S.tab === id ? 0 : -1}">${esc(label)}${n ? `<span class="count">${n}</span>` : ""}</button>`).join("")}</div>
       <div role="tabpanel" id="panel-${S.tab}" aria-labelledby="tab-${S.tab}">${panel(S.tab)}</div></div>`;
   layout("runs", name, `<div class="crumbs"><a href="#/runs">← Runs</a></div>
-    <div class="page-title">${esc(name)} ${stateBadge(run)}</div>
-    <p class="page-sub" style="margin-bottom:18px">Started ${esc(when(run.createdAt))} · Run <code>${esc(run.runId.slice(0, 8))}</code></p>
+    <div class="page-title">${esc(name)} ${runTypeBadge(run)} ${stateBadge(run)}</div>
+    <p class="page-sub" style="margin-bottom:18px">Started ${esc(when(run.createdAt))} · Design run <code>${esc(run.runId.slice(0, 8))}</code></p>
     ${failure}
-    <div class="grid-3"><div class="card"><div class="card-head"><h2>Progress</h2></div>${stepsHtml(run, audit)}</div>${deliverables(run)}${inputs(scope)}</div>
+    <div class="grid-3"><div class="card"><div class="card-head"><h2>Progress</h2></div>${stepsHtml(run, audit)}</div>${deliverables(run)}<div>${deployCtaCard(run)}${inputs(scope)}</div></div>
     ${kpis}${body}`);
   if (S.tab === "organization" && diagram) drawDiagram(diagram);
+}
+
+function deployCtaCard(run) {
+  if (isDeployRun(run) || run.status !== "DELIVERED") return "";
+  return `<div class="card"><div class="card-head"><h2>Deploy</h2></div>
+    <p class="hint">Run AWS Transform against the platform org using this approved scope and generated IaC (PoC: agent role in the platform account).</p>
+    <button class="btn btn-primary" type="button" data-deploy="${esc(run.runId)}">Start deploy run</button></div>`;
+}
+
+function deployStepsHtml(run, audit) {
+  const has = (a) => audit.some((x) => x.action === a);
+  const hasTool = (name) => audit.some((x) => x.action === name);
+  const done = [
+    hasTool("tool.run_pre_discover") || has("phase.continue"),
+    hasTool("tool.save_iac_change_plan") || hasTool("tool.render_iac_bundles"),
+    hasTool("tool.transform_start_deploy"),
+    has("deploy.attested") || (run.status === "DELIVERED" && has("phase.completed")),
+  ];
+  const steps = [
+    ["Discover baseline", "Organizations snapshot and gap analysis"],
+    ["Analyze and plan", "Transform analyze, assessment, and IaC plan"],
+    ["Transform deploy", "Apply changes in the target org"],
+    ["Attest and deliver", "Foundation report and artifacts"],
+  ];
+  const next = done.indexOf(false), failed = run.status === "FAILED";
+  return `<div class="steps">${steps.map(([name, sub], i) => {
+    const state = done[i] ? "done" : i === next ? (failed ? "failed" : run.status === "AWAITING_INPUT" ? "" : "active") : "";
+    return `<div class="step ${state}"><div class="step-rail"><span class="step-node"></span><span class="step-line"></span></div>
+      <div class="step-body"><div class="step-name">${esc(name)}</div><div class="step-sub">${esc(done[i] ? "Done" : state === "failed" ? "Stopped here" : state === "active" ? "In progress" : sub)}</div></div>
+      <span class="step-check">${done[i] ? "✓" : state === "failed" ? "✕" : ""}</span></div>`;
+  }).join("")}</div>`;
+}
+
+function deployHitlNotice(audit) {
+  const last = [...audit].reverse().find((a) => a.action === "phase.continue");
+  if (!last) return "";
+  const d = parseAuditDetail(last);
+  if (!d.awaitingHitl) return "";
+  return `<div class="notice notice-info" role="status"><strong>Waiting on AWS Transform.</strong> Complete the required step in the Transform workspace. The deploy agent will resume on its own.</div>`;
+}
+
+function renderDeployRun() {
+  const { run, audit, scope, diagram, deploymentReport } = S.data;
+  const name = scope ? scope.customer.orgName : runName(run);
+  const tabs = [];
+  if (deploymentReport) tabs.push(["deployment", "Deployment report"]);
+  if (scope && diagram) tabs.push(["organization", "Organization"]);
+  if (scope) tabs.push(["scope", "Scope"]);
+  tabs.push(["activity", "Activity"]);
+  if (!tabs.length) tabs.push(["activity", "Activity"]);
+  if (!tabs.some((t) => t[0] === S.tab)) S.tab = tabs[0][0];
+  const designLink = run.designRunId
+    ? ` · Design run <a href="#/run/${esc(run.designRunId)}"><code>${esc(run.designRunId.slice(0, 8))}</code></a>`
+    : "";
+  const failure = run.status === "FAILED"
+    ? `<div class="notice notice-err" role="alert"><strong>Deploy failed.</strong> ${esc(run.error || "No reason was recorded.")}<br>Open the Activity tab or deployment report for details.</div>`
+    : "";
+  const waiting = !isDone(run)
+    ? `<div class="card"><div class="card-head"><h2><span class="spin"></span> Deploy agent running</h2></div><p class="meta" style="color:var(--dim)">Transform and discovery can take a while. This page refreshes every few seconds. You can leave and come back from Runs.</p></div>`
+    : "";
+  const body = isDone(run) || scope
+    ? `<div class="panel panel-pad"><div class="tabs" role="tablist" aria-label="Deploy run details">${tabs.map(([id, label, n]) =>
+        `<button class="tab" role="tab" id="tab-${id}" aria-selected="${S.tab === id}" aria-controls="panel-${id}" data-tab="${id}" tabindex="${S.tab === id ? 0 : -1}">${esc(label)}${n ? `<span class="count">${n}</span>` : ""}</button>`).join("")}</div>
+      <div role="tabpanel" id="panel-${S.tab}" aria-labelledby="tab-${S.tab}">${panel(S.tab)}</div></div>`
+    : waiting;
+  layout("runs", `${name} deploy`, `<div class="crumbs"><a href="#/runs">← Runs</a></div>
+    <div class="page-title">${esc(name)} ${runTypeBadge(run)} ${stateBadge(run)}</div>
+    <p class="page-sub" style="margin-bottom:18px">Started ${esc(when(run.createdAt))} · Deploy run <code>${esc(run.runId.slice(0, 8))}</code>${designLink}</p>
+    ${failure}${deployHitlNotice(audit)}
+    <div class="grid-3"><div class="card"><div class="card-head"><h2>Progress</h2></div>${deployStepsHtml(run, audit)}</div>${deployDeliverables(run)}</div>
+    ${body}`);
+  if (S.tab === "organization" && diagram) drawDiagram(diagram);
+}
+
+function deployDeliverables(run) {
+  const ok = run.status === "DELIVERED";
+  const has = (k) => run.artifacts && run.artifacts[k];
+  const b = (k, label, primary) => `<button class="btn ${primary ? "btn-primary" : ""}" type="button" data-dl="${k}" ${ok && has(k) ? "" : "disabled"}>⤓ ${label}</button>`;
+  const note = ok
+    ? "Foundation attestation, IaC plan, manifest, and evidence JSON from the deploy workflow."
+    : run.status === "FAILED"
+      ? "Deliverables appear here if attestation completed before failure."
+      : "Available when the deploy run finishes successfully.";
+  return `<div class="card"><div class="card-head"><h2>Deliverables</h2></div><div style="display:flex;gap:8px;flex-wrap:wrap">${b("deployment-report", "Deployment report", true)}${b("foundation-assessment", "Foundation assessment")}${b("iac-change-plan", "IaC change plan")}${b("iac-manifest", "IaC manifest")}</div><p class="hint" style="margin-top:10px">${note}</p></div>`;
 }
 
 function deliverables(run) {
@@ -282,8 +410,44 @@ function inputs(scope) {
 
 /* ---------- tab panels ---------- */
 function panel(tab) {
-  const { scope, diagram, report, audit } = S.data;
-  return tab === "organization" ? orgPanel(diagram) : tab === "scope" ? scopePanel(scope) : tab === "scps" ? scpPanel(scope) : tab === "security" ? securityPanel(report) : activityPanel(audit);
+  const { scope, diagram, report, deploymentReport, audit } = S.data;
+  if (tab === "deployment") return deploymentPanel(deploymentReport);
+  if (tab === "organization") return orgPanel(diagram);
+  if (tab === "scope") return scopePanel(scope);
+  if (tab === "scps") return scpPanel(scope);
+  if (tab === "security") return securityPanel(report);
+  return activityPanel(audit);
+}
+
+const DEPLOY_OVERALL = {
+  pass: ["green", "Foundation attestation passed"],
+  pass_with_manual_steps: ["amber", "Passed with manual steps"],
+  fail: ["red", "Attestation failed"],
+};
+function deploymentPanel(rep) {
+  if (!rep) return '<div class="empty">The deployment report is not available yet.</div>';
+  const [tone, label] = DEPLOY_OVERALL[rep.overall] || ["muted", rep.overall];
+  const pre = rep.observed && rep.observed.preDeploy;
+  const post = rep.observed && rep.observed.postDeploy;
+  const gapList = (g) => {
+    if (!g) return "None listed";
+    const parts = [];
+    if ((g.missingOus || []).length) parts.push(`${g.missingOus.length} missing OU(s)`);
+    if ((g.missingAccountsByName || []).length) parts.push(`${g.missingAccountsByName.length} missing account name(s)`);
+    return parts.length ? parts.join(", ") : "No missing OUs or account names vs scope";
+  };
+  const reasons = (rep.outcomeReasons || []).length
+    ? `<ul class="bullets">${rep.outcomeReasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>`
+    : "";
+  const cls = rep.classification || {};
+  return `<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:14px">${badge(tone, label)}
+      <span class="hint">Design run <code>${esc((rep.designRunId || "").slice(0, 8))}</code></span></div>
+    ${reasons}
+    <div class="grid-kpi">${kpi("Pre-deploy OUs", pre ? pre.ouCount : "–")}${kpi("Post-deploy OUs", post ? post.ouCount : "–")}${kpi("Pre-deploy accounts", pre ? pre.accountCount : "–")}${kpi("Post-deploy accounts", post ? post.accountCount : "–")}</div>
+    <section class="sec"><h3>Classification</h3><dl class="kv"><dt>Before deploy</dt><dd>${esc(cls.preDeploy || "–")}</dd><dt>After deploy</dt><dd>${esc(cls.postDeploy || "–")}</dd></dl></section>
+    <section class="sec"><h3>Gaps vs approved scope</h3><dl class="kv"><dt>Pre-deploy</dt><dd>${esc(gapList(rep.gaps && rep.gaps.preDeploy))}</dd><dt>Post-deploy</dt><dd>${esc(gapList(rep.gaps && rep.gaps.postDeploy))}</dd></dl>
+      <p class="hint">${esc(rep.disclaimer || "")}</p></section>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px"><button class="btn btn-primary" type="button" data-dl="deployment-report">⤓ Deployment report (JSON)</button></div>`;
 }
 
 const LEGEND = [["#0e1e33", "#2b8ef0", "Created by the stacks"], ["#1f1b3d", "#9b8cf7", "Security OU and shared accounts, set up by Control Tower"], ["#1a1f29", "#8b94a3", "Already exists"]];
@@ -370,10 +534,46 @@ function securityPanel(rep) {
     <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" type="button" data-dl="reports">⤓ Scan reports (zip)</button><button class="btn" type="button" data-dl="report">⤓ Validation report (JSON)</button></div>`;
 }
 
-const ACTIONS = { "run.created": "Run created", "run.started": "Analysis started", "sow.extracted": "SOW text extracted", "phase.started": "Agent started", "phase.completed": "Scope saved",
-  "phase.failed": "Agent step failed", "bundle.rendered": "Code generated", "run.delivered": "Ready to download", "run.failed": "Run failed", "artifact.downloaded": "Download",
-  "tool.get_catalog": "Read the catalog", "tool.read_sow_page": "Read a SOW page", "tool.read_run_state": "Checked progress", "tool.save_scope": "Saved the scope",
-  "tool.save_scope.rejected": "Scope rejected, retrying", "tool.save_scope.review": "Review hints sent to the agent" };
+const ACTIONS = {
+  "run.created": "Run created",
+  "run.started": "Analysis started",
+  "sow.extracted": "SOW text extracted",
+  "phase.started": "Agent started",
+  "phase.completed": "Agent step finished",
+  "phase.continue": "Agent waiting (orchestrator resume)",
+  "phase.failed": "Agent step failed",
+  "bundle.rendered": "Code generated",
+  "run.delivered": "Ready to download",
+  "run.failed": "Run failed",
+  "artifact.downloaded": "Download",
+  "design.deploy_requested": "Deploy run requested",
+  "deploy.started": "Deploy run started",
+  "deploy.attested": "Foundation attested",
+  "deploy.delivered": "Deploy finished",
+  "deploy.failed": "Deploy failed",
+  "tool.get_catalog": "Read the catalog",
+  "tool.read_sow_page": "Read a SOW page",
+  "tool.read_run_state": "Checked progress",
+  "tool.save_scope": "Saved the scope",
+  "tool.save_scope.rejected": "Scope rejected, retrying",
+  "tool.save_scope.review": "Review hints sent to the agent",
+  "tool.run_pre_discover": "Pre-deploy discovery",
+  "tool.run_post_discover": "Post-deploy discovery",
+  "tool.transform_init_connection": "Transform connection",
+  "tool.transform_start_analyze": "Transform analyze started",
+  "tool.transform_poll_analyze_job": "Transform analyze polled",
+  "tool.transform_merge_discovery": "Merged Transform discovery",
+  "tool.save_foundation_assessment": "Saved foundation assessment",
+  "tool.save_iac_change_plan": "Saved IaC change plan",
+  "tool.render_iac_bundles": "Rendered IaC bundles",
+  "tool.transform_start_deploy": "Transform deploy started",
+  "tool.transform_poll_deploy_job": "Transform deploy polled",
+  "tool.finish_deploy_workflow": "Deploy workflow finished",
+  "tool.yield_for_orchestrator": "Yielded for orchestrator",
+  "tool.read_deploy_checkpoint": "Read deploy checkpoint",
+  "tool.read_deploy_context": "Read deploy context",
+  "tool.read_approved_scope": "Read approved scope",
+};
 function activityPanel(audit) {
   const rows = audit.filter((a) => S.steps || !a.action.startsWith("tool."));
   return `<label class="check" style="margin-bottom:10px"><input type="checkbox" id="steps" ${S.steps ? "checked" : ""}> Show the agent's individual steps</label>
@@ -390,9 +590,21 @@ async function download(name) {
     toast("Download started");
   } catch (e) { if (e.message !== "session expired") toast(e.message, "bad"); }
 }
+async function startDeploy(designRunId) {
+  try {
+    const { runId } = await api(`/runs/${designRunId}/deploy`, { method: "POST" });
+    toast("Deploy run started");
+    await loadRuns().catch(() => {});
+    location.hash = `#/run/${runId}`;
+  } catch (e) {
+    if (e.message !== "session expired") toast(e.message, "bad");
+  }
+}
 function onView(e) {
   const row = e.target.closest("[data-open]");
   if (row && !e.target.closest("a,button")) { location.hash = `#/run/${row.dataset.open}`; return; }
+  const deployBtn = e.target.closest("[data-deploy]");
+  if (deployBtn) { startDeploy(deployBtn.dataset.deploy); return; }
   const t = e.target.closest("[data-tab],[data-dl],[data-copy],[data-full]");
   if (!t) return;
   if (t.dataset.full) { const svg = diagramCache.get(S.data.diagram); if (svg) { $("fullBody").innerHTML = svg; $("full").showModal(); } }
