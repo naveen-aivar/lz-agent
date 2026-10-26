@@ -5,6 +5,28 @@ import json
 from typing import Any, Callable
 
 from lzcore import transform_ops
+# Stable handle to the real transform_ops for the exception type and principal/workspace
+# resolution. `transform_ops` above may be monkeypatched (e.g. in tests) to a fake that lacks
+# TransformAccessDenied; translation must always use the genuine module.
+from lzcore import transform_ops as _real_transform_ops
+
+
+def _translate_403(operation: str, exc: Exception) -> Exception:
+    """Return a TransformAccessDenied for an HTTP 403 (duck-typed status_code), else the
+    original exception. Defense-in-depth: the primary translation is in transform_ops._call,
+    but a 403 raised by any Transform boundary call surfaces the same actionable message
+    (principal + workspace + Contributor guidance) instead of a bare "HTTP 403".
+    """
+    if getattr(exc, "status_code", None) == 403 and not isinstance(
+        exc, _real_transform_ops.TransformAccessDenied
+    ):
+        return _real_transform_ops.TransformAccessDenied(
+            operation,
+            _real_transform_ops.workspace_id(),
+            _real_transform_ops._resolve_principal(),
+            cause=exc,
+        )
+    return exc
 
 
 def scope_summary_from_scope(scope: dict) -> str:
@@ -24,7 +46,10 @@ def put_transform_artifact(put_json: Callable[[str, dict], None], run_id: str, n
 
 
 def init_transform(*, run_id: str, put_json: Callable[[str, dict], None]) -> dict[str, Any]:
-    init = transform_ops.init_connection()
+    try:
+        init = transform_ops.init_connection()
+    except Exception as exc:
+        raise _translate_403("ListWorkspaces", exc) from exc
     ws = transform_ops.workspace_id()
     body = {"init": init, "workspaceId": ws}
     put_transform_artifact(put_json, run_id, "init", body)
@@ -39,7 +64,10 @@ def start_analyze_job(
     persist_job: Callable[[str, str], None],
 ) -> dict[str, Any]:
     prompt = scope_summary_from_scope(scope)
-    result = transform_ops.start_landing_zone_job(run_id=run_id, phase="analyze", prompt=prompt)
+    try:
+        result = transform_ops.start_landing_zone_job(run_id=run_id, phase="analyze", prompt=prompt)
+    except Exception as exc:
+        raise _translate_403("CreateJob", exc) from exc
     job_id = result["jobId"]
     ws = result.get("workspaceId") or transform_ops.workspace_id()
     persist_job(job_id, ws)
@@ -63,7 +91,10 @@ def start_deploy_job(
         + plan_hint
         + " Proceed with landing zone deployment per Transform workflow. Request human approval before destructive changes."
     )
-    result = transform_ops.start_landing_zone_job(run_id=run_id, phase="deploy", prompt=prompt)
+    try:
+        result = transform_ops.start_landing_zone_job(run_id=run_id, phase="deploy", prompt=prompt)
+    except Exception as exc:
+        raise _translate_403("CreateJob", exc) from exc
     job_id = result["jobId"]
     persist_deploy_job(job_id)
     put_transform_artifact(put_json, run_id, "deploy-started", result)
@@ -78,11 +109,16 @@ def poll_transform_job(
     label: str,
     put_json: Callable[[str, dict], None],
 ) -> dict[str, Any]:
-    poll = transform_ops.poll_job(job_id, workspace_id)
+    try:
+        poll = transform_ops.poll_job(job_id, workspace_id)
+    except Exception as exc:
+        raise _translate_403("GetJob", exc) from exc
     put_transform_artifact(put_json, run_id, f"poll-{label}", poll)
     status = poll.get("status")
-    if status == "FAILED":
-        raise RuntimeError(f"Transform job {job_id} failed: {status}")
+    # Defense-in-depth with poll_job: fail on FAILED and on cancelled/stopped terminals so a
+    # non-successful job never flows forward as if it completed.
+    if status in {"FAILED", "STOPPED", "CANCELLED", "CANCELED"}:
+        raise RuntimeError(f"Transform job {job_id} ended with status {status}")
     return {
         "jobId": job_id,
         "status": status,
@@ -101,15 +137,11 @@ def merge_transform_into_foundation(
 ) -> None:
     base = f"runs/{run_id}/deployment"
     foundation_key = f"{base}/foundation.json"
-    try:
-        foundation = get_json(foundation_key)
-    except Exception:
-        foundation = {}
-    transform_insights: dict = {}
-    try:
-        transform_insights = get_json(f"{base}/transform-poll-analyze.json")
-    except Exception:
-        pass
+    analyze_key = f"{base}/transform-poll-analyze.json"
+    # No fallback: a missing or unreadable input means the run is not in a mergeable state.
+    # Read both directly; get_json raises naming the key if the object is absent/unreadable.
+    foundation = get_json(foundation_key)
+    transform_insights = get_json(analyze_key)
     merged = {
         **foundation,
         "transform": {

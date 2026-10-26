@@ -13,6 +13,10 @@ Parameters:
     Type: String
     Default: ""
     Description: ECR image (linux/arm64). Leave empty on the first deploy; push the image, then update the stack.
+  AgentRuntimeArn:
+    Type: String
+    Default: ""
+    Description: Optional existing Bedrock AgentCore runtime ARN in this account (skips creating AgentRuntime; do not use cross-account ARNs).
   ModelId:
     Type: String
     Description: Bedrock inference-profile id for the Claude model (verify it in your region before deploying).
@@ -30,10 +34,22 @@ Parameters:
     Type: String
     Default: ""
     Description: Transform orchestrator agent name for landing-zone jobs (recommended).
+  EnableCloudFront:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set false when the AWS account is not yet verified for CloudFront (S3 website HTTP UI for PoC).
+  DeployAssumeRoleArn:
+    Type: String
+    Default: "*"
+    Description: IAM resource pattern for sts:AssumeRole on cross-account deploy targets (AgentCore role).
 
 Conditions:
-  CreateRuntime: !Not [!Equals [!Ref AgentImageUri, ""]]
+  HasExternalRuntime: !Not [!Equals [!Ref AgentRuntimeArn, ""]]
+  CreateRuntime: !And [!Not [!Equals [!Ref AgentImageUri, ""]], !Not [!Condition HasExternalRuntime]]
   HasBedrockApiKeySecret: !Not [!Equals [!Ref BedrockApiKeySecretArn, ""]]
+  UseCloudFront: !Equals [!Ref EnableCloudFront, "true"]
+  UseS3WebsiteUi: !Equals [!Ref EnableCloudFront, "false"]
 
 Resources:
   # ---------- Data ----------
@@ -77,7 +93,11 @@ Resources:
           - ServerSideEncryptionByDefault: {SSEAlgorithm: "aws:kms", KMSMasterKeyID: !GetAtt Key.Arn}
       CorsConfiguration:   # browser uploads the SOW with a presigned POST
         CorsRules:
-          - AllowedOrigins: [!Sub "https://${Distribution.DomainName}"]
+          - AllowedOrigins:
+              !If
+                - UseCloudFront
+                - [!Sub "https://${Distribution.DomainName}"]
+                - ["*"]
             AllowedMethods: [POST]
             AllowedHeaders: ["*"]
             MaxAge: 600
@@ -96,7 +116,7 @@ Resources:
             Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
             Condition: {Bool: {"aws:SecureTransport": "false"}}
 
-  # ---------- UI hosting (S3 + CloudFront OAC) ----------
+  # ---------- UI hosting (S3 + CloudFront OAC, or private S3 + API Gateway when CloudFront unavailable) ----------
   UiBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -105,6 +125,7 @@ Resources:
         ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]
 
   Oac:
+    Condition: UseCloudFront
     Type: AWS::CloudFront::OriginAccessControl
     Properties:
       OriginAccessControlConfig:
@@ -114,6 +135,7 @@ Resources:
         SigningProtocol: sigv4
 
   Distribution:
+    Condition: UseCloudFront
     Type: AWS::CloudFront::Distribution
     Properties:
       DistributionConfig:
@@ -132,6 +154,7 @@ Resources:
           ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03   # Managed-SecurityHeadersPolicy
 
   UiBucketPolicy:
+    Condition: UseCloudFront
     Type: AWS::S3::BucketPolicy
     Properties:
       Bucket: !Ref UiBucket
@@ -159,21 +182,6 @@ Resources:
   UserPoolDomain:
     Type: AWS::Cognito::UserPoolDomain
     Properties: {Domain: !Ref CognitoDomainPrefix, UserPoolId: !Ref UserPool}
-
-  UserPoolClient:
-    Type: AWS::Cognito::UserPoolClient
-    Properties:
-      UserPoolId: !Ref UserPool
-      GenerateSecret: false
-      AllowedOAuthFlowsUserPoolClient: true
-      AllowedOAuthFlows: [code]
-      AllowedOAuthScopes: [openid, email]
-      SupportedIdentityProviders: [COGNITO]
-      CallbackURLs: [!Sub "https://${Distribution.DomainName}/"]
-      LogoutURLs: [!Sub "https://${Distribution.DomainName}/"]
-      AccessTokenValidity: 60
-      IdTokenValidity: 60
-      TokenValidityUnits: {AccessToken: minutes, IdToken: minutes}
 
   # ---------- Roles ----------
   LambdaLogs:
@@ -205,11 +213,24 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-run"
                   - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-deploy"
               - Effect: Allow
+                Action: ["states:StopExecution"]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${ProjectName}-run:*"
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${ProjectName}-deploy:*"
+              - Effect: Allow
                 Action: ["s3:GetObject", "s3:PutObject"]   # PutObject: presigned POST for the SOW is signed with this role
                 Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
               - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt UiBucket.Arn
+                  - !Sub "${UiBucket.Arn}/*"
+              - Effect: Allow
                 Action: ["kms:Decrypt", "kms:GenerateDataKey"]
                 Resource: !GetAtt Key.Arn
+              - Effect: Allow
+                Action: ["sts:AssumeRole"]
+                Resource: !Ref DeployAssumeRoleArn
 
   PhaseRole:
     Type: AWS::IAM::Role
@@ -256,6 +277,13 @@ Resources:
             Principal: {Service: bedrock-agentcore.amazonaws.com}
             Action: "sts:AssumeRole"
             Condition: {StringEquals: {"aws:SourceAccount": !Ref "AWS::AccountId"}}
+          # Self-assume with a fixed session name (agent/stable_identity.py): AWS Transform keys
+          # workspace collaborators by RoleId:SessionName, and AgentCore session names change per run.
+          # Only this role may assume itself (aws:PrincipalArn is the role ARN for its sessions).
+          - Effect: Allow
+            Principal: {AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"}
+            Action: "sts:AssumeRole"
+            Condition: {ArnLike: {"aws:PrincipalArn": !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-AgentRole-*"}}
       Policies:
         - PolicyName: agent
           PolicyDocument:
@@ -277,11 +305,32 @@ Resources:
                 Action: ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"]
                 Resource: !GetAtt StateTable.Arn
               - Effect: Allow
-                Action: ["s3:GetObject"]
+                Action: ["s3:ListBucket"]
+                Resource: !GetAtt ArtifactBucket.Arn
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:HeadObject"]
                 Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
               - Effect: Allow
                 Action: ["s3:PutObject"]
                 Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
+              # AWS Transform (FES APIs + permission-only profile actions). Workspace collaborator role still required in console.
+              - Effect: Allow
+                Action: ["transform:*"]
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - transform:AccessTransformProfile
+                  - transform:GetWebAppUrl
+                  - transform:ListProfiles
+                  - transform:CreateProfile
+                  - transform:UpdateProfile
+                  - transform:DeleteProfile
+                  - transform:GetAccountSettings
+                  - transform:UpdateAccountSettings
+                  - transform:ListAgents
+                  - transform:GetAgent
+                  - transform:UpdateAgentAccess
+                Resource: "*"
               - Effect: Allow
                 Action:
                   - organizations:DescribeOrganization
@@ -294,6 +343,12 @@ Resources:
               - Effect: Allow
                 Action: ["controltower:ListLandingZones"]
                 Resource: "*"
+              - Effect: Allow
+                Action: ["sts:AssumeRole"]
+                Resource: !Ref DeployAssumeRoleArn
+              - Effect: Allow   # self-assume for the stable Transform identity
+                Action: ["sts:AssumeRole"]
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-AgentRole-*"
               - Effect: Allow
                 Action: ["kms:Decrypt", "kms:GenerateDataKey"]
                 Resource: !GetAtt Key.Arn
@@ -383,6 +438,7 @@ Resources:
         BEDROCK_API_KEY_SECRET_ARN: !Ref BedrockApiKeySecretArn
         TRANSFORM_WORKSPACE_ID: !Ref TransformWorkspaceId
         TRANSFORM_ORCHESTRATOR_AGENT: !Ref TransformOrchestratorAgent
+        AGENT_ROLE_ARN: !GetAtt AgentRole.Arn
 
   # ---------- Validation ----------
   ValidateProject:
@@ -432,6 +488,18 @@ Resources:
       Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
       Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket}}
 
+  UiServeFn:
+    Condition: UseS3WebsiteUi
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-ui-serve"
+      Runtime: python3.12
+      Handler: ui_serve.handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 10
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
+      Environment: {Variables: {UI_BUCKET: !Ref UiBucket}}
+
   PhaseExtractFn:
     Type: AWS::Lambda::Function
     Properties:
@@ -457,7 +525,11 @@ Resources:
         Variables:
           STATE_TABLE: !Ref StateTable
           ARTIFACT_BUCKET: !Ref ArtifactBucket
-          AGENT_RUNTIME_ARN: !If [CreateRuntime, !GetAtt AgentRuntime.AgentRuntimeArn, ""]
+          AGENT_RUNTIME_ARN:
+            !If
+              - HasExternalRuntime
+              - !Ref AgentRuntimeArn
+              - !If [CreateRuntime, !GetAtt AgentRuntime.AgentRuntimeArn, ""]
 
   PhaseRenderFn:
     Type: AWS::Lambda::Function
@@ -540,9 +612,36 @@ Resources:
       Name: !Sub "${ProjectName}-api"
       ProtocolType: HTTP
       CorsConfiguration:
-        AllowOrigins: [!Sub "https://${Distribution.DomainName}"]
+        AllowOrigins:
+          !If
+            - UseCloudFront
+            - [!Sub "https://${Distribution.DomainName}"]
+            - ["*"]
         AllowHeaders: [authorization, content-type]
         AllowMethods: [GET, POST, OPTIONS]
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        !If
+          - UseCloudFront
+          - [!Sub "https://${Distribution.DomainName}/"]
+          - [!Sub "${Api.ApiEndpoint}/"]
+      LogoutURLs:
+        !If
+          - UseCloudFront
+          - [!Sub "https://${Distribution.DomainName}/"]
+          - [!Sub "${Api.ApiEndpoint}/"]
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits: {AccessToken: minutes, IdToken: minutes}
 
   Authorizer:
     Type: AWS::ApiGatewayV2::Authorizer
@@ -561,6 +660,10 @@ Resources:
   ArtifactsIntegration:
     Type: AWS::ApiGatewayV2::Integration
     Properties: {ApiId: !Ref Api, IntegrationType: AWS_PROXY, IntegrationUri: !GetAtt ApiArtifactsFn.Arn, PayloadFormatVersion: "2.0"}
+  UiIntegration:
+    Condition: UseS3WebsiteUi
+    Type: AWS::ApiGatewayV2::Integration
+    Properties: {ApiId: !Ref Api, IntegrationType: AWS_PROXY, IntegrationUri: !GetAtt UiServeFn.Arn, PayloadFormatVersion: "2.0"}
 
   RouteCreateRun:
     Type: AWS::ApiGatewayV2::Route
@@ -574,6 +677,12 @@ Resources:
   RouteDeployRun:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref Api, RouteKey: "POST /runs/{runId}/deploy", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
+  RouteStopRun:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "POST /runs/{runId}/stop", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
+  RouteVerifyDeployTarget:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "POST /deploy-target/verify", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
   RouteGetRun:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref Api, RouteKey: "GET /runs/{runId}", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
@@ -586,6 +695,22 @@ Resources:
   RouteArtifact:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref Api, RouteKey: "GET /runs/{runId}/artifacts/{name}", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${ArtifactsIntegration}"}
+  RouteUiRoot:
+    Condition: UseS3WebsiteUi
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "GET /", AuthorizationType: NONE, Target: !Sub "integrations/${UiIntegration}"}
+  RouteUiIndex:
+    Condition: UseS3WebsiteUi
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "GET /index.html", AuthorizationType: NONE, Target: !Sub "integrations/${UiIntegration}"}
+  RouteUiAppJs:
+    Condition: UseS3WebsiteUi
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "GET /app.js", AuthorizationType: NONE, Target: !Sub "integrations/${UiIntegration}"}
+  RouteUiConfig:
+    Condition: UseS3WebsiteUi
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "GET /config.json", AuthorizationType: NONE, Target: !Sub "integrations/${UiIntegration}"}
 
   Stage:
     Type: AWS::ApiGatewayV2::Stage
@@ -601,12 +726,28 @@ Resources:
   PermArtifacts:
     Type: AWS::Lambda::Permission
     Properties: {Action: "lambda:InvokeFunction", FunctionName: !Ref ApiArtifactsFn, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"}
+  PermUiServe:
+    Condition: UseS3WebsiteUi
+    Type: AWS::Lambda::Permission
+    Properties: {Action: "lambda:InvokeFunction", FunctionName: !Ref UiServeFn, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"}
 
 Outputs:
-  UiUrl: {Value: !Sub "https://${Distribution.DomainName}"}
+  UiUrl:
+    Value:
+      !If
+        - UseCloudFront
+        - !Sub "https://${Distribution.DomainName}"
+        - !GetAtt Api.ApiEndpoint
   UiBucketName: {Value: !Ref UiBucket}
+  EnableCloudFront: {Value: !Ref EnableCloudFront}
   ApiUrl: {Value: !GetAtt Api.ApiEndpoint}
   UserPoolId: {Value: !Ref UserPool}
   UserPoolClientId: {Value: !Ref UserPoolClient}
   CognitoDomain: {Value: !Sub "${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"}
   AgentRepoUri: {Value: !GetAtt AgentRepo.RepositoryUri}
+  AgentRuntimeArnInUse:
+    Value:
+      !If
+        - HasExternalRuntime
+        - !Ref AgentRuntimeArn
+        - !If [CreateRuntime, !GetAtt AgentRuntime.AgentRuntimeArn, ""]

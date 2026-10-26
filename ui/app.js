@@ -79,6 +79,11 @@ const badge = (cls, text) => `<span class="badge badge-${cls}">${esc(text)}</spa
 const basisBadge = (b) => ({ explicit: badge("blue", "Quoted from the SOW"), inferred: badge("muted", "Inferred"), default: badge("amber", "Default, not in the SOW") }[b] || "");
 const kpi = (label, value, hint = "", tone = "") => `<div class="kpi ${tone ? "kpi-" + tone : ""}"><div class="kpi-label">${esc(label)}</div><div class="kpi-value">${esc(value)}</div>${hint ? `<div class="kpi-hint">${esc(hint)}</div>` : ""}</div>`;
 const isDone = (run) => run.status === "DELIVERED" || run.status === "FAILED";
+
+function stopRunButton(run) {
+  if (run.status !== "RUNNING") return "";
+  return `<button class="btn btn-sm" type="button" data-stop-run="${esc(run.runId)}" title="Stop Step Functions and mark this run failed">Stop run</button>`;
+}
 const isDeployRun = (run) => run.runKind === "deploy";
 const STATE = {
   DELIVERED: ["green", "Ready to download"],
@@ -298,7 +303,7 @@ function renderRun() {
         `<button class="tab" role="tab" id="tab-${id}" aria-selected="${S.tab === id}" aria-controls="panel-${id}" data-tab="${id}" tabindex="${S.tab === id ? 0 : -1}">${esc(label)}${n ? `<span class="count">${n}</span>` : ""}</button>`).join("")}</div>
       <div role="tabpanel" id="panel-${S.tab}" aria-labelledby="tab-${S.tab}">${panel(S.tab)}</div></div>`;
   layout("runs", name, `<div class="crumbs"><a href="#/runs">← Runs</a></div>
-    <div class="page-title">${esc(name)} ${runTypeBadge(run)} ${stateBadge(run)}</div>
+    <div class="page-title" style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">${esc(name)} ${runTypeBadge(run)} ${stateBadge(run)} ${stopRunButton(run)}</div>
     <p class="page-sub" style="margin-bottom:18px">Started ${esc(when(run.createdAt))} · Design run <code>${esc(run.runId.slice(0, 8))}</code></p>
     ${failure}
     <div class="grid-3"><div class="card"><div class="card-head"><h2>Progress</h2></div>${stepsHtml(run, audit)}</div>${deliverables(run)}<div>${deployCtaCard(run)}${inputs(scope)}</div></div>
@@ -309,7 +314,7 @@ function renderRun() {
 function deployCtaCard(run) {
   if (isDeployRun(run) || run.status !== "DELIVERED") return "";
   return `<div class="card"><div class="card-head"><h2>Deploy</h2></div>
-    <p class="hint">Run AWS Transform against the platform org using this approved scope and generated IaC (PoC: agent role in the platform account).</p>
+    <p class="hint">Run the deploy agent against a target AWS account (cross-account role or keys). Organizations discover and attestation use that account; Transform jobs use the platform workspace.</p>
     <button class="btn btn-primary" type="button" data-deploy="${esc(run.runId)}">Start deploy run</button></div>`;
 }
 
@@ -317,7 +322,7 @@ function deployStepsHtml(run, audit) {
   const has = (a) => audit.some((x) => x.action === a);
   const hasTool = (name) => audit.some((x) => x.action === name);
   const done = [
-    hasTool("tool.run_pre_discover") || has("phase.continue"),
+    hasTool("tool.run_pre_discover") || hasTool("tool.run_pre_discover.failed"),
     hasTool("tool.save_iac_change_plan") || hasTool("tool.render_iac_bundles"),
     hasTool("tool.transform_start_deploy"),
     has("deploy.attested") || (run.status === "DELIVERED" && has("phase.completed")),
@@ -337,12 +342,39 @@ function deployStepsHtml(run, audit) {
   }).join("")}</div>`;
 }
 
-function deployHitlNotice(audit) {
-  const last = [...audit].reverse().find((a) => a.action === "phase.continue");
-  if (!last) return "";
-  const d = parseAuditDetail(last);
-  if (!d.awaitingHitl) return "";
-  return `<div class="notice notice-info" role="status"><strong>Waiting on AWS Transform.</strong> Complete the required step in the Transform workspace. The deploy agent will resume on its own.</div>`;
+function deployContinueNotice(audit, run) {
+  const lastCont = [...audit].reverse().find((a) => a.action === "phase.continue");
+  const lastYield = [...audit].reverse().find((a) => a.action === "tool.yield_for_orchestrator");
+  const d = lastCont ? parseAuditDetail(lastCont) : {};
+  const reason = String(d.reason || (lastYield ? parseAuditDetail(lastYield).reason : "") || "").trim();
+  if (!lastCont && !reason) return "";
+  const targetAcct = run && run.deployTarget && run.deployTarget.accountId;
+  if (/^Pre-discover failed for deploy target account/i.test(reason)) {
+    return `<div class="notice notice-warn" role="status"><strong>Deploy paused (target discover).</strong> ${esc(reason.length > 480 ? reason.slice(0, 480) + "…" : reason)}<br><span class="hint">Fix the issue in account ${esc(targetAcct || "556")}, then start a new deploy run.</span></div>`;
+  }
+  const wrong831OrgAdvice =
+    targetAcct &&
+    targetAcct !== "831493647146" &&
+    /831493647146.*(create|enable).*org|create-organization.*831|Organizations not yet created.*831493647146|management account 831493647146/i.test(reason);
+  const platformBlock =
+    !wrong831OrgAdvice &&
+    /permission|IAM|AccessDenied|not authorized|s3:|organization|create-organization|831493647146|platform account|run_pre_discover|NotInUse/i.test(
+      reason
+    );
+  if (d.awaitingHitl && !platformBlock && !wrong831OrgAdvice) {
+    return `<div class="notice notice-info" role="status"><strong>Waiting on AWS Transform.</strong> Complete the required step in the Transform workspace. The deploy agent will resume on its own.</div>`;
+  }
+  if (wrong831OrgAdvice) {
+    return `<div class="notice notice-warn" role="status"><strong>Deploy paused — ignore “create org in 831”.</strong> This run targets account <code>${esc(targetAcct)}</code>. The agent skipped discover and gave incorrect platform advice. Use valid <strong>${esc(targetAcct)}</strong> credentials (or AssumeRole), add AgentRole as Contributor+ on the Transform workspace in 831, then start a <strong>new</strong> deploy run after redeploying the latest agent.<br><span class="hint">Step Functions may keep retrying this run until you stop it.</span></div>`;
+  }
+  if (reason) {
+    const cls = platformBlock ? "notice-warn" : "notice-info";
+    const lead = platformBlock
+      ? "<strong>Deploy paused (platform setup).</strong>"
+      : "<strong>Deploy paused.</strong>";
+    return `<div class="notice ${cls}" role="status">${lead} ${esc(reason.length > 420 ? reason.slice(0, 420) + "…" : reason)}<br><span class="hint">Step Functions will retry until you use <strong>Stop run</strong> or the run fails.</span></div>`;
+  }
+  return "";
 }
 
 function renderDeployRun() {
@@ -370,9 +402,9 @@ function renderDeployRun() {
       <div role="tabpanel" id="panel-${S.tab}" aria-labelledby="tab-${S.tab}">${panel(S.tab)}</div></div>`
     : waiting;
   layout("runs", `${name} deploy`, `<div class="crumbs"><a href="#/runs">← Runs</a></div>
-    <div class="page-title">${esc(name)} ${runTypeBadge(run)} ${stateBadge(run)}</div>
+    <div class="page-title" style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">${esc(name)} ${runTypeBadge(run)} ${stateBadge(run)} ${stopRunButton(run)}</div>
     <p class="page-sub" style="margin-bottom:18px">Started ${esc(when(run.createdAt))} · Deploy run <code>${esc(run.runId.slice(0, 8))}</code>${designLink}</p>
-    ${failure}${deployHitlNotice(audit)}
+    ${failure}${deployContinueNotice(audit, run)}
     <div class="grid-3"><div class="card"><div class="card-head"><h2>Progress</h2></div>${deployStepsHtml(run, audit)}</div>${deployDeliverables(run)}</div>
     ${body}`);
   if (S.tab === "organization" && diagram) drawDiagram(diagram);
@@ -570,6 +602,7 @@ const ACTIONS = {
   "tool.transform_poll_deploy_job": "Transform deploy polled",
   "tool.finish_deploy_workflow": "Deploy workflow finished",
   "tool.yield_for_orchestrator": "Yielded for orchestrator",
+  "run.stopped": "Run stopped",
   "tool.read_deploy_checkpoint": "Read deploy checkpoint",
   "tool.read_deploy_context": "Read deploy context",
   "tool.read_approved_scope": "Read approved scope",
@@ -590,9 +623,101 @@ async function download(name) {
     toast("Download started");
   } catch (e) { if (e.message !== "session expired") toast(e.message, "bad"); }
 }
-async function startDeploy(designRunId) {
+let pendingDeployDesignId = null;
+
+function deployAuthFields() {
+  const method = $("deployForm").authMethod.value;
+  $("deployRoleFields").hidden = method !== "role";
+  $("deployKeyFields").hidden = method !== "keys";
+  $("deployForm").accountId.required = method !== "platform";
+  $("testDeployCreds").hidden = method === "platform";
+  $("deployVerifyBox").hidden = true;
+  $("deployVerifyBox").textContent = "";
+  $("deployVerifyBox").className = "deploy-verify";
+}
+
+function setDeployVerifyResult(kind, text) {
+  const box = $("deployVerifyBox");
+  box.hidden = false;
+  box.className = `deploy-verify ${kind}`;
+  box.textContent = text;
+}
+
+async function testDeployCredentials() {
+  const btn = $("testDeployCreds");
   try {
-    const { runId } = await api(`/runs/${designRunId}/deploy`, { method: "POST" });
+    const body = deployPayloadFromForm();
+    btn.disabled = true;
+    setDeployVerifyResult("pending", "Testing connection…");
+    const r = await api("/deploy-target/verify", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      setDeployVerifyResult("err", r.error || "Could not verify credentials.");
+      return;
+    }
+    let msg = r.message || "Credentials verified.";
+    if (r.warnings && r.warnings.length) msg += " " + r.warnings.join(" ");
+    setDeployVerifyResult("ok", msg);
+  } catch (e) {
+    if (e.message !== "session expired") setDeployVerifyResult("err", e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function openDeployDialog(designRunId) {
+  pendingDeployDesignId = designRunId;
+  const f = $("deployForm");
+  f.reset();
+  f.authMethod.value = "role";
+  deployAuthFields();
+  $("deployDlg").showModal();
+}
+
+function deployPayloadFromForm() {
+  const f = $("deployForm");
+  const method = f.authMethod.value;
+  if (method === "platform") return {};
+  const accountId = f.accountId.value.trim();
+  if (!/^\d{12}$/.test(accountId)) throw new Error("Target account ID must be 12 digits");
+  if (method === "role") {
+    const roleArn = f.roleArn.value.trim();
+    if (!roleArn) throw new Error("Role ARN is required");
+    const body = { deployTarget: { accountId, roleArn } };
+    const ext = f.externalId.value.trim();
+    if (ext) body.deployTarget.externalId = ext;
+    return body;
+  }
+  const accessKeyId = f.accessKeyId.value.trim();
+  const secretAccessKey = f.secretAccessKey.value.trim();
+  if (!accessKeyId || !secretAccessKey) throw new Error("Access key ID and secret are required");
+  const body = { deployTarget: { accountId, accessKeyId, secretAccessKey } };
+  const sessionToken = f.sessionToken.value.trim();
+  if (sessionToken) body.deployTarget.sessionToken = sessionToken;
+  return body;
+}
+
+async function stopRun(runId) {
+  if (!confirm("Stop this run? The workflow will abort and the run will be marked failed.")) return;
+  try {
+    await api(`/runs/${runId}/stop`, { method: "POST" });
+    toast("Run stopped");
+    await openRun(runId);
+    loadRuns().catch(() => {});
+  } catch (e) {
+    if (e.message !== "session expired") toast(e.message, "bad");
+  }
+}
+
+async function startDeploy(designRunId, body) {
+  try {
+    const { runId } = await api(`/runs/${designRunId}/deploy`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
     toast("Deploy run started");
     await loadRuns().catch(() => {});
     location.hash = `#/run/${runId}`;
@@ -604,7 +729,9 @@ function onView(e) {
   const row = e.target.closest("[data-open]");
   if (row && !e.target.closest("a,button")) { location.hash = `#/run/${row.dataset.open}`; return; }
   const deployBtn = e.target.closest("[data-deploy]");
-  if (deployBtn) { startDeploy(deployBtn.dataset.deploy); return; }
+  if (deployBtn) { openDeployDialog(deployBtn.dataset.deploy); return; }
+  const stopBtn = e.target.closest("[data-stop-run]");
+  if (stopBtn) { stopRun(stopBtn.dataset.stopRun); return; }
   const t = e.target.closest("[data-tab],[data-dl],[data-copy],[data-full]");
   if (!t) return;
   if (t.dataset.full) { const svg = diagramCache.get(S.data.diagram); if (svg) { $("fullBody").innerHTML = svg; $("full").showModal(); } }
@@ -637,6 +764,21 @@ async function start() {
   $("who").textContent = claims.email || "";
   $("logout").onclick = logout;
   $("closeFull").onclick = () => $("full").close();
+  $("closeDeployDlg").onclick = () => $("deployDlg").close();
+  $("cancelDeployDlg").onclick = () => $("deployDlg").close();
+  $("deployForm").authMethod.onchange = deployAuthFields;
+  $("testDeployCreds").onclick = () => testDeployCredentials();
+  $("deployForm").onsubmit = async (e) => {
+    e.preventDefault();
+    if (!pendingDeployDesignId) return;
+    try {
+      const body = deployPayloadFromForm();
+      $("deployDlg").close();
+      await startDeploy(pendingDeployDesignId, body);
+    } catch (err) {
+      toast(err.message, "bad");
+    }
+  };
   $("view").addEventListener("click", onView);
   $("view").addEventListener("keydown", onKeys);
   $("view").addEventListener("change", (e) => { if (e.target.id === "steps") { S.steps = e.target.checked; renderRun(); } });

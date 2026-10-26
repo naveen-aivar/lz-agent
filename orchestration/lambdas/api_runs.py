@@ -1,4 +1,4 @@
-"""POST /runs, POST /runs/{id}/start, POST /runs/{id}/deploy, GET /runs/{id}, GET /runs/{id}/audit, GET /runs/{id}/scope
+"""POST /runs, POST /deploy-target/verify, POST /runs/{id}/start, POST /runs/{id}/stop, POST /runs/{id}/deploy, GET /runs/{id}, GET /runs/{id}/audit, GET /runs/{id}/scope
 
 Create returns an S3 presigned POST for the SOW (pdf/docx/txt/md, <= 10 MB). The workflow only starts on /start,
 after the upload has landed, so the pipeline never races the upload.
@@ -15,6 +15,7 @@ from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
 from common import ARTIFACT_BUCKET, audit, get_run, now, s3, table
+from lzcore.deploy_target_api import parse_deploy_target_from_request, verify_deploy_target_credentials
 from lzcore.diagram import org_mermaid
 
 sfn = boto3.client("stepfunctions")
@@ -33,6 +34,15 @@ def _claims(event):
 
 def _can_view(run, sub):
     return run["requester"] == sub  # each user sees their own runs
+
+
+def _public_run(meta: dict) -> dict:
+    """Strip deploy credential pointers before returning run to the browser."""
+    out = dict(meta)
+    dt = out.get("deployTarget")
+    if isinstance(dt, dict) and dt.get("mode") == "keys":
+        out["deployTarget"] = {"mode": "keys", "accountId": dt.get("accountId")}
+    return out
 
 
 def _create(event, sub):
@@ -116,6 +126,23 @@ def _deploy(design_run_id, sub, event):
         return _resp(503, {"error": "deploy requires TRANSFORM_WORKSPACE_ID on the platform stack"})
 
     deploy_id = uuid.uuid4().hex
+    body = json.loads(event.get("body") or "{}")
+
+    def _put_credentials(key: str, payload: bytes) -> None:
+        s3().put_object(
+            Bucket=ARTIFACT_BUCKET,
+            Key=key,
+            Body=payload,
+            ServerSideEncryption="aws:kms",
+        )
+
+    try:
+        deploy_target = parse_deploy_target_from_request(
+            body, deploy_id=deploy_id, put_credentials=_put_credentials
+        )
+    except ValueError as e:
+        return _resp(400, {"error": str(e)})
+
     item = {
         "PK": f"RUN#{deploy_id}",
         "SK": "META",
@@ -130,6 +157,8 @@ def _deploy(design_run_id, sub, event):
         "error": "",
         "transformWorkspaceId": os.environ["TRANSFORM_WORKSPACE_ID"].strip(),
     }
+    if deploy_target:
+        item["deployTarget"] = deploy_target
     table().put_item(Item=item)
     sm = os.environ.get("DEPLOY_STATE_MACHINE_ARN")
     if not sm:
@@ -144,7 +173,12 @@ def _deploy(design_run_id, sub, event):
         UpdateExpression="SET executionArn = :e",
         ExpressionAttributeValues={":e": ex["executionArn"]},
     )
-    audit(deploy_id, sub, "deploy.started", {"designRunId": design_run_id})
+    audit(
+        deploy_id,
+        sub,
+        "deploy.started",
+        {"designRunId": design_run_id, "deployTarget": deploy_target or {"mode": "platform"}},
+    )
     audit(design_run_id, sub, "design.deploy_requested", {"deployRunId": deploy_id})
     return _resp(202, {"runId": deploy_id, "designRunId": design_run_id})
 
@@ -155,7 +189,7 @@ def _get(run_id, sub):
     if not meta or not _can_view(meta, sub):
         return _resp(404, {"error": "not found"})
     meta.pop("requirements", None)
-    return _resp(200, {"run": meta})
+    return _resp(200, {"run": _public_run(meta)})
 
 
 def _audit(run_id, sub):
@@ -178,6 +212,45 @@ def _scope(run_id, sub):
     return _resp(200, {"scope": scope, "sha": art["sha"], "orgDiagram": org_mermaid(scope)})
 
 
+def _verify_deploy_target(event):
+    body = json.loads(event.get("body") or "{}")
+    return _resp(200, verify_deploy_target_credentials(body))
+
+
+def _stop(run_id, sub):
+    run = get_run(run_id)
+    if not run or not _can_view(run, sub):
+        return _resp(404, {"error": "not found"})
+    if run.get("status") != "RUNNING":
+        return _resp(409, {"error": f"run is {run.get('status')}; only RUNNING runs can be stopped"})
+    arn = (run.get("executionArn") or "").strip()
+    if arn:
+        try:
+            sfn.stop_execution(
+                executionArn=arn,
+                error="UserStopped",
+                cause="Stopped by user from UI",
+            )
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code not in ("ExecutionDoesNotExist", "ExecutionAlreadyCompleted"):
+                raise
+    try:
+        table().update_item(
+            Key={"PK": f"RUN#{run_id}", "SK": "META"},
+            UpdateExpression="SET #s = :f, #e = :msg",
+            ConditionExpression="#s = :r",
+            ExpressionAttributeNames={"#s": "status", "#e": "error"},
+            ExpressionAttributeValues={":f": "FAILED", ":r": "RUNNING", ":msg": "Stopped by user."},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return _resp(409, {"error": "run is no longer RUNNING"})
+        raise
+    audit(run_id, sub, "run.stopped", {})
+    return _resp(200, {"runId": run_id, "status": "FAILED"})
+
+
 def handler(event, _ctx):
     sub = _claims(event)
     route = event["routeKey"]
@@ -185,11 +258,15 @@ def handler(event, _ctx):
         return _create(event, sub)
     if route == "GET /runs":
         return _list(sub)
+    if route == "POST /deploy-target/verify":
+        return _verify_deploy_target(event)
     run_id = event["pathParameters"]["runId"]
     if route.endswith("/start"):
         return _start(run_id, sub)
     if route.endswith("/deploy"):
         return _deploy(run_id, sub, event)
+    if route.endswith("/stop"):
+        return _stop(run_id, sub)
     if route.endswith("/audit"):
         return _audit(run_id, sub)
     if route.endswith("/scope"):

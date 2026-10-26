@@ -34,7 +34,18 @@ _state = {
     "transform_workspace_id": None,
     "transform_analyze_job_id": None,
     "transform_deploy_job_id": None,
+    "deploy_target": None,
 }
+
+
+def deploy_boto_session():
+    """Organizations discover/attest in deploy target account when configured."""
+    from lzcore.aws_target_session import session_for_deploy_target
+
+    def _read_credentials(key: str) -> str:
+        return _s3.get_object(Bucket=BUCKET, Key=key)["Body"].read().decode()
+
+    return session_for_deploy_target(_state.get("deploy_target"), read_credentials=_read_credentials)
 
 
 def set_run(run_id: str) -> None:
@@ -59,6 +70,7 @@ def set_deploy_run(run_id: str) -> None:
         transform_analyze_job_id=meta.get("transformAnalyzeJobId"),
         transform_deploy_job_id=meta.get("transformDeployJobId"),
         polls_this_invoke=0,
+        deploy_target=meta.get("deployTarget"),
     )
 
 
@@ -185,10 +197,19 @@ def read_deploy_context() -> str:
         transform_ctx["mergedFoundation"] = snapshot["transform"]
 
     log_tool_event("tool.read_deploy_context", {"designRunId": _state["design_run_id"]})
+    target = _state.get("deploy_target")
+    target_summary = None
+    if target:
+        target_summary = {
+            "accountId": target.get("accountId"),
+            "mode": target.get("mode"),
+            "roleArn": target.get("roleArn"),
+        }
     return json.dumps(
         {
             "runId": _state["run"],
             "designRunId": _state["design_run_id"],
+            "deployTarget": target_summary,
             "gaps": gaps,
             "heuristicClassification": heuristic,
             "foundationAssessmentSaved": saved_assessment,
@@ -221,8 +242,15 @@ def save_foundation_assessment(assessment_json: str) -> str:
     base = _deployment_prefix()
     scope_key = f"runs/{_state['design_run_id']}/intake/scope.json"
     scope = _load_json(scope_key)
-    snapshot = _load_json(f"{base}/foundation.json")
-    gaps = _load_json(f"{base}/gap-analysis.json")
+    try:
+        snapshot = _load_json(f"{base}/foundation.json")
+        gaps = _load_json(f"{base}/gap-analysis.json")
+    except Exception:
+        return (
+            "REFUSED: missing foundation.json or gap-analysis.json. "
+            "Call run_pre_discover successfully before save_foundation_assessment. "
+            "Do not call transform_merge_discovery until after a real Transform analyze job exists."
+        )
     classification = classification_from_agent(normalized)
     assessment = build_foundation_assessment(
         scope=scope,

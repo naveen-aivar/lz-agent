@@ -1,0 +1,139 @@
+{
+  "pbtResults": {},
+  "executionHistory": {
+    "1. Write bug condition exploration test": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009825629
+      },
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009831699
+      },
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793010155392
+      }
+    ],
+    "2. Write preservation property tests (BEFORE implementing fix)": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826051
+      },
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793010159882
+      }
+    ],
+    "3.1 Add strict S3 reads in `agent/deploy_workflow_tools.py`": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826084
+      }
+    ],
+    "3.2 Add Transform error translation and cancelled-job failure in `lzcore/transform_ops.py`": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826120
+      }
+    ],
+    "3.3 Enforce merge input strictness in `lzcore/deploy_transform.py`": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826140
+      }
+    ],
+    "3.4 Extract `_execute_*` for every mechanical step and record the resume point on pause": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826170
+      }
+    ],
+    "3.5 Implement the `run_deploy_invoke` sequencer in `agent/deploy_workflow_tools.py`": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826195
+      }
+    ],
+    "3.6 Cut over the deploy branch in `agent/app.py` and remove the v8 patches": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826223
+      }
+    ],
+    "3.7 Narrow the prompts in `agent/prompts.py`": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826246
+      }
+    ],
+    "3.8 Verify bug condition exploration test now passes": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826266
+      }
+    ],
+    "3.9 Verify preservation tests still pass": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826288
+      }
+    ],
+    "4.1 Unit tests for the new primitives": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826310
+      }
+    ],
+    "4.2 Exhaustive stage-property tests (no `hypothesis`)": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826336
+      }
+    ],
+    "4.3 Multi-invoke integration path with fakes": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826361
+      }
+    ],
+    "5. Run the full test suites": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826382
+      }
+    ],
+    "6. MANUAL — rebuild, deploy agent image v9, and validate live (REQUIRES USER CONFIRMATION)": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826407
+      }
+    ],
+    "7. Checkpoint - Ensure all tests pass": [
+      {
+        "executionId": "08695640-77d9-4045-92c3-95436730a0d7",
+        "chatSessionId": "sess_e7436b20-0b09-44c8-8dab-aa3a602db40c",
+        "timestamp": 1793009826431
+      }
+    ]
+  }
+}

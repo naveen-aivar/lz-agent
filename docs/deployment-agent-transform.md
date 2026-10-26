@@ -69,6 +69,35 @@ After required S3 artifacts exist (`lzcore/deploy_artifacts.py`), **`phase_attes
 
 See [deployment-agent-scope.md](./deployment-agent-scope.md) for outcomes and PoC credentials scope.
 
+## Transform 403 (CreateJob / AccessTransformProfile / ListJobs)
+
+**IAM:** The platform **`AgentRole`** must allow **`transform:*`** and **`transform:AccessTransformProfile`** (profile / SigV4 path). The stack template includes these; redeploy after template changes.
+
+**Workspace RBAC:** AWS Transform also enforces **workspace collaborator roles**. HTTP **403** on job APIs often means the role is not a **Contributor+** member of the workspace, even when IAM looks correct.
+
+1. Open **AWS Transform** in the **platform account** (same account as the stack).
+2. Open workspace **`landing-zone`** (id must match stack `TransformWorkspaceId`).
+3. **User access** / **Collaborators** → add the AgentCore execution role as an **IAM principal**:
+   - `arn:aws:iam::<platform-account-id>:role/ingram-landing-zone-AgentRole-XXXXXXXX`
+4. Assign **Contributor** or **Administrator** (needs **Create Job**).
+5. Start a **new** deploy run (failed/paused runs do not pick up access changes).
+
+Service management **IAM-only access** must stay **enabled** (your console screenshot). That is account-level; workspace membership is still required per workspace.
+
+### Add the AgentCore IAM role as a workspace collaborator (required for CreateJob)
+
+IAM on **`ingram-landing-zone-AgentRole-…`** can show **Allow** for `transform:CreateJob` while API calls still return **403** until the role is a workspace member.
+
+1. Sign in to **AWS Transform** as a workspace **Admin** (your SSO user is Admin on **landing-zone** today).
+2. Open workspace **`landing-zone`**.
+3. **Collaborators** / **User access** → add the **IAM role** (not your SSO user):
+   `arn:aws:iam::831493647146:role/ingram-landing-zone-AgentRole-LBinaFbV3RCO`
+4. Assign **Contributor** or **Administrator** (must allow **Create Job**).
+
+PutUserRoleMappings via API fails with “has not logged in to tenant” until the IAM principal is registered in Transform; use the console as Admin, or have the role complete an IAM Transform sign-in once if your tenant requires it.
+
+There is **no** IAM action `transform:StartAnalyzeJob`; the deploy agent uses **CreateJob** + **StartJob**.
+
 ## Guardrails
 
 | Guardrail | Value |

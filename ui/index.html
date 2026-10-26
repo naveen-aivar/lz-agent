@@ -139,6 +139,18 @@ dialog.full { width:min(96vw,1600px); height:92vh; padding:0; border:1px solid v
 dialog.full::backdrop { background:rgba(2,6,12,.78); }
 dialog.full .bar { display:flex; justify-content:space-between; align-items:center; padding:12px 18px; border-bottom:1px solid var(--border); font-weight:700; }
 dialog.full .body { height:calc(92vh - 58px); overflow:auto; padding:24px; text-align:center; background-image:radial-gradient(#262c37 1px, transparent 1px); background-size:22px 22px; }
+dialog.deploy { width:min(520px, 96vw); padding:0; border:1px solid var(--border); border-radius:var(--radius); background:var(--card); color:var(--ink); }
+dialog.deploy::backdrop { background:rgba(2,6,12,.72); }
+dialog.deploy .bar { display:flex; justify-content:space-between; align-items:center; padding:14px 18px; border-bottom:1px solid var(--border); font-weight:700; }
+dialog.deploy .body { padding:18px; display:grid; gap:14px; text-align:left; }
+dialog.deploy label { display:grid; gap:6px; font-size:13px; font-weight:600; color:var(--dim); }
+dialog.deploy input, dialog.deploy select { width:100%; padding:10px 12px; border-radius:var(--radius-s); border:1px solid var(--border); background:var(--panel); color:var(--ink); font:inherit; }
+dialog.deploy .actions { display:flex; gap:10px; justify-content:flex-end; margin-top:4px; flex-wrap:wrap; }
+dialog.deploy .hint { font-size:12px; color:var(--faint); font-weight:400; line-height:1.5; }
+.deploy-verify { font-size:13px; line-height:1.5; padding:10px 12px; border-radius:var(--radius-s); border:1px solid var(--border); }
+.deploy-verify.pending { color:var(--dim); }
+.deploy-verify.ok { border-color:#2d6a4f; background:rgba(45,106,79,.12); color:var(--ink); }
+.deploy-verify.err { border-color:#9b2226; background:rgba(155,34,38,.12); color:var(--ink); }
 
 /* custom scps, security */
 .scp { margin-bottom:12px; } .scp .top { display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px 12px; align-items:flex-start; }
@@ -194,7 +206,7 @@ dialog.full .body { height:calc(92vh - 58px); overflow:auto; padding:24px; text-
       <a href="#/dashboard" id="nav-dashboard"><span class="nav-ic">◧</span> Dashboard</a>
       <a href="#/runs" id="nav-runs"><span class="nav-ic">▶</span> Runs</a>
     </nav>
-    <div class="side-foot"><strong>Landing Zone Agent</strong>Control Tower code generation<div class="mode-pill cloud">CLOUD</div></div>
+    <div class="side-foot"><strong>Ingram Landing Zone</strong>Design &amp; deploy agent<div class="mode-pill cloud">CLOUD</div></div>
   </aside>
   <div class="main">
     <div class="topbar"><span class="crumb">Ingram Agents</span><span class="sep">·</span><span id="crumb">Dashboard</span>
@@ -204,6 +216,29 @@ dialog.full .body { height:calc(92vh - 58px); overflow:auto; padding:24px; text-
 </div>
 
 <dialog class="full" id="full" aria-label="Organization structure"><div class="bar"><span>Organization structure</span><button class="btn btn-sm" type="button" id="closeFull">Close</button></div><div class="body" id="fullBody"></div></dialog>
+<dialog class="deploy" id="deployDlg" aria-label="Deploy target account">
+  <div class="bar"><span>Deploy target</span><button class="btn btn-sm" type="button" id="closeDeployDlg">Cancel</button></div>
+  <form class="body" id="deployForm">
+    <p class="hint">Discover and attest against the target AWS account. Use a cross-account IAM role (recommended) or temporary access keys. AWS Transform still runs from the platform account until your workspace is bound to the target org.</p>
+    <label>Target account ID<input name="accountId" inputmode="numeric" pattern="[0-9]{12}" placeholder="556880010183" required /></label>
+    <label>Auth method<select name="authMethod"><option value="role">IAM role (AssumeRole)</option><option value="keys">Access keys (session)</option><option value="platform">Platform account only</option></select></label>
+    <div id="deployRoleFields">
+      <label>Role ARN<span class="hint">Trust the platform AgentCore role in the target account</span><input name="roleArn" placeholder="arn:aws:iam::556880010183:role/IngramLandingZoneDeploy" /></label>
+      <label>External ID (optional)<input name="externalId" autocomplete="off" /></label>
+    </div>
+    <div id="deployKeyFields" hidden>
+      <label>Access key ID<input name="accessKeyId" autocomplete="off" /></label>
+      <label>Secret access key<input name="secretAccessKey" type="password" autocomplete="off" /></label>
+      <label>Session token (optional)<input name="sessionToken" autocomplete="off" /></label>
+    </div>
+    <div id="deployVerifyBox" class="deploy-verify" hidden role="status" aria-live="polite"></div>
+    <div class="actions">
+      <button class="btn" type="button" id="cancelDeployDlg">Cancel</button>
+      <button class="btn" type="button" id="testDeployCreds" hidden>Test connection</button>
+      <button class="btn btn-primary" type="submit">Start deploy run</button>
+    </div>
+  </form>
+</dialog>
 <div id="toast" role="status" aria-live="polite" hidden></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.3/mermaid.min.js" integrity="sha384-R63zfMfSwJF4xCR11wXii+QUsbiBIdiDzDbtxia72oGWfkT7WHJfmD/I/eeHPJyT" crossorigin="anonymous"></script>

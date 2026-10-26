@@ -1,6 +1,6 @@
 # Landing Zone Deployment Agent — scope (item 7)
 
-**Owner:** Billu  
+**Owner:** Billu Naveen (billu.naveen@aivar.tech) · **Project:** Ingram Landing Zone  
 **Status:** Scope redefined (Architecture vs Deployment split)  
 **Platform doc (technical):** [deployment-agent-transform.md](./deployment-agent-transform.md)
 
@@ -37,11 +37,15 @@ The **Architecture Design Agent** turns a SOW or transcript into approved **scop
    - **Implemented:** **`deployment-report.json`** on the deploy run (pass/fail vs approved scope names at Organizations level).  
    - **Complement, not replace:** Transform deployment history and approvals in the Transform product.
 
-## Target account and credentials (PoC)
+## Target account and credentials
 
-Foundation **discover** and **attest** call AWS Organizations/Control Tower with the **AgentCore runtime IAM role** (the account where the platform stack runs). There is **no cross-account STS** in this build.
+**Default:** Foundation **discover** and **attest** use the **AgentCore runtime IAM role** (platform account).
 
-For a valid PoC, run deploy against the **same organization** that role can read (or treat “target account” as that org’s management account). Multi-account / customer-org deployment requires a future **assumed-role** or Transform workspace binding design.
+**Cross-account (UI or API):** Optional `deployTarget` on deploy runs — **AssumeRole** into a customer role or short-lived keys stored in S3 for that run. Discover and attestation run in the **target account**. See [cross-account-deploy.md](./cross-account-deploy.md).
+
+**Transform** still uses the platform account and stack `TransformWorkspaceId` until the workspace is entitled for the target org.
+
+For a valid PoC, the **target** credentials should be able to call Organizations **ListRoots** / **ListAccounts** — typically the org **management account** or a [delegated administrator](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_delegate_policies.html). Member-account-only discovery returns a **partial** snapshot (`discoveryLimitations` in `foundation.json`).
 
 ## Attestation outcomes
 

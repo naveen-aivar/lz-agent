@@ -12,18 +12,18 @@ TRANSFORM_DEPLOY_SUCCESS_STATUSES = frozenset(
 )
 
 
-def collect_snapshot_and_gaps(scope: dict) -> tuple[dict, dict]:
+def collect_snapshot_and_gaps(scope: dict, boto_session=None) -> tuple[dict, dict]:
     """Live org snapshot and name-level gaps vs approved scope (no environment label)."""
-    snapshot = collect_foundation()
+    snapshot = collect_foundation(boto_session)
     if snapshot.get("error"):
         raise RuntimeError(snapshot["error"])
     gaps = gap_analysis(scope, snapshot)
     return snapshot, gaps
 
 
-def run_foundation_assessment(scope: dict) -> tuple[dict, dict, dict]:
+def run_foundation_assessment(scope: dict, boto_session=None) -> tuple[dict, dict, dict]:
     """Post-deploy discover: snapshot, heuristic classification, and gaps."""
-    snapshot, gaps = collect_snapshot_and_gaps(scope)
+    snapshot, gaps = collect_snapshot_and_gaps(scope, boto_session)
     classification = classify_foundation(snapshot)
     return snapshot, classification, gaps
 

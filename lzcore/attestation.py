@@ -18,6 +18,19 @@ def _scp_ids(scope: dict) -> set[str]:
 
 def gap_analysis(scope: dict, snapshot: dict) -> dict[str, Any]:
     """Identify foundation-level gaps between approved scope and live org (not full resource drift)."""
+    if snapshot.get("discoveryLimitations"):
+        return {
+            "missingOus": [],
+            "extraOus": [],
+            "missingAccountsByName": [],
+            "extraAccountsByName": [],
+            "expectedScpIds": sorted(_scp_ids(scope)),
+            "incomplete": True,
+            "note": (
+                "Live OU/account tree was not readable from the runtime account (member account or "
+                "delegation). Gap lists are empty; use Transform analyze and save_foundation_assessment."
+            ),
+        }
     live_ous = {ou["name"] for ou in snapshot.get("organizationalUnits") or [] if ou.get("name")}
     live_accounts = {a["name"] for a in snapshot.get("accounts") or [] if a.get("name")}
     expected_ous = _ou_names(scope)

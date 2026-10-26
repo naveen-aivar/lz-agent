@@ -8,8 +8,13 @@ from botocore.config import Config
 from common import audit, record_artifact
 from phase_attest import handler as attest_handler
 
-# the agent runs for minutes: no 60s default read timeout and no retry, or a retry starts a duplicate agent on the same session
-agentcore = boto3.client("bedrock-agentcore", config=Config(read_timeout=900, connect_timeout=10, retries={"max_attempts": 1}))
+def _agentcore_client():
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    return boto3.client(
+        "bedrock-agentcore",
+        region_name=region,
+        config=Config(read_timeout=900, connect_timeout=10, retries={"max_attempts": 1}),
+    )
 
 
 PHASE_ARTIFACT = {
@@ -36,8 +41,15 @@ def handler(event, _ctx):
 
     session_id = _session_id(run_id, phase)
     audit(run_id, "system", "phase.started", {"phase": phase})
-    resp = agentcore.invoke_agent_runtime(
-        agentRuntimeArn=os.environ["AGENT_RUNTIME_ARN"],
+    runtime_arn = (os.environ.get("AGENT_RUNTIME_ARN") or "").strip()
+    if not runtime_arn:
+        raise RuntimeError(
+            "AGENT_RUNTIME_ARN is not set on the phase-invoke Lambda. "
+            "Deploy pass 2 (agent image + AgentCore runtime) in this account, or use the UI for the stack that has a runtime."
+        )
+    resp = _agentcore_client().invoke_agent_runtime(
+        agentRuntimeArn=runtime_arn,
+        qualifier="DEFAULT",
         runtimeSessionId=session_id,
         payload=json.dumps({"runId": run_id, "phase": phase}).encode(),
         contentType="application/json",
