@@ -4,7 +4,15 @@ Create returns an S3 presigned POST for the SOW (pdf/docx/txt/md, <= 10 MB). The
 after the upload has landed, so the pipeline never races the upload.
 
 /deploy starts a deploy run (AWS Transform required) against a DELIVERED design run.
+
+Operator attribution: API Gateway events carry requestContext.http and the Cognito JWT. A direct Lambda invoke
+(IAM-gated by lambda:InvokeFunction, used by scripts/run_deploy.py) has no requestContext.http and MUST carry
+"invokedBy": the operator's IAM ARN from sts get-caller-identity. It is recorded in META.invokedBy and in the
+deploy.started / design.deploy_requested / run.stopped audit details. The value is asserted by the caller
+(Lambda does not see the invoker's identity); CloudTrail's Invoke event is the authoritative record of who called.
 """
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -14,13 +22,23 @@ import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
-from common import ARTIFACT_BUCKET, audit, get_run, now, s3, table
-from lzcore.deploy_target_api import parse_deploy_target_from_request, verify_deploy_target_credentials
+from common import ARTIFACT_BUCKET, audit, delete_run_credentials, get_run, now, s3, table
+from lzcore.aws_target_session import public_deploy_target
+from lzcore.deploy_target_api import (
+    delete_deploy_target_credentials,
+    parse_deploy_target_from_request,
+    verify_deploy_target_credentials,
+)
 from lzcore.diagram import org_mermaid
 
 sfn = boto3.client("stepfunctions")
 EXTS = {"pdf", "docx", "txt", "md"}
 MAX_UPLOAD = 10 * 1024 * 1024
+_INVOKED_BY_RE = re.compile(r"arn:aws[a-z-]*:(iam|sts)::\d{12}:[A-Za-z0-9+=,.@_/-]{1,512}")
+
+
+class BadRequest(ValueError):
+    pass
 
 
 def _resp(code, body):
@@ -32,17 +50,41 @@ def _claims(event):
     return c["sub"]
 
 
+def _invoked_by(event) -> str | None:
+    """Operator IAM ARN for direct Lambda invokes; None for API Gateway requests."""
+    via_api_gateway = "http" in (event.get("requestContext") or {})
+    value = event.get("invokedBy")
+    if via_api_gateway:
+        if value is not None:
+            raise BadRequest("invokedBy is only accepted on direct Lambda invocations")
+        return None
+    if not isinstance(value, str) or not _INVOKED_BY_RE.fullmatch(value):
+        raise BadRequest(
+            "direct Lambda invocation requires invokedBy: the operator's IAM ARN from sts get-caller-identity "
+            "(scripts/run_deploy.py sends it)"
+        )
+    return value
+
+
 def _can_view(run, sub):
     return run["requester"] == sub  # each user sees their own runs
 
 
 def _public_run(meta: dict) -> dict:
-    """Strip deploy credential pointers before returning run to the browser."""
+    """Never return credential pointers or external ids to the browser."""
     out = dict(meta)
-    dt = out.get("deployTarget")
-    if isinstance(dt, dict) and dt.get("mode") == "keys":
-        out["deployTarget"] = {"mode": "keys", "accountId": dt.get("accountId")}
+    if "deployTarget" in out:
+        out["deployTarget"] = public_deploy_target(out["deployTarget"])
     return out
+
+
+def _public_audit_item(item: dict) -> dict:
+    """Audit rows written before deployTarget was redacted at write time may hold externalId/credentialsKey."""
+    detail = json.loads(item.get("detail") or "{}")
+    if isinstance(detail, dict) and isinstance(detail.get("deployTarget"), dict):
+        detail["deployTarget"] = public_deploy_target(detail["deployTarget"])
+        return {**item, "detail": json.dumps(detail, default=str)}
+    return item
 
 
 def _create(event, sub):
@@ -111,19 +153,30 @@ def _start(run_id, sub):
     return _resp(202, {"runId": run_id})
 
 
-def _deploy(design_run_id, sub, event):
-    design = get_run(design_run_id)
+def _deliverable_design_run(design_run_id, sub):
+    """(design, None) when the caller owns a DELIVERED design run with an approved scope, else (None, response)."""
+    design = get_run(design_run_id) if isinstance(design_run_id, str) and design_run_id else None
     if not design or design["requester"] != sub:
-        return _resp(404, {"error": "not found"})
+        return None, _resp(404, {"error": "not found"})
     if design.get("runKind") == "deploy":
-        return _resp(400, {"error": "path must be a design run id, not a deploy run"})
+        return None, _resp(400, {"error": "path must be a design run id, not a deploy run"})
     if design.get("status") != "DELIVERED":
-        return _resp(409, {"error": "design run must be DELIVERED before deploy attestation"})
+        return None, _resp(409, {"error": "design run must be DELIVERED before deploy attestation"})
     if not (design.get("artifacts") or {}).get("intake"):
-        return _resp(409, {"error": "design run has no approved scope"})
+        return None, _resp(409, {"error": "design run has no approved scope"})
+    return design, None
+
+
+def _deploy(design_run_id, sub, event, invoked_by):
+    design, err = _deliverable_design_run(design_run_id, sub)
+    if err:
+        return err
 
     if not os.environ.get("TRANSFORM_WORKSPACE_ID", "").strip():
         return _resp(503, {"error": "deploy requires TRANSFORM_WORKSPACE_ID on the platform stack"})
+    sm = os.environ.get("DEPLOY_STATE_MACHINE_ARN")
+    if not sm:
+        return _resp(503, {"error": "deploy workflow not configured"})
 
     deploy_id = uuid.uuid4().hex
     body = json.loads(event.get("body") or "{}")
@@ -134,6 +187,7 @@ def _deploy(design_run_id, sub, event):
             Key=key,
             Body=payload,
             ServerSideEncryption="aws:kms",
+            SSEKMSKeyId=os.environ["DATA_KEY_ARN"],  # the stack CMK, never aws/s3 (bucket policy enforces it)
         )
 
     try:
@@ -159,15 +213,20 @@ def _deploy(design_run_id, sub, event):
     }
     if deploy_target:
         item["deployTarget"] = deploy_target
-    table().put_item(Item=item)
-    sm = os.environ.get("DEPLOY_STATE_MACHINE_ARN")
-    if not sm:
-        return _resp(503, {"error": "deploy workflow not configured"})
-    ex = sfn.start_execution(
-        stateMachineArn=sm,
-        name=deploy_id,
-        input=json.dumps({"runId": deploy_id, "continueCount": 0}),
-    )
+    if invoked_by:
+        item["invokedBy"] = invoked_by
+    try:
+        table().put_item(Item=item)
+        ex = sfn.start_execution(
+            stateMachineArn=sm,
+            name=deploy_id,
+            input=json.dumps({"runId": deploy_id, "progressCount": 0, "hitlCount": 0}),
+        )
+    except Exception:
+        # Nothing will ever run for these keys: remove them before surfacing the original error.
+        if deploy_target and deploy_target.get("mode") == "keys":
+            delete_deploy_target_credentials(s3(), ARTIFACT_BUCKET, deploy_target["credentialsKey"])
+        raise
     table().update_item(
         Key={"PK": f"RUN#{deploy_id}", "SK": "META"},
         UpdateExpression="SET executionArn = :e",
@@ -177,9 +236,9 @@ def _deploy(design_run_id, sub, event):
         deploy_id,
         sub,
         "deploy.started",
-        {"designRunId": design_run_id, "deployTarget": deploy_target or {"mode": "platform"}},
+        {"designRunId": design_run_id, "deployTarget": public_deploy_target(deploy_target), "invokedBy": invoked_by},
     )
-    audit(design_run_id, sub, "design.deploy_requested", {"deployRunId": deploy_id})
+    audit(design_run_id, sub, "design.deploy_requested", {"deployRunId": deploy_id, "invokedBy": invoked_by})
     return _resp(202, {"runId": deploy_id, "designRunId": design_run_id})
 
 
@@ -197,7 +256,7 @@ def _audit(run_id, sub):
     if not run or not _can_view(run, sub):
         return _resp(404, {"error": "not found"})
     items = table().query(KeyConditionExpression=Key("PK").eq(f"RUN#{run_id}") & Key("SK").begins_with("AUDIT#"))["Items"]
-    return _resp(200, {"audit": items})
+    return _resp(200, {"audit": [_public_audit_item(i) for i in items]})
 
 
 def _scope(run_id, sub):
@@ -212,12 +271,16 @@ def _scope(run_id, sub):
     return _resp(200, {"scope": scope, "sha": art["sha"], "orgDiagram": org_mermaid(scope)})
 
 
-def _verify_deploy_target(event):
+def _verify_deploy_target(event, sub):
+    """Only the owner of a DELIVERED design run may test target credentials (no open AssumeRole oracle)."""
     body = json.loads(event.get("body") or "{}")
+    _design, err = _deliverable_design_run(body.get("designRunId"), sub)
+    if err:
+        return err
     return _resp(200, verify_deploy_target_credentials(body))
 
 
-def _stop(run_id, sub):
+def _stop(run_id, sub, invoked_by):
     run = get_run(run_id)
     if not run or not _can_view(run, sub):
         return _resp(404, {"error": "not found"})
@@ -238,35 +301,44 @@ def _stop(run_id, sub):
     try:
         table().update_item(
             Key={"PK": f"RUN#{run_id}", "SK": "META"},
-            UpdateExpression="SET #s = :f, #e = :msg",
+            UpdateExpression="SET #s = :f, #e = :msg, awaitingHitl = :no REMOVE pendingHumanInput",
             ConditionExpression="#s = :r",
             ExpressionAttributeNames={"#s": "status", "#e": "error"},
-            ExpressionAttributeValues={":f": "FAILED", ":r": "RUNNING", ":msg": "Stopped by user."},
+            ExpressionAttributeValues={":f": "FAILED", ":r": "RUNNING", ":msg": "Stopped by user.", ":no": False},
         )
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
             return _resp(409, {"error": "run is no longer RUNNING"})
         raise
-    audit(run_id, sub, "run.stopped", {})
+    audit(run_id, sub, "run.stopped", {"invokedBy": invoked_by})
+    try:
+        delete_run_credentials(run, sub)
+    except Exception as e:
+        return _resp(500, {"runId": run_id, "status": "FAILED",
+                           "error": f"run stopped, but deleting stored deploy-target credentials failed: {str(e)[:300]}"})
     return _resp(200, {"runId": run_id, "status": "FAILED"})
 
 
 def handler(event, _ctx):
     sub = _claims(event)
+    try:
+        invoked_by = _invoked_by(event)
+    except BadRequest as e:
+        return _resp(400, {"error": str(e)})
     route = event["routeKey"]
     if route == "POST /runs":
         return _create(event, sub)
     if route == "GET /runs":
         return _list(sub)
     if route == "POST /deploy-target/verify":
-        return _verify_deploy_target(event)
+        return _verify_deploy_target(event, sub)
     run_id = event["pathParameters"]["runId"]
     if route.endswith("/start"):
         return _start(run_id, sub)
     if route.endswith("/deploy"):
-        return _deploy(run_id, sub, event)
+        return _deploy(run_id, sub, event, invoked_by)
     if route.endswith("/stop"):
-        return _stop(run_id, sub)
+        return _stop(run_id, sub, invoked_by)
     if route.endswith("/audit"):
         return _audit(run_id, sub)
     if route.endswith("/scope"):

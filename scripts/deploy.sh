@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Deploys the PLATFORM into the account/region of your current AWS credentials. Creates real resources: review first.
 # Usage: scripts/deploy.sh <code-bucket> <cognito-domain-prefix> <bedrock-model-id> [image-tag]
-# Required: TRANSFORM_WORKSPACE_ID=<uuid> for deploy runs. Optional: BEDROCK_API_KEY_SECRET_ARN, TRANSFORM_ORCHESTRATOR_AGENT.
+# Required: TRANSFORM_WORKSPACE_ID=<uuid> for deploy runs. Optional: BEDROCK_API_KEY_SECRET_ARN, TRANSFORM_ORCHESTRATOR_AGENT,
+# TRANSFORM_ROLE_ARN (+ TRANSFORM_EXTERNAL_ID), DEPLOY_ASSUME_ROLE_ARN (target-role pattern; default IngramLandingZoneDeploy*).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -46,6 +47,14 @@ if [ -n "${BEDROCK_API_KEY_SECRET_ARN:-}" ]; then
 fi
 if [ -n "${TRANSFORM_ORCHESTRATOR_AGENT:-}" ]; then
   DEPLOY_PARAMS+=(TransformOrchestratorAgent="$TRANSFORM_ORCHESTRATOR_AGENT")
+fi
+# Always pass DeployAssumeRoleArn: `cloudformation deploy` keeps a stack's previous value for omitted parameters,
+# so a stack created when the default was "*" would otherwise keep "*". Override with DEPLOY_ASSUME_ROLE_ARN.
+DEPLOY_PARAMS+=(DeployAssumeRoleArn="${DEPLOY_ASSUME_ROLE_ARN:-arn:aws:iam::*:role/IngramLandingZoneDeploy*}")
+# Transform in another account (same AWS Organization as the landing-zone target): role + external id.
+# The external id is not a secret (it is a confused-deputy guard), so passing it on the command line is fine.
+if [ -n "${TRANSFORM_ROLE_ARN:-}" ]; then
+  DEPLOY_PARAMS+=(TransformRoleArn="$TRANSFORM_ROLE_ARN" TransformExternalId="${TRANSFORM_EXTERNAL_ID:-}")
 fi
 CFN_TAG_ARGS=()
 if [ -n "${PROJECT_OWNER_NAME:-}" ]; then

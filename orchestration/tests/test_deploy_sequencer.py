@@ -1,60 +1,39 @@
-"""Bug condition exploration tests for the deploy-transform mechanical-stage stall.
+"""Acceptance tests for the deterministic deploy sequencer (agent/deploy_workflow_tools.py).
 
-Spec: .kiro/specs/deploy-transform-init-stall-fix (bugfix). This module implements
-task 1 ("Write bug condition exploration test"). It drives the UNFIXED deploy invoke
-path (``agent.app.invoke(payload, context)``) with a scripted model that calls deploy
-workflow tools up to a given stage and then returns, exactly as a real model does when
-it ends its turn after a mechanical step.
+Every test drives the real AgentCore entrypoint (``agent.app.invoke(payload, context)``) or a
+real deploy tool and asserts BOTH the returned status and the resulting checkpoint stage.
+Behaviour covered:
 
-Per the bugfix exploration-test protocol a FAILING assertion here is the SUCCESS case:
-the failure is the counterexample that proves the bug exists. Cases A-G below encode the
-*expected* (fixed) behaviour from bugfix.md requirements 2.x. On the unfixed code they are
-expected to fail (or, where the uncommitted v8 patch masks the stall, to pass for the
-wrong reason, which the test documents in-line). When the sequencer fix lands (task 3)
-the SAME assertions become the acceptance test for the fix (task 3.8).
+  * Mechanical steps run in order without the model: pre-discover, Transform init, start/poll
+    analyze, merge, render, start/poll deploy, post-discover, finish (Cases A-C).
+  * Checkpoint read errors other than not-found fail naming the key (D); Transform 403 names
+    the principal, the workspace and Contributor (E); cancelled jobs fail (G).
+  * Pre-discover failures are a named run_pre_discover error, never a HITL wait; a checkpoint
+    left at the superseded ``pre_discover_blocked`` stage fails explicitly (#3).
+  * The judgment model runs only at transform_merged, gets judgment tools only (#4), is
+    bounded by a persisted attempt counter (#7, F), exceptions are named (#22), and a completed
+    judgment returns continue so render/start-deploy run on the next invoke (#8).
+  * Transform jobs are never started for a run whose META.status is not RUNNING (C4), and a job
+    started before a failed write is stopped and named in the error (#23).
+  * Transform pending human input (C1) is saved on the waiting checkpoint and returned in the
+    continue payload (C3).
 
-Harness notes (design.md "Testing Strategy"):
-  * ``strands`` and ``bedrock_agentcore`` and ``mcp`` are not installed locally, so this
-    module installs stub modules in ``sys.modules`` (identity ``tool`` decorator, stub
-    ``BedrockAgentCoreApp`` whose ``entrypoint`` returns the wrapped function) and sets
-    ``STATE_TABLE``, ``ARTIFACT_BUCKET``, ``MODEL_ID``, ``TRANSFORM_WORKSPACE_ID`` BEFORE
-    importing ``agent.app`` / ``agent.deploy_workflow_tools``.
-  * Fixtures (FakeS3, FakeTable, fake transform_ops, fake STS, scripted model callable)
-    are installed per test by ``_make_env`` and are NEVER a default the application picks
-    up when configuration is absent (engineering rule: no fallback/stub stand-ins that the
-    app adopts silently; fixtures are installed explicitly by the test only).
-
-Recorded counterexamples on the UNFIXED working tree (python -m unittest, this repo):
-  A init stall ............ PASS (v8 masks this one stage: ensure_transform_job_progress_after_agent
-                            starts analyze + polls once -> {'status':'continue'}; passes for the
-                            wrong reason, see class docstring). Pre-v8 this is
-                            "deploy incomplete at checkpoint stage='transform_init_done'".
-  B merge stall ........... FAIL -> {'status':'error',
-                            'error':"deploy incomplete at checkpoint stage='transform_analyze_done'"}
-  C render stall .......... FAIL -> "...stage='transform_merged'"  (plan saved, bundles not rendered)
-  C start-deploy stall .... FAIL -> "...stage='iac_render_done'"
-  C post-discover stall ... FAIL -> "...stage='transform_deploy_done'"
-  C finish stall .......... FAIL -> "...stage='post_discover_done'"  (all artifacts present, not finished)
-  D checkpoint AccessDenied FAIL -> {'status':'error','error':'deploy incomplete at checkpoint stage=None'}
-                            (S3 AccessDenied swallowed into {}; real cause hidden)
-  E CreateJob 403 ......... FAIL -> {'status':'error',
-                            'error':'transform_start_analyze failed: HTTP 403: User is not authorized'}
-                            (no principal ARN, no workspace id, no 'Contributor' guidance)
-  F judgment incomplete ... FAIL -> "...stage='transform_merged'"  (missing iac-change-plan.json not named)
-  G cancelled analyze ..... FAIL -> transformDone=True, checkpoint advanced to 'transform_analyze_done'
-                            (CANCELLED treated as a completed poll; flows into merge -> silent substitution)
-These failures confirm: (1) model-owned sequencing stalls at every mechanical stage v8 does
-not patch (B, C), (2) swallowed checkpoint read error (D), (3) undifferentiated Transform 403
-(E), (4) un-named incomplete judgment artifact (F), (5) cancelled-job-as-done substitution (G).
-
-Working-tree note: the repo currently carries the uncommitted v8 patch
-(``ensure_pre_discover`` + ``ensure_transform_job_progress_after_agent`` wired into
-``app.invoke``). The task description mentions ``git stash`` for the pre-v8 Case A
-baseline, but this run does NOT modify the working tree; it captures v8 behaviour as-is
-and documents, per case, whether v8 masks the stall.
+Harness rules:
+  * ``strands``, ``bedrock_agentcore`` and ``mcp`` may be absent locally, so import stubs are
+    installed in ``sys.modules`` before importing ``agent.app``. They carry no behaviour the
+    tests rely on.
+  * Nothing can reach AWS: each test installs a guard that fails the test if botocore sends an
+    HTTP request or if boto3.Session/client/resource is constructed, replaces every
+    credential-producing function in lzcore.transform_credentials with a recorder that fails the
+    test, points AWS config files at nonexistent paths, and clears AWS credential env vars.
+    deploy_boto_session returns a FakeOrgSession (never None, which would fall through to
+    boto3.Session()).
+  * All fixtures (FakeS3, FakeTable, FakeTransformOps, FakeOrgSession, scripted model) are
+    installed per test and restored in cleanup; none is a default the application picks up.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -62,152 +41,165 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "agent"))
 
 
-# --------------------------------------------------------------------------------------
-# sys.modules stubs: strands / bedrock_agentcore / mcp are not installed locally.
-# Installed once at import time so that `import agent.app` succeeds. These stubs carry NO
-# behaviour the application relies on at runtime beyond letting the module import; all
-# real behaviour under test comes from the per-test fixtures, which the test installs
-# explicitly (never a silent default).
-# --------------------------------------------------------------------------------------
 def _install_import_stubs() -> None:
     if "strands" not in sys.modules:
-        strands = types.ModuleType("strands")
+        try:
+            import strands  # noqa: F401
+        except ImportError:
+            strands = types.ModuleType("strands")
 
-        def tool(fn=None, **_kw):
-            # identity decorator; supports both @tool and @tool(...)
-            if fn is None:
-                return lambda f: f
-            return fn
-
-        class Agent:  # pragma: no cover - never instantiated; _deploy_agent is patched
-            def __init__(self, *a, **k):
-                raise RuntimeError("strands.Agent stub must not be constructed in tests")
-
-            def __call__(self, *a, **k):
-                raise RuntimeError("strands.Agent stub must not be called in tests")
-
-        strands.tool = tool
-        strands.Agent = Agent
-        sys.modules["strands"] = strands
-
-        models = types.ModuleType("strands.models")
-
-        class BedrockModel:  # pragma: no cover
-            def __init__(self, *a, **k):
-                pass
-
-        models.BedrockModel = BedrockModel
-        sys.modules["strands.models"] = models
-
-        strands_tools = types.ModuleType("strands.tools")
-        sys.modules["strands.tools"] = strands_tools
-        mcp_sub = types.ModuleType("strands.tools.mcp")
-
-        class MCPClient:  # pragma: no cover
-            def __init__(self, *a, **k):
-                pass
-
-        mcp_sub.MCPClient = MCPClient
-        sys.modules["strands.tools.mcp"] = mcp_sub
-        strands_tools.mcp = mcp_sub
-
-    if "bedrock_agentcore" not in sys.modules:
-        bac = types.ModuleType("bedrock_agentcore")
-        runtime = types.ModuleType("bedrock_agentcore.runtime")
-
-        class BedrockAgentCoreApp:
-            def __init__(self, *a, **k):
-                self._entry = None
-
-            def entrypoint(self, fn):
-                # Return the wrapped function so tests can call app.invoke(payload, ctx).
-                self._entry = fn
+            def tool(fn=None, **_kw):
+                if fn is None:
+                    return lambda f: f
                 return fn
 
-            def run(self):  # pragma: no cover
-                pass
+            class Agent:  # pragma: no cover - tests patch app.Agent when they construct one
+                def __init__(self, *a, **k):
+                    raise RuntimeError("strands.Agent stub must not be constructed in tests")
 
-        runtime.BedrockAgentCoreApp = BedrockAgentCoreApp
-        bac.runtime = runtime
-        sys.modules["bedrock_agentcore"] = bac
-        sys.modules["bedrock_agentcore.runtime"] = runtime
+            strands.tool = tool
+            strands.Agent = Agent
+            sys.modules["strands"] = strands
+
+            models = types.ModuleType("strands.models")
+
+            class BedrockModel:  # pragma: no cover
+                def __init__(self, *a, **k):
+                    raise RuntimeError("strands BedrockModel stub must not be constructed in tests")
+
+            models.BedrockModel = BedrockModel
+            sys.modules["strands.models"] = models
+
+            strands_tools = types.ModuleType("strands.tools")
+            mcp_sub = types.ModuleType("strands.tools.mcp")
+
+            class MCPClient:  # pragma: no cover
+                def __init__(self, *a, **k):
+                    raise RuntimeError("MCPClient stub must not be constructed in tests")
+
+            mcp_sub.MCPClient = MCPClient
+            strands_tools.mcp = mcp_sub
+            sys.modules["strands.tools"] = strands_tools
+            sys.modules["strands.tools.mcp"] = mcp_sub
+
+    if "bedrock_agentcore" not in sys.modules:
+        try:
+            import bedrock_agentcore.runtime  # noqa: F401
+        except ImportError:
+            bac = types.ModuleType("bedrock_agentcore")
+            runtime = types.ModuleType("bedrock_agentcore.runtime")
+
+            class BedrockAgentCoreApp:
+                def entrypoint(self, fn):
+                    return fn  # tests call app.invoke(payload, ctx) directly
+
+                def run(self):  # pragma: no cover
+                    raise RuntimeError("stub app must not run")
+
+            runtime.BedrockAgentCoreApp = BedrockAgentCoreApp
+            bac.runtime = runtime
+            sys.modules["bedrock_agentcore"] = bac
+            sys.modules["bedrock_agentcore.runtime"] = runtime
 
     if "mcp" not in sys.modules:
-        mcp = types.ModuleType("mcp")
-        client = types.ModuleType("mcp.client")
-        stdio = types.ModuleType("mcp.client.stdio")
-        streamable = types.ModuleType("mcp.client.streamable_http")
+        try:
+            import mcp.client.stdio  # noqa: F401
+            import mcp.client.streamable_http  # noqa: F401
+        except ImportError:
+            mcp = types.ModuleType("mcp")
+            client = types.ModuleType("mcp.client")
+            stdio = types.ModuleType("mcp.client.stdio")
+            streamable = types.ModuleType("mcp.client.streamable_http")
 
-        class StdioServerParameters:  # pragma: no cover
-            def __init__(self, *a, **k):
-                pass
+            class StdioServerParameters:  # pragma: no cover
+                def __init__(self, *a, **k):
+                    raise RuntimeError("mcp stub must not be used in tests")
 
-        def get_default_environment():  # pragma: no cover
-            return {}
+            def _unused(*a, **k):  # pragma: no cover
+                raise RuntimeError("mcp stub must not be used in tests")
 
-        def stdio_client(*a, **k):  # pragma: no cover
-            raise RuntimeError("mcp stdio stub must not be used in tests")
-
-        def streamablehttp_client(*a, **k):  # pragma: no cover
-            raise RuntimeError("mcp http stub must not be used in tests")
-
-        stdio.StdioServerParameters = StdioServerParameters
-        stdio.get_default_environment = get_default_environment
-        stdio.stdio_client = stdio_client
-        streamable.streamablehttp_client = streamablehttp_client
-        mcp.client = client
-        client.stdio = stdio
-        client.streamable_http = streamable
-        sys.modules["mcp"] = mcp
-        sys.modules["mcp.client"] = client
-        sys.modules["mcp.client.stdio"] = stdio
-        sys.modules["mcp.client.streamable_http"] = streamable
+            stdio.StdioServerParameters = StdioServerParameters
+            stdio.get_default_environment = _unused
+            stdio.stdio_client = _unused
+            streamable.streamablehttp_client = _unused
+            mcp.client = client
+            client.stdio = stdio
+            client.streamable_http = streamable
+            sys.modules["mcp"] = mcp
+            sys.modules["mcp.client"] = client
+            sys.modules["mcp.client.stdio"] = stdio
+            sys.modules["mcp.client.streamable_http"] = streamable
 
 
-# Env vars required at import time (tools.py reads STATE_TABLE / ARTIFACT_BUCKET at module
-# load; transform_ops and transform_mcp read TRANSFORM_WORKSPACE_ID).
-os.environ.setdefault("STATE_TABLE", "test-state-table")
-os.environ.setdefault("ARTIFACT_BUCKET", "test-artifact-bucket")
-os.environ.setdefault("MODEL_ID", "test-model-id")
-os.environ.setdefault("TRANSFORM_WORKSPACE_ID", "ws-test-0001")
-os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+# Read at import by agent/tools.py and agent/app.py. Values only name the fake table/bucket.
+os.environ["STATE_TABLE"] = "test-state-table"
+os.environ["ARTIFACT_BUCKET"] = "test-artifact-bucket"
+os.environ["MODEL_ID"] = "test-model-id"
 
 _install_import_stubs()
 
-# Import after stubs + env are in place.
-#
-# IMPORTANT: agent/app.py does `import tools` and `from deploy_workflow_tools import ...`
-# with the agent/ directory on sys.path, so those resolve to the TOP-LEVEL modules
-# `tools` / `deploy_workflow_tools`, NOT `agent.tools` / `agent.deploy_workflow_tools`.
-# The test must patch the SAME module objects the app uses, so we import the top-level
-# names (and read them back through `app` to guarantee object identity).
+# agent/app.py does `import tools` / `from deploy_workflow_tools import ...` with agent/ on
+# sys.path, so the app uses the TOP-LEVEL modules. Patch those exact module objects.
 import agent.app as app  # noqa: E402
 
-tools = app.tools  # the exact module object app.invoke() uses
-dwt = sys.modules["deploy_workflow_tools"]  # imported transitively by app
-from lzcore import deploy_transform  # noqa: E402  (app's tools uses lzcore.deploy_transform)
+tools = app.tools
+dwt = sys.modules["deploy_workflow_tools"]
+transform_mcp_mod = sys.modules["transform_mcp"]
+from lzcore import deploy_transform  # noqa: E402
+from lzcore import transform_credentials as tcred  # noqa: E402
+from lzcore import transform_ops as real_transform_ops  # noqa: E402
 from lzcore.deploy_artifacts import deployment_artifact_keys  # noqa: E402
+from lzcore.iac_plan import PLAN_TYPE  # noqa: E402
 
 assert tools is sys.modules["tools"], "test must patch the same tools module app imports"
 
 
-BUCKET = os.environ["ARTIFACT_BUCKET"]
 DEPLOY_RUN = "deployrun00000000000000000000001"
 DESIGN_RUN = "designrun0000000000000000000001"
-CHECKPOINT_KEY = f"runs/{DEPLOY_RUN}/deployment/agent-checkpoint.json"
+DEPLOYMENT = f"runs/{DEPLOY_RUN}/deployment"
+CHECKPOINT_KEY = f"{DEPLOYMENT}/agent-checkpoint.json"
+ASSESSMENT_KEY = f"{DEPLOYMENT}/foundation-assessment.json"
+PLAN_KEY = f"{DEPLOYMENT}/iac-change-plan.json"
+WORKSPACE = "ws-test-0001"
+TRANSFORM_ROLE = "arn:aws:iam::111122223333:role/TestTransformRole"
+MGMT_ACCOUNT = "111111111111"
+TARGET_ACCOUNT = "222222222222"
+ANALYZE_JOB = f"job-analyze-{DEPLOY_RUN[:6]}"
+DEPLOY_JOB = f"job-deploy-{DEPLOY_RUN[:6]}"
+
+SCOPE = {
+    "customer": {"orgName": "Acme"},
+    "summary": {"ous": 1},
+    "regions": {"home": "eu-west-1"},
+    "ous": [{"name": "Workloads"}],
+    "accounts": [{"name": "acme-management"}, {"name": "acme-prod"}],
+}
+
+PENDING = {
+    "source": "transform",
+    "jobId": ANALYZE_JOB,
+    "workspaceId": WORKSPACE,
+    "kind": "task",
+    "taskId": "task-0001",
+    "title": "Approve landing zone plan",
+    "text": "Approve the proposed OU changes?",
+    "options": ["Approve", "Reject"],
+    "consoleUrl": "https://transform.example.invalid/jobs/job-analyze",
+}
 
 
 # --------------------------------------------------------------------------------------
-# Fakes. All dict-backed; configurable per-key errors. Installed per test only.
+# Fakes. Installed per test only; anything unscripted fails loudly.
 # --------------------------------------------------------------------------------------
 class _ClientError(Exception):
-    """Mimics botocore.exceptions.ClientError for FakeS3-injected failures."""
+    """Shape of botocore ClientError (response['Error']['Code']) for injected failures."""
 
     def __init__(self, code: str, operation: str = "GetObject"):
         self.response = {"Error": {"Code": code, "Message": f"{code} (injected)"}}
@@ -224,39 +216,41 @@ class _Body:
 
 
 class FakeS3:
-    """Dict-backed S3 with per-key injectable ClientError. Absent keys raise NoSuchKey."""
+    """Dict-backed S3. errors: key -> code raised on get/head; put_errors: key -> code raised on put."""
 
     def __init__(self):
         self.store: dict[str, bytes] = {}
-        # key -> ClientError code to raise on get_object/head_object for that key
         self.errors: dict[str, str] = {}
+        self.put_errors: dict[str, str] = {}
         self.puts: list[str] = []
 
     def put_object(self, Bucket, Key, Body, **kw):
+        if Key in self.put_errors:
+            raise _ClientError(self.put_errors[Key], "PutObject")
         self.store[Key] = Body if isinstance(Body, bytes) else str(Body).encode()
         self.puts.append(Key)
         return {}
 
-    def _maybe_error(self, key):
+    def _check(self, key, operation):
         if key in self.errors:
-            raise _ClientError(self.errors[key])
+            raise _ClientError(self.errors[key], operation)
         if key not in self.store:
-            raise _ClientError("NoSuchKey")
+            raise _ClientError("NoSuchKey" if operation == "GetObject" else "404", operation)
 
     def get_object(self, Bucket, Key, **kw):
-        self._maybe_error(Key)
+        self._check(Key, "GetObject")
         return {"Body": _Body(self.store[Key])}
 
     def head_object(self, Bucket, Key, **kw):
-        self._maybe_error(Key)
+        self._check(Key, "HeadObject")
         return {"ContentLength": len(self.store[Key])}
 
-    def copy_object(self, **kw):  # pragma: no cover - render path not exercised here
-        self.store[kw["Key"]] = b"{}"
-        self.puts.append(kw["Key"])
+    def copy_object(self, Bucket, Key, CopySource, **kw):
+        self._check(CopySource["Key"], "CopyObject")
+        self.store[Key] = self.store[CopySource["Key"]]
+        self.puts.append(Key)
         return {}
 
-    # test helpers
     def put_json(self, key, obj):
         self.store[key] = json.dumps(obj).encode()
 
@@ -265,7 +259,8 @@ class FakeS3:
 
 
 class FakeTable:
-    """Records update_item/put_item; serves a single deploy META item."""
+    """Serves one deploy META item (also returned for the design run META); records audit rows.
+    Evaluates the sequencer's `#s = :running` condition like DynamoDB would."""
 
     def __init__(self, meta: dict):
         self.meta = dict(meta)
@@ -282,12 +277,15 @@ class FakeTable:
             self.audit.append(Item)
         return {}
 
-    def update_item(self, Key, UpdateExpression="", ExpressionAttributeValues=None, **kw):
-        self.updates.append(
-            {"expr": UpdateExpression, "vals": dict(ExpressionAttributeValues or {})}
-        )
-        # Reflect job-id writes back into META so subsequent _run_meta() reads see them.
-        vals = ExpressionAttributeValues or {}
+    def update_item(self, Key, UpdateExpression="", ExpressionAttributeValues=None,
+                    ExpressionAttributeNames=None, ConditionExpression=None):
+        vals = dict(ExpressionAttributeValues or {})
+        if ConditionExpression is not None:
+            if ConditionExpression != "#s = :running" or (ExpressionAttributeNames or {}).get("#s") != "status":
+                raise AssertionError(f"FakeTable: unscripted condition {ConditionExpression!r}")
+            if self.meta.get("status") != vals[":running"]:
+                raise _ClientError("ConditionalCheckFailedException", "UpdateItem")
+        self.updates.append({"expr": UpdateExpression, "vals": vals})
         if ":j" in vals and "transformAnalyzeJobId" in UpdateExpression:
             self.meta["transformAnalyzeJobId"] = vals[":j"]
         if ":j" in vals and "transformDeployJobId" in UpdateExpression:
@@ -296,17 +294,15 @@ class FakeTable:
             self.meta["transformWorkspaceId"] = vals[":w"]
         return {}
 
-    # audit actions seen, newest-last
     def actions(self):
         return [a.get("action") for a in self.audit]
 
 
 class FakeTransformOps:
-    """Scriptable stand-in for lzcore.transform_ops. Installed per test on deploy_transform.
+    """Stand-in for lzcore.transform_ops (installed on deploy_transform and the sequencer).
 
-    status_sequence drives successive poll_job() calls. create_error, when set, is raised
-    on start_landing_zone_job (CreateJob path). Fail loudly on anything unscripted; never
-    return a plausible default (engineering rule: no silent substitution).
+    poll_script: list of statuses or (status, pendingHumanInput) pairs for successive poll_job
+    calls, shaped per contract C1. Mirrors the real module: CANCELLED/STOPPED raise.
     """
 
     class HttpError(Exception):
@@ -314,14 +310,19 @@ class FakeTransformOps:
             self.status_code = status_code
             super().__init__(f"HTTP {status_code}: {message}")
 
-    def __init__(self, status_sequence=None, create_error=None):
-        self.status_sequence = list(status_sequence or [])
+    _TERMINAL_OK = {"COMPLETED", "SUCCEEDED"}
+
+    def __init__(self, poll_script=None, create_error=None, on_create=None, stop_error=None):
+        self.poll_script = list(poll_script or [])
         self.create_error = create_error
-        self.started = []
+        self.on_create = on_create
+        self.stop_error = stop_error
+        self.started: list[tuple[str, str]] = []
+        self.stopped: list[tuple[str, str]] = []
         self.polls = 0
 
     def workspace_id(self):
-        return os.environ["TRANSFORM_WORKSPACE_ID"]
+        return WORKSPACE
 
     def init_connection(self, preferred_region=None):
         return {"ok": True, "authMode": "sigv4", "region": "us-east-1"}
@@ -331,425 +332,911 @@ class FakeTransformOps:
             raise self.create_error
         job_id = f"job-{phase}-{run_id[:6]}"
         self.started.append((phase, job_id))
-        return {"workspaceId": self.workspace_id(), "jobId": job_id, "jobStatus": "IN_PROGRESS", "init": {}}
+        if self.on_create:
+            self.on_create(phase, job_id)
+        return {"workspaceId": WORKSPACE, "jobId": job_id, "jobStatus": "EXECUTING", "init": {}}
 
     def poll_job(self, job_id, workspace=None):
-        if not self.status_sequence:
-            raise RuntimeError("FakeTransformOps.poll_job called with no scripted status left")
-        status = self.status_sequence.pop(0)
+        if not self.poll_script:
+            raise AssertionError("FakeTransformOps.poll_job called with no scripted status left")
+        entry = self.poll_script.pop(0)
+        status, pending = entry if isinstance(entry, tuple) else (entry, None)
         self.polls += 1
-        s = status.upper()
-        terminal = s in {
-            "SUCCEEDED", "SUCCESS", "COMPLETED", "COMPLETE", "DONE",
-            "FAILED", "STOPPED", "CANCELLED", "CANCELED",
-        }
-        awaiting = s in {"AWAITING_HUMAN_INPUT", "PAUSED", "BLOCKED"} or "HITL" in s
+        if status in {"STOPPED", "CANCELLED"}:
+            raise RuntimeError(f"Transform job {job_id} ended with status {status}")
         return {
             "ok": True,
             "jobId": job_id,
-            "status": s,
-            "done": terminal,
-            "awaitingHumanApproval": awaiting,
-            "job": {"status": s},
+            "status": status,
+            "done": status in self._TERMINAL_OK or status == "FAILED",
+            "awaitingHumanApproval": status == "AWAITING_HUMAN_INPUT" or pending is not None,
+            "pendingHumanInput": pending,
+            "job": {"statusDetails": {"status": status}},
         }
+
+    def stop_job(self, job_id, workspace_id):
+        self.stopped.append((job_id, workspace_id))
+        if self.stop_error is not None:
+            raise self.stop_error
+
+
+class FakeOrgSession:
+    """Boto3-session-shaped fake for Organizations discovery: a management-account caller that
+    can read the full tree. org_error is raised from DescribeOrganization when set."""
+
+    def __init__(self, account_id=MGMT_ACCOUNT, org_error=None):
+        self.account_id = account_id
+        self.org_error = org_error
+        self.clients: list[str] = []
+
+    def client(self, name, **kw):
+        self.clients.append(name)
+        if name == "sts":
+            return types.SimpleNamespace(
+                get_caller_identity=lambda: {
+                    "Account": self.account_id,
+                    "Arn": f"arn:aws:sts::{self.account_id}:assumed-role/Test/test",
+                }
+            )
+        if name == "organizations":
+            return _FakeOrganizations(self)
+        if name == "controltower":
+            return _FakePaged({"list_landing_zones": lambda **k: {"landingZones": []}})
+        raise AssertionError(f"FakeOrgSession: unexpected client {name!r}")
+
+
+class _FakePaged:
+    """Client exposing each scripted operation both as a method and as a one-page paginator."""
+
+    def __init__(self, operations):
+        self._ops = operations
+
+    def __getattr__(self, name):
+        if name.startswith("_") or name not in self._ops:
+            raise AttributeError(f"fake client: unscripted operation {name!r}")
+        return self._ops[name]
+
+    def get_paginator(self, name):
+        if name not in self._ops:
+            raise AssertionError(f"fake client: unscripted paginator {name!r}")
+        op = self._ops[name]
+        return types.SimpleNamespace(paginate=lambda **k: [op(**k)])
+
+
+class _FakeOrganizations(_FakePaged):
+    def __init__(self, session):
+        def describe_organization(**k):
+            if session.org_error is not None:
+                raise session.org_error
+            return {"Organization": {"Id": "o-test", "MasterAccountId": session.account_id, "FeatureSet": "ALL"}}
+
+        def list_ous(ParentId, **k):
+            if ParentId == "r-test":
+                return {"OrganizationalUnits": [{"Id": "ou-test-workloads", "Name": "Workloads"}]}
+            return {"OrganizationalUnits": []}
+
+        accounts = [
+            {"Id": session.account_id, "Name": "acme-management", "Status": "ACTIVE"},
+            {"Id": "333333333333", "Name": "acme-prod", "Status": "ACTIVE"},
+        ]
+        super().__init__({
+            "describe_organization": describe_organization,
+            "list_roots": lambda **k: {"Roots": [{"Id": "r-test"}]},
+            "list_organizational_units_for_parent": list_ous,
+            "list_accounts": lambda **k: {"Accounts": accounts},
+            "list_policies": lambda Filter, **k: {"Policies": []},
+            "list_targets_for_policy": lambda PolicyId, **k: {"Targets": []},
+        })
+
+
+def _orgs_not_in_use():
+    from botocore.exceptions import ClientError
+
+    return ClientError(
+        {"Error": {"Code": "AWSOrganizationsNotInUseException", "Message": "not in use"}},
+        "DescribeOrganization",
+    )
 
 
 class _ScriptedModel:
-    """Scripted model: calls a list of deploy workflow tool callables, then returns.
-
-    Mirrors a real model ending its turn after N mechanical tool calls. Returns a short
-    string, like the real Strands Agent result.
-    """
+    """Stands in for one judgment-agent turn: runs the scripted steps, then returns."""
 
     def __init__(self, steps):
-        self.steps = steps  # list[callable] taking no args
-        self.calls = []
+        self.steps = list(steps)
+        self.calls = 0
 
     def __call__(self):
+        self.calls += 1
         for step in self.steps:
-            self.calls.append(getattr(step, "__name__", repr(step)))
             step()
-        return "Invocation completed successfully (20s)"
+        return "turn complete"
+
+
+def _valid_plan() -> dict:
+    return {
+        "schemaVersion": "1",
+        "planType": PLAN_TYPE,
+        "runId": DEPLOY_RUN,
+        "designRunId": DESIGN_RUN,
+        "summary": "No foundation changes needed.",
+        "strategy": "no_changes_needed",
+        "deliverDesignBundles": False,
+        "changes": [{"id": "chg-001", "category": "foundation", "action": "no_op", "target": "foundation",
+                     "rationale": "names match"}],
+    }
+
+
+def _judgment_model_saves_both(case):
+    """A judgment turn that uses the real judgment tools to save both artifacts."""
+
+    def step():
+        ctx = json.loads(tools.read_deploy_context())
+        case.assertEqual(ctx["runId"], DEPLOY_RUN)
+        out = tools.save_foundation_assessment(json.dumps({"environment": "brownfield", "rationale": "OUs exist"}))
+        case.assertTrue(out.startswith("saved"), out)
+        out = tools.save_iac_change_plan(json.dumps(_valid_plan()))
+        case.assertTrue(out.startswith("saved"), out)
+
+    return step
 
 
 # --------------------------------------------------------------------------------------
 # Env wiring shared by every case.
 # --------------------------------------------------------------------------------------
+# Pure functions of env vars / strings (no credentials, no network); everything else public in
+# lzcore.transform_credentials is treated as credential-producing and blocked.
+_DETERMINISTIC_CREDENTIAL_FUNCS = frozenset(
+    {"transform_principal_arn", "transform_role_arn", "transform_external_id", "parse_role_arn"}
+)
+
+
 class _SequencerCaseBase(unittest.TestCase):
-    def _make_env(self, *, meta_extra=None, transform_ops=None, seed=None):
-        """Install FakeS3/FakeTable/fake transform_ops + fake STS, seed artifacts, patch
-        app._deploy_agent with a scripted model, and return (s3, table, cleanup)."""
+    def setUp(self):
+        self.blocked: list[str] = []
+        self._install_no_aws_guard()
+
+    def _install_no_aws_guard(self):
+        import boto3
+        import botocore.httpsession
+
+        blocked = self.blocked
+
+        def _blocker(label):
+            def _raise(*a, **k):
+                blocked.append(label)
+                raise AssertionError(f"sequencer test attempted real AWS access via {label}")
+            return _raise
+
+        for target, attr in (
+            (botocore.httpsession.URLLib3Session, "send"),
+            (boto3, "Session"),
+            (boto3, "client"),
+            (boto3, "resource"),
+        ):
+            p = mock.patch.object(target, attr, _blocker(f"{getattr(target, '__name__', target)}.{attr}"))
+            p.start()
+            self.addCleanup(p.stop)
+
+        # Every credential-producing function in lzcore.transform_credentials (and any alias
+        # imported elsewhere) fails the test. transform_principal_arn/transform_role_arn are
+        # deterministic (no network) and stay real so the 403 message can be checked.
+        originals = {
+            name: fn
+            for name, fn in vars(tcred).items()
+            if callable(fn)
+            and not isinstance(fn, type)
+            and not name.startswith("_")
+            and getattr(fn, "__module__", None) == tcred.__name__
+            and name not in _DETERMINISTIC_CREDENTIAL_FUNCS
+        }
+        for mod in (tcred, real_transform_ops, deploy_transform, transform_mcp_mod, tools, dwt):
+            for attr, value in list(vars(mod).items()):
+                for name, fn in originals.items():
+                    if value is fn:
+                        p = mock.patch.object(mod, attr, _blocker(f"transform_credentials.{name}"))
+                        p.start()
+                        self.addCleanup(p.stop)
+
+        env = mock.patch.dict(
+            os.environ,
+            {
+                "TRANSFORM_WORKSPACE_ID": WORKSPACE,
+                "TRANSFORM_ROLE_ARN": TRANSFORM_ROLE,
+                "AWS_CONFIG_FILE": "/nonexistent/aws-config",
+                "AWS_SHARED_CREDENTIALS_FILE": "/nonexistent/aws-credentials",
+                "AWS_EC2_METADATA_DISABLED": "true",
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE",
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                    "TRANSFORM_EXTERNAL_ID", "BEDROCK_API_KEY_SECRET_ARN", "TRANSFORM_ORCHESTRATOR_AGENT"):
+            os.environ.pop(key, None)
+        # Runs last (cleanups are LIFO): no test may have touched AWS, even if it caught the error.
+        self.addCleanup(lambda: self.assertEqual(self.blocked, [], "real AWS access was attempted"))
+
+    def _make_env(self, *, meta_extra=None, transform_ops=None, org_session=None):
         s3 = FakeS3()
         meta = {
             "PK": f"RUN#{DEPLOY_RUN}",
             "SK": "META",
             "runKind": "deploy",
+            "status": "RUNNING",
             "designRunId": DESIGN_RUN,
-            "transformWorkspaceId": os.environ["TRANSFORM_WORKSPACE_ID"],
+            "transformWorkspaceId": WORKSPACE,
             "artifacts": {},
         }
-        if meta_extra:
-            meta.update(meta_extra)
+        meta.update(meta_extra or {})
         table = FakeTable(meta)
+        self.fake_ops = transform_ops or FakeTransformOps()
+        self.org_session = org_session or FakeOrgSession()
+        self.session_calls = 0
 
-        saved = {
-            "tools_s3": tools._s3,
-            "tools_ddb": tools._ddb,
-            "dt_ops": deploy_transform.transform_ops,
-            "deploy_agent": app._deploy_agent,
-            "transform_tools": app.transform_tools,
-            "deploy_session": tools.deploy_boto_session,
-            "assume_stable": app.stable_identity.assume_stable_session,
-            "state": dict(tools._state),
-        }
-
-        tools._s3 = s3
-        tools._ddb = table
-        if transform_ops is not None:
-            deploy_transform.transform_ops = transform_ops
-        # Transform MCP context manager is a no-op yielding no tools.
-        import contextlib
+        def _session():
+            self.session_calls += 1
+            return self.org_session
 
         @contextlib.contextmanager
         def _fake_transform_tools():
             yield []
 
-        app.transform_tools = _fake_transform_tools
-        # Never hit real AWS Organizations/STS for pre/post discover.
-        tools.deploy_boto_session = lambda: None
-        # Never call real STS for the stable Transform identity switch (fixture installed per test).
-        app.stable_identity.assume_stable_session = (
-            lambda: "arn:aws:sts::000000000000:assumed-role/test-AgentRole/ingram-lz-agent"
-        )
+        for target, attr, value in (
+            (tools, "_s3", s3),
+            (tools, "_ddb", table),
+            (tools, "deploy_boto_session", _session),
+            (deploy_transform, "transform_ops", self.fake_ops),
+            (dwt, "transform_ops", self.fake_ops),
+            (app, "transform_tools", _fake_transform_tools),
+            (app, "_deploy_agent", self._model_not_scripted),
+        ):
+            p = mock.patch.object(target, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+        saved_state = dict(tools._state)
 
-        # Seed the approved design scope (needed by analyze/merge/start-deploy paths).
-        s3.put_json(
-            f"runs/{DESIGN_RUN}/intake/scope.json",
-            {"customer": {"orgName": "Acme"}, "summary": {"ous": 2}, "regions": {"home": "eu-west-1"}},
-        )
-        if seed:
-            seed(s3, table)
-
-        def cleanup():
-            tools._s3 = saved["tools_s3"]
-            tools._ddb = saved["tools_ddb"]
-            deploy_transform.transform_ops = saved["dt_ops"]
-            app._deploy_agent = saved["deploy_agent"]
-            app.transform_tools = saved["transform_tools"]
-            tools.deploy_boto_session = saved["deploy_session"]
-            app.stable_identity.assume_stable_session = saved["assume_stable"]
+        def _restore_state():
             tools._state.clear()
-            tools._state.update(saved["state"])
+            tools._state.update(saved_state)
 
-        self.addCleanup(cleanup)
+        self.addCleanup(_restore_state)
+        s3.put_json(f"runs/{DESIGN_RUN}/intake/scope.json", SCOPE)
+        self.s3, self.table = s3, table
         return s3, table
 
-    def _set_scripted_model(self, steps):
+    def _model_not_scripted(self, prompt):
+        raise AssertionError("judgment model invoked but the test did not script it")
+
+    def _set_model(self, steps):
         model = _ScriptedModel(steps)
-        app._deploy_agent = lambda prompt: model()
+        p = mock.patch.object(app, "_deploy_agent", lambda prompt: model())
+        p.start()
+        self.addCleanup(p.stop)
         return model
 
     def _invoke(self):
         return app.invoke({"runId": DEPLOY_RUN, "phase": "deploy"}, context=None)
 
-    def _seed_checkpoint(self, s3, stage, **extra):
-        body = {"stage": stage, "updatedAt": 0, **extra}
-        s3.put_json(CHECKPOINT_KEY, body)
+    def _checkpoint(self):
+        return self.s3.get_json(CHECKPOINT_KEY) if CHECKPOINT_KEY in self.s3.store else None
 
-    def _seed_foundation(self, s3):
-        """Pre-seed foundation.json so v8 ensure_pre_discover() is a no-op (skips discover)."""
-        base = f"runs/{DEPLOY_RUN}/deployment"
-        s3.put_json(f"{base}/foundation.json", {"organizationalUnits": [], "accounts": []})
-        s3.put_json(f"{base}/gap-analysis.json", {"missingOus": [], "missingAccountsByName": []})
+    def _stage(self):
+        cp = self._checkpoint()
+        return cp.get("stage") if cp else None
 
+    def _seed_checkpoint(self, stage, **extra):
+        self.s3.put_json(CHECKPOINT_KEY, {"stage": stage, "updatedAt": 0, **extra})
 
-# --------------------------------------------------------------------------------------
-# Case A: init stall (Bug Condition 1.1 / Expected 2.1)
-# --------------------------------------------------------------------------------------
-class CaseA_InitStall(_SequencerCaseBase):
-    """Model calls read_deploy_checkpoint + transform_init_connection, then returns.
+    def _seed_foundation(self):
+        self.s3.put_json(f"{DEPLOYMENT}/foundation.json", {
+            "organization": {"id": "o-test", "callerAccountId": MGMT_ACCOUNT, "masterAccountId": MGMT_ACCOUNT},
+            "organizationalUnits": [{"id": "ou-test-workloads", "name": "Workloads", "path": "Workloads"}],
+            "accounts": [{"id": MGMT_ACCOUNT, "name": "acme-management", "isManagementAccount": True},
+                         {"id": "333333333333", "name": "acme-prod", "isManagementAccount": False}],
+            "serviceControlPolicies": [],
+            "controlTower": {"landingZones": []},
+        })
+        self.s3.put_json(f"{DEPLOYMENT}/gap-analysis.json", {
+            "missingOus": [], "extraOus": [], "missingAccountsByName": [], "extraAccountsByName": [],
+            "expectedScpIds": [],
+        })
 
-    Expected (fixed, 2.1): the sequencer starts the analyze job deterministically,
-    advances to transform_analyze_started/_waiting, and returns continue/ok. The result
-    must NOT be `deploy incomplete at checkpoint stage=...`.
+    def _seed_judgment(self, *, assessment=True, plan=True):
+        if assessment:
+            self.s3.put_json(ASSESSMENT_KEY, {"environment": "brownfield"})
+        if plan:
+            self.s3.put_json(PLAN_KEY, _valid_plan())
 
-    On the UNFIXED working tree the v8 patch (ensure_transform_job_progress_after_agent)
-    partially masks this exact stage: after the model returns at transform_init_done, v8
-    runs start_analyze + one poll. So v8 may turn this into a continue (masking the
-    model-owned-sequencing defect for THIS one stage). We assert the fixed-behaviour
-    expectation; if v8 happens to satisfy it, this case passes for the wrong reason, which
-    is documented here. The pre-v8 counterexample is `deploy incomplete ... 'transform_init_done'`.
-    """
-
-    def test_init_stall_should_not_report_deploy_incomplete(self):
-        fake = FakeTransformOps(status_sequence=["IN_PROGRESS"])  # one poll -> waiting
-        s3, table = self._make_env(transform_ops=fake)
-        self._seed_foundation(s3)  # skip pre-discover (v8 runs it before the agent)
-
-        def init_only():
-            dwt.read_deploy_checkpoint()
-            # Set the pre_discover_done checkpoint the real pre-discover would have set,
-            # then run init exactly as the model would.
-            dwt._save_checkpoint("pre_discover_done")
-            dwt.transform_init_connection()
-
-        self._set_scripted_model([init_only])
-        result = self._invoke()
-
-        self.assertNotIn(
-            "deploy incomplete at checkpoint stage",
-            str(result.get("error", "")),
-            msg=f"CounterexampleA(pre-v8): expected the analyze job to be started "
-            f"deterministically; got {result!r}",
+    def _assert_continue(self, result, *, awaiting=False, pending=None, job_id=None):
+        self.assertEqual(result.get("status"), "continue", msg=f"got {result!r}")
+        self.assertEqual(
+            set(result), {"status", "reason", "awaitingHitl", "jobId", "pendingHumanInput"},
+            msg=f"C3 payload keys; got {result!r}",
         )
-        self.assertIn(result.get("status"), {"continue", "ok"}, msg=f"got {result!r}")
+        self.assertIs(result["awaitingHitl"], awaiting, msg=f"got {result!r}")
+        self.assertEqual(result["pendingHumanInput"], pending, msg=f"got {result!r}")
+        if job_id is not None:
+            self.assertEqual(result["jobId"], job_id, msg=f"got {result!r}")
 
-
-# --------------------------------------------------------------------------------------
-# Case B: merge stall (Bug Condition 1.3 / Expected 2.3)
-# --------------------------------------------------------------------------------------
-class CaseB_MergeStall(_SequencerCaseBase):
-    """Checkpoint at transform_analyze_done, model returns without calling merge.
-
-    Expected (fixed, 2.3): the sequencer runs the merge deterministically and advances to
-    transform_merged. v8 does NOT cover transform_analyze_done, so the unfixed path returns
-    `deploy incomplete at checkpoint stage='transform_analyze_done'`.
-    """
-
-    def test_merge_stall_counterexample(self):
-        s3, table = self._make_env()
-        self._seed_foundation(s3)
-        self._seed_checkpoint(s3, "transform_analyze_done", jobId="job-analyze-x")
-        # analyze poll artifact exists (merge reads it)
-        s3.put_json(f"runs/{DEPLOY_RUN}/deployment/transform-poll-analyze.json", {"status": "DONE"})
-
-        self._set_scripted_model([lambda: None])  # model does nothing
-        result = self._invoke()
-
-        self.assertNotIn(
-            "deploy incomplete at checkpoint stage",
-            str(result.get("error", "")),
-            msg=f"CounterexampleB: merge not run deterministically; got {result!r}",
-        )
-
-
-# --------------------------------------------------------------------------------------
-# Case C: render / start-deploy / post-discover / finish stalls
-# (Bug Conditions 1.4, 1.5, 1.6, 1.7 / Expected 2.4, 2.5, 2.6, 2.7)
-# --------------------------------------------------------------------------------------
-class CaseC_MechanicalStalls(_SequencerCaseBase):
-    """Each remaining mechanical stage, with the model ending its turn early. None are
-    covered by v8, so each returns the matching `deploy incomplete at checkpoint stage=...`
-    on the unfixed code."""
-
-    def _run_stage(self, stage, seed=None):
-        fake = FakeTransformOps(status_sequence=["IN_PROGRESS"])
-        s3, table = self._make_env(
-            transform_ops=fake, meta_extra={"transformDeployJobId": "job-deploy-x"}
-        )
-        self._seed_foundation(s3)
-        self._seed_checkpoint(s3, stage)
-        if seed:
-            seed(s3)
-        self._set_scripted_model([lambda: None])
-        return self._invoke()
-
-    def test_render_stall_counterexample(self):
-        # Plan saved, checkpoint still transform_merged -> bundles should be rendered (1.4/2.4).
-        def seed(s3):
-            s3.put_json(
-                f"runs/{DEPLOY_RUN}/deployment/iac-change-plan.json",
-                {"strategy": "no_changes_needed", "changes": []},
-            )
-            # judgment artifacts present so fixed sequencer treats stage as mechanical
-            s3.put_json(f"runs/{DEPLOY_RUN}/deployment/foundation-assessment.json", {"environment": "greenfield"})
-
-        result = self._run_stage("transform_merged", seed=seed)
-        self.assertNotIn(
-            "deploy incomplete at checkpoint stage",
-            str(result.get("error", "")),
-            msg=f"CounterexampleC-render: bundles not rendered; got {result!r}",
-        )
-
-    def test_start_deploy_stall_counterexample(self):
-        result = self._run_stage("iac_render_done")
-        self.assertNotIn(
-            "deploy incomplete at checkpoint stage",
-            str(result.get("error", "")),
-            msg=f"CounterexampleC-start-deploy: deploy job not started; got {result!r}",
-        )
-
-    def test_post_discover_stall_counterexample(self):
-        result = self._run_stage("transform_deploy_done")
-        self.assertNotIn(
-            "deploy incomplete at checkpoint stage",
-            str(result.get("error", "")),
-            msg=f"CounterexampleC-post-discover: post-discover not run; got {result!r}",
-        )
-
-    def test_finish_stall_counterexample(self):
-        # post_discover_done with every required artifact present -> should finish (ok).
-        def seed(s3):
-            for key in deployment_artifact_keys(DEPLOY_RUN):
-                s3.put_json(key, {"ok": True})
-
-        result = self._run_stage("post_discover_done", seed=seed)
-        self.assertNotIn(
-            "deploy incomplete at checkpoint stage",
-            str(result.get("error", "")),
-            msg=f"CounterexampleC-finish: finish not run; got {result!r}",
-        )
-
-
-# --------------------------------------------------------------------------------------
-# Case D: checkpoint AccessDenied (Bug Condition 1.9 / Expected 2.9)
-# --------------------------------------------------------------------------------------
-class CaseD_CheckpointAccessDenied(_SequencerCaseBase):
-    """FakeS3 raises ClientError(AccessDenied) on the checkpoint key.
-
-    Expected (fixed, 2.9): fail with an error naming the checkpoint key and the AccessDenied
-    cause. Unfixed: `_load_checkpoint`/`_read_checkpoint` swallow the error into {} and the
-    result is `deploy incomplete at checkpoint stage=None`, hiding the real cause.
-    """
-
-    def test_access_denied_is_not_swallowed_to_stage_none(self):
-        s3, table = self._make_env()
-        self._seed_foundation(s3)
-        s3.errors[CHECKPOINT_KEY] = "AccessDenied"
-
-        self._set_scripted_model([lambda: None])
-        result = self._invoke()
-
-        err = str(result.get("error", ""))
-        self.assertNotIn(
-            "stage=None",
-            err,
-            msg=f"CounterexampleD: AccessDenied swallowed to stage=None; got {result!r}",
-        )
-        self.assertIn("AccessDenied", err, msg=f"error should name the cause; got {result!r}")
-        self.assertIn(
-            "agent-checkpoint.json", err, msg=f"error should name the checkpoint key; got {result!r}"
-        )
-
-
-# --------------------------------------------------------------------------------------
-# Case E: CreateJob 403 (Bug Condition 1.8 / Expected 2.8)
-# --------------------------------------------------------------------------------------
-class CaseE_CreateJob403(_SequencerCaseBase):
-    """Fake transform_ops raises HttpError(403) on the CreateJob (start analyze) path.
-
-    Expected (fixed, 2.8): error naming the step, the calling principal, and the need for
-    Contributor membership in TRANSFORM_WORKSPACE_ID. Unfixed: a generic message with none
-    of principal / workspace / 'Contributor' guidance.
-    """
-
-    def test_create_job_403_names_principal_and_workspace(self):
-        err403 = FakeTransformOps.HttpError(403, "User is not authorized")
-        fake = FakeTransformOps(create_error=err403)
-        s3, table = self._make_env(transform_ops=fake)
-        self._seed_foundation(s3)
-        self._seed_checkpoint(s3, "transform_init_done", workspaceId=os.environ["TRANSFORM_WORKSPACE_ID"])
-
-        # Model returns immediately; v8 (or the fixed sequencer) drives start-analyze.
-        self._set_scripted_model([lambda: None])
-        result = self._invoke()
-
-        err = str(result.get("error", ""))
+    def _assert_error(self, result, *needles):
         self.assertEqual(result.get("status"), "error", msg=f"got {result!r}")
-        for needle in ("Contributor", os.environ["TRANSFORM_WORKSPACE_ID"]):
-            self.assertIn(
-                needle,
-                err,
-                msg=f"CounterexampleE: 403 message lacks {needle!r}; got {result!r}",
-            )
+        for needle in needles:
+            self.assertIn(needle, result.get("error", ""), msg=f"got {result!r}")
 
 
 # --------------------------------------------------------------------------------------
-# Case F: judgment incomplete (Bug Condition 1.10 / Expected 2.10)
+# Case A: mechanical steps from the start / from pre_discover_done
 # --------------------------------------------------------------------------------------
-class CaseF_JudgmentIncomplete(_SequencerCaseBase):
-    """Checkpoint transform_merged with a judgment artifact (iac-change-plan.json) missing,
-    model returns without saving it.
+class CaseA_InitAndAnalyze(_SequencerCaseBase):
+    def test_from_pre_discover_done_starts_analyze_and_waits(self):
+        self._make_env(transform_ops=FakeTransformOps(poll_script=["EXECUTING"]))
+        self._seed_foundation()
+        self._seed_checkpoint("pre_discover_done")
 
-    Expected (fixed, 2.10): error naming the incomplete judgment step and the missing
-    artifact key (runs/{id}/deployment/iac-change-plan.json). Unfixed: only
-    `deploy incomplete at checkpoint stage='transform_merged'`, with no named artifact key.
-    """
-
-    def test_missing_plan_names_the_artifact_key(self):
-        s3, table = self._make_env()
-        self._seed_foundation(s3)
-        self._seed_checkpoint(s3, "transform_merged")
-        # assessment saved, plan deliberately absent
-        s3.put_json(f"runs/{DEPLOY_RUN}/deployment/foundation-assessment.json", {"environment": "greenfield"})
-
-        self._set_scripted_model([lambda: None])
         result = self._invoke()
 
-        err = str(result.get("error", ""))
-        self.assertNotIn(
-            "deploy incomplete at checkpoint stage",
-            err,
-            msg=f"CounterexampleF: judgment stall reported generically; got {result!r}",
-        )
-        self.assertIn(
-            "iac-change-plan.json",
-            err,
-            msg=f"CounterexampleF: missing artifact key not named; got {result!r}",
-        )
+        self._assert_continue(result, job_id=ANALYZE_JOB)
+        self.assertEqual(self._stage(), "transform_analyze_waiting")
+        self.assertEqual(self.fake_ops.started, [("analyze", ANALYZE_JOB)])
+        self.assertEqual(self.table.meta["transformAnalyzeJobId"], ANALYZE_JOB)
+
+    def test_from_no_checkpoint_runs_pre_discover_with_target_session(self):
+        self._make_env(transform_ops=FakeTransformOps(poll_script=["EXECUTING"]))
+
+        result = self._invoke()
+
+        self._assert_continue(result, job_id=ANALYZE_JOB)
+        self.assertEqual(self._stage(), "transform_analyze_waiting")
+        self.assertEqual(self.session_calls, 1)
+        self.assertIn("organizations", self.org_session.clients)
+        gaps = self.s3.get_json(f"{DEPLOYMENT}/gap-analysis.json")
+        self.assertEqual((gaps["missingOus"], gaps["missingAccountsByName"]), ([], []))
+
+    def test_second_invoke_polls_again_and_merges_into_judgment(self):
+        self._make_env(transform_ops=FakeTransformOps(poll_script=["EXECUTING", "COMPLETED"]))
+        self._seed_foundation()
+        self._seed_checkpoint("pre_discover_done")
+        model = self._set_model([_judgment_model_saves_both(self)])
+
+        self._assert_continue(self._invoke(), job_id=ANALYZE_JOB)
+        self.assertEqual(model.calls, 0)
+        result = self._invoke()
+
+        self._assert_continue(result)
+        self.assertEqual(self._stage(), "judgment_done")
+        self.assertEqual(model.calls, 1)
 
 
 # --------------------------------------------------------------------------------------
-# Case G: cancelled analyze job treated as done (silent substitution being fixed)
-# (design.md "Noted, not in scope" -> task 3.2 scope decision; Expected 2.8/2.11)
+# Case B: merge, then the judgment path
 # --------------------------------------------------------------------------------------
-class CaseG_CancelledAnalyzeJob(_SequencerCaseBase):
-    """Fake Transform reports analyze job status CANCELLED on poll.
+class CaseB_MergeThenJudgment(_SequencerCaseBase):
+    def test_merge_runs_and_judgment_completes_with_continue(self):
+        self._make_env(meta_extra={"transformAnalyzeJobId": ANALYZE_JOB})
+        self._seed_foundation()
+        self._seed_checkpoint("transform_analyze_done", jobId=ANALYZE_JOB)
+        self.s3.put_json(f"{DEPLOYMENT}/transform-poll-analyze.json", {"status": "COMPLETED"})
+        model = self._set_model([_judgment_model_saves_both(self)])
 
-    Unfixed: poll_transform_job only raises on FAILED; poll_job marks CANCELLED as a
-    terminal `done` status, so a cancelled analyze job flows into merge as if it succeeded
-    -- a silent substitution (no-fallbacks violation). Expected (fixed): poll raises naming
-    the job id and the CANCELLED status.
+        result = self._invoke()
 
-    This test drives the poll directly via the tool (transform_poll_analyze_job) using the
-    fake, because that is where the CANCELLED-as-done substitution happens. It asserts the
-    fixed behaviour: done must be False (not treated as a completed analyze).
-    """
+        self._assert_continue(result)
+        self.assertIn("deploy_judgment complete", result["reason"])
+        self.assertEqual(model.calls, 1)
+        self.assertEqual(self._stage(), "judgment_done")
+        self.assertEqual(self._checkpoint()["judgmentAttempts"], 1)
+        merged = self.s3.get_json(f"{DEPLOYMENT}/foundation.json")
+        self.assertEqual(merged["transform"]["analyzeJobId"], ANALYZE_JOB)
+        # #8: render and the destructive deploy job never share an invoke with a model turn.
+        self.assertNotIn(f"{DEPLOYMENT}/iac-manifest.json", self.s3.store)
+        self.assertEqual(self.fake_ops.started, [])
 
-    def test_cancelled_analyze_not_treated_as_done(self):
-        fake = FakeTransformOps(status_sequence=["CANCELLED"])
-        s3, table = self._make_env(
-            transform_ops=fake, meta_extra={"transformAnalyzeJobId": "job-analyze-x"}
-        )
-        self._seed_foundation(s3)
-        self._seed_checkpoint(s3, "transform_analyze_started", jobId="job-analyze-x")
 
-        # Put the deploy run into deploy mode so the tool's mode guard passes.
+# --------------------------------------------------------------------------------------
+# Case C: render / start-deploy / post-discover / finish
+# --------------------------------------------------------------------------------------
+class CaseC_MechanicalStages(_SequencerCaseBase):
+    def _env_at(self, stage, poll_script=("EXECUTING",), **meta_extra):
+        self._make_env(transform_ops=FakeTransformOps(poll_script=list(poll_script)), meta_extra=meta_extra)
+        self._seed_foundation()
+        self._seed_checkpoint(stage)
+
+    def test_judgment_done_renders_starts_deploy_and_waits(self):
+        self._env_at("judgment_done")
+        self._seed_judgment()
+
+        result = self._invoke()
+
+        self._assert_continue(result, job_id=DEPLOY_JOB)
+        self.assertEqual(self._stage(), "transform_deploy_waiting")
+        self.assertIn(f"{DEPLOYMENT}/iac-manifest.json", self.s3.store)
+        self.assertEqual(self.fake_ops.started, [("deploy", DEPLOY_JOB)])
+
+    def test_transform_merged_with_both_artifacts_renders_without_model(self):
+        self._env_at("transform_merged")
+        self._seed_judgment()
+
+        result = self._invoke()
+
+        self._assert_continue(result, job_id=DEPLOY_JOB)
+        self.assertEqual(self._stage(), "transform_deploy_waiting")
+        self.assertIn(f"{DEPLOYMENT}/iac-manifest.json", self.s3.store)
+
+    def test_start_deploy_from_iac_render_done(self):
+        self._env_at("iac_render_done")
+        self._seed_judgment()
+
+        result = self._invoke()
+
+        self._assert_continue(result, job_id=DEPLOY_JOB)
+        self.assertEqual(self._stage(), "transform_deploy_waiting")
+        self.assertEqual(self.table.meta["transformDeployJobId"], DEPLOY_JOB)
+
+    def test_deploy_done_runs_post_discover_and_finishes(self):
+        self._env_at("transform_deploy_done", transformDeployJobId=DEPLOY_JOB)
+        post = {f"{DEPLOYMENT}/{n}" for n in ("foundation-post.json", "gap-analysis-post.json", "classification-post.json")}
+        for key in deployment_artifact_keys(DEPLOY_RUN):
+            if key not in post and key not in self.s3.store:
+                self.s3.put_json(key, {"ok": True})
+
+        result = self._invoke()
+
+        self.assertEqual(result, {"status": "ok", "summary": "deploy agent phase complete"})
+        self.assertEqual(self._stage(), "agent_complete")
+        self.assertTrue(post <= set(self.s3.store))
+        self.assertEqual(self.session_calls, 1)
+
+    def test_post_discover_done_with_missing_artifacts_names_them(self):
+        self._env_at("post_discover_done")
+
+        result = self._invoke()
+
+        self._assert_error(result, "finish_deploy_workflow: missing artifacts", f"{DEPLOYMENT}/iac-manifest.json")
+        self.assertEqual(self._stage(), "post_discover_done")
+
+    def test_finish_with_all_artifacts_is_ok(self):
+        self._env_at("post_discover_done")
+        for key in deployment_artifact_keys(DEPLOY_RUN):
+            if key not in self.s3.store:
+                self.s3.put_json(key, {"ok": True})
+
+        result = self._invoke()
+
+        self.assertEqual(result.get("status"), "ok", msg=f"got {result!r}")
+        self.assertEqual(self._stage(), "agent_complete")
+
+    def test_unknown_stage_is_an_error(self):
+        self._env_at("no_such_stage")
+        self._assert_error(self._invoke(), "unknown deploy checkpoint stage 'no_such_stage'")
+        self.assertEqual(self._stage(), "no_such_stage")
+
+    def test_paused_without_resume_stage_is_an_error(self):
+        self._env_at("paused")
+        self._assert_error(self._invoke(), "no resumeStage")
+
+
+# --------------------------------------------------------------------------------------
+# Case D: non-404 read errors name the key (checkpoint, #18, #19)
+# --------------------------------------------------------------------------------------
+class CaseD_ReadErrors(_SequencerCaseBase):
+    def test_checkpoint_access_denied_names_key_and_cause(self):
+        self._make_env()
+        self.s3.errors[CHECKPOINT_KEY] = "AccessDenied"
+
+        result = self._invoke()
+
+        self._assert_error(result, "AccessDenied", CHECKPOINT_KEY)
+        self.assertEqual(self.session_calls, 0)
+
+    def _deploy_mode(self):
+        self._make_env()
+        self._seed_foundation()
         tools.set_deploy_run(DEPLOY_RUN)
 
-        raised = None
-        out = None
-        try:
-            out = dwt._execute_transform_poll_analyze_once()
-        except Exception as e:  # fixed code should raise here
-            raised = e
+    def test_save_foundation_assessment_raises_on_unreadable_foundation(self):
+        self._deploy_mode()
+        self.s3.errors[f"{DEPLOYMENT}/foundation.json"] = "AccessDenied"
+        with self.assertRaises(RuntimeError) as ctx:
+            tools.save_foundation_assessment(json.dumps({"environment": "greenfield", "rationale": "r"}))
+        self.assertIn(f"{DEPLOYMENT}/foundation.json", str(ctx.exception))
+        self.assertIn("AccessDenied", str(ctx.exception))
+        self.assertNotIn(ASSESSMENT_KEY, self.s3.store)
 
-        if raised is not None:
-            msg = str(raised)
-            self.assertIn("CANCELLED", msg.upper(), msg=f"raise should name status; got {msg!r}")
-            return
+    def test_save_foundation_assessment_refuses_only_when_absent(self):
+        self._deploy_mode()
+        del self.s3.store[f"{DEPLOYMENT}/gap-analysis.json"]
+        out = tools.save_foundation_assessment(json.dumps({"environment": "greenfield", "rationale": "r"}))
+        self.assertTrue(out.startswith("REFUSED"), out)
+        self.assertIn(f"{DEPLOYMENT}/gap-analysis.json", out)
+        self.assertNotIn(ASSESSMENT_KEY, self.s3.store)
 
-        # Unfixed path: no raise. Capture the counterexample: CANCELLED marked done=True and
-        # the checkpoint advanced to transform_analyze_done, feeding merge.
-        cp = s3.get_json(CHECKPOINT_KEY)
-        self.assertFalse(
-            out.get("transformDone"),
-            msg=(
-                "CounterexampleG: CANCELLED analyze job treated as done "
-                f"(transformDone={out.get('transformDone')}, checkpoint stage="
-                f"{cp.get('stage')!r}); a cancelled job must not flow into merge."
-            ),
+    def test_read_deploy_context_raises_on_unreadable_optional_inputs(self):
+        for name in ("transform-poll-analyze.json", "classification-heuristic.json", "foundation-assessment.json"):
+            with self.subTest(name=name):
+                self._deploy_mode()
+                key = f"{DEPLOYMENT}/{name}"
+                self.s3.errors[key] = "KMS.AccessDeniedException"
+                with self.assertRaises(RuntimeError) as ctx:
+                    tools.read_deploy_context()
+                self.assertIn(key, str(ctx.exception))
+
+    def test_read_deploy_context_reports_absent_optional_inputs_as_null(self):
+        self._deploy_mode()
+        ctx = json.loads(tools.read_deploy_context())
+        self.assertIsNone(ctx["transform"]["analyzePoll"])
+        self.assertIsNone(ctx["heuristicClassification"])
+        self.assertIsNone(ctx["foundationAssessmentSaved"])
+
+
+# --------------------------------------------------------------------------------------
+# Case E: CreateJob 403
+# --------------------------------------------------------------------------------------
+class CaseE_CreateJob403(_SequencerCaseBase):
+    def test_create_job_403_names_principal_workspace_and_contributor(self):
+        err403 = FakeTransformOps.HttpError(403, "User is not authorized")
+        self._make_env(transform_ops=FakeTransformOps(create_error=err403))
+        self._seed_foundation()
+        self._seed_checkpoint("transform_init_done", workspaceId=WORKSPACE)
+
+        result = self._invoke()
+
+        principal = tcred.transform_principal_arn()
+        self.assertIn(":assumed-role/TestTransformRole/", principal)
+        self._assert_error(result, "transform_start_analyze failed", principal, WORKSPACE, "Contributor")
+        self.assertEqual(self._stage(), "transform_init_done")
+        self.assertEqual(self.fake_ops.stopped, [])
+
+
+# --------------------------------------------------------------------------------------
+# Case F + #7 + #22: bounded judgment
+# --------------------------------------------------------------------------------------
+class CaseF_JudgmentBounded(_SequencerCaseBase):
+    def _env(self):
+        self._make_env()
+        self._seed_foundation()
+        self._seed_checkpoint("transform_merged")
+        self._seed_judgment(plan=False)
+
+    def test_incomplete_judgment_fails_named_after_attempt_limit(self):
+        self._env()
+        model = self._set_model([])
+
+        for attempt in (1, 2):
+            result = self._invoke()
+            self._assert_continue(result)
+            self.assertIn(f"attempt {attempt}/3 incomplete", result["reason"])
+            self.assertEqual(self._stage(), "transform_merged")
+            self.assertEqual(self._checkpoint()["judgmentAttempts"], attempt)
+        result = self._invoke()
+
+        self._assert_error(result, "deploy_judgment failed", "save_iac_change_plan", PLAN_KEY, "after 3 model turns")
+        self.assertEqual(model.calls, 3)
+        self.assertIn("tool.deploy_judgment.failed", self.table.actions())
+        # The limit is persisted: a further invoke does not run the model again.
+        self._assert_error(self._invoke(), "deploy_judgment failed")
+        self.assertEqual(model.calls, 3)
+
+    def test_non_hitl_yield_counts_as_an_attempt(self):
+        self._env()
+        self._set_model([lambda: dwt.yield_for_orchestrator("thinking", awaiting_hitl=False)])
+
+        result = self._invoke()
+
+        self._assert_continue(result, awaiting=False)
+        self.assertEqual(self._stage(), "transform_merged")
+        self.assertEqual(self._checkpoint()["judgmentAttempts"], 1)
+
+    def test_hitl_yield_continues_without_using_an_attempt_and_is_bounded(self):
+        self._env()
+        model = self._set_model([lambda: dwt.yield_for_orchestrator("Transform asks a question", awaiting_hitl=True)])
+
+        for n in (1, 2, 3):
+            result = self._invoke()
+            self._assert_continue(result, awaiting=True)
+            cp = self._checkpoint()
+            self.assertEqual(cp["stage"], "paused")
+            self.assertEqual(cp["resumeStage"], "transform_merged")
+            self.assertEqual((cp["judgmentAttempts"], cp["judgmentHitlYields"]), (0, n))
+        result = self._invoke()
+
+        self._assert_error(result, "deploy_judgment failed", "yielded for human input 4 times")
+        self.assertEqual(model.calls, 4)
+
+    def test_hitl_yield_then_completion_resumes_from_paused(self):
+        self._env()
+        turns = iter([
+            lambda: dwt.yield_for_orchestrator("waiting on Transform", awaiting_hitl=True),
+            lambda: self.s3.put_json(PLAN_KEY, _valid_plan()),
+        ])
+        self._set_model([lambda: next(turns)()])
+
+        self._assert_continue(self._invoke(), awaiting=True)
+        result = self._invoke()
+
+        self._assert_continue(result)
+        self.assertEqual(self._stage(), "judgment_done")
+
+    def test_model_exception_is_named_and_audited(self):
+        self._env()
+
+        def boom():
+            raise RuntimeError("Bedrock ThrottlingException")
+
+        self._set_model([boom])
+        result = self._invoke()
+
+        self._assert_error(result, "deploy_judgment failed: Bedrock ThrottlingException")
+        self.assertIn("tool.deploy_judgment.failed", self.table.actions())
+        self.assertEqual(self._checkpoint()["judgmentAttempts"], 1)
+
+
+# --------------------------------------------------------------------------------------
+# Case G: cancelled analyze job
+# --------------------------------------------------------------------------------------
+class CaseG_CancelledAnalyzeJob(_SequencerCaseBase):
+    def test_cancelled_analyze_is_a_named_error(self):
+        self._make_env(
+            transform_ops=FakeTransformOps(poll_script=["CANCELLED"]),
+            meta_extra={"transformAnalyzeJobId": ANALYZE_JOB},
         )
+        self._seed_foundation()
+        self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
+
+        result = self._invoke()
+
+        self._assert_error(result, "transform_poll_analyze_job failed", ANALYZE_JOB, "CANCELLED")
+        self.assertEqual(self._stage(), "transform_analyze_started")
+
+
+# --------------------------------------------------------------------------------------
+# #3: pre-discover failures are step errors, never HITL waits
+# --------------------------------------------------------------------------------------
+class PreDiscoverFailures(_SequencerCaseBase):
+    def test_failure_without_target_is_a_named_error(self):
+        self._make_env()
+
+        def broken_session():
+            raise RuntimeError("cannot read deploy target credentials")
+
+        p = mock.patch.object(tools, "deploy_boto_session", broken_session)
+        p.start()
+        self.addCleanup(p.stop)
+
+        result = self._invoke()
+
+        self.assertEqual(result, {"status": "error",
+                                  "error": "run_pre_discover failed: cannot read deploy target credentials"})
+        self.assertIsNone(self._checkpoint())
+        self.assertIn("tool.run_pre_discover.failed", self.table.actions())
+
+    def test_failure_with_target_keeps_platform_account_guidance(self):
+        target = {"mode": "role", "accountId": TARGET_ACCOUNT,
+                  "roleArn": f"arn:aws:iam::{TARGET_ACCOUNT}:role/LzDeploy"}
+        self._make_env(
+            meta_extra={"deployTarget": target},
+            org_session=FakeOrgSession(account_id=TARGET_ACCOUNT, org_error=_orgs_not_in_use()),
+        )
+
+        result = self._invoke()
+
+        self._assert_error(
+            result,
+            "run_pre_discover failed: deploy target account " + TARGET_ACCOUNT,
+            "DescribeOrganization",
+            "Do not create an AWS Organization in the platform account",
+        )
+        self.assertNotIn("awaitingHitl", result)
+        self.assertIsNone(self._checkpoint())
+
+    def test_superseded_blocked_checkpoint_is_an_explicit_error(self):
+        self._make_env()
+        self._seed_checkpoint("pre_discover_blocked", reason="old failure", awaitingHitl=True)
+
+        result = self._invoke()
+
+        self._assert_error(result, "'pre_discover_blocked'", "old failure", "start a new deploy run")
+        self.assertEqual(self.session_calls, 0)
+        self.assertEqual(self._stage(), "pre_discover_blocked")
+
+
+# --------------------------------------------------------------------------------------
+# #8 / C4: no Transform job for a run that is not RUNNING
+# --------------------------------------------------------------------------------------
+class RunStatusGuard(_SequencerCaseBase):
+    def test_start_analyze_refused_when_run_failed(self):
+        self._make_env(meta_extra={"status": "FAILED"})
+        self._seed_foundation()
+        self._seed_checkpoint("transform_init_done")
+
+        result = self._invoke()
+
+        self.assertEqual(result, {"status": "error", "error": "transform_start_analyze refused: run is FAILED"})
+        self.assertEqual(self.fake_ops.started, [])
+        self.assertEqual(self._stage(), "transform_init_done")
+
+    def test_start_deploy_refused_when_run_failed(self):
+        self._make_env(meta_extra={"status": "FAILED"})
+        self._seed_foundation()
+        self._seed_judgment()
+        self._seed_checkpoint("iac_render_done")
+
+        result = self._invoke()
+
+        self.assertEqual(result, {"status": "error", "error": "transform_start_deploy refused: run is FAILED"})
+        self.assertEqual(self.fake_ops.started, [])
+        self.assertEqual(self._stage(), "iac_render_done")
+
+    def test_run_stopped_during_create_job_stops_the_new_job(self):
+        def stop_run(phase, job_id):
+            self.table.meta["status"] = "FAILED"  # /stop lands between the guard and CreateJob
+
+        self._make_env(transform_ops=FakeTransformOps(on_create=stop_run))
+        self._seed_foundation()
+        self._seed_checkpoint("transform_init_done")
+
+        result = self._invoke()
+
+        self._assert_error(result, "transform_start_analyze failed", ANALYZE_JOB, "ConditionalCheckFailedException",
+                           f"stop_job({ANALYZE_JOB}) succeeded")
+        self.assertEqual(self.fake_ops.stopped, [(ANALYZE_JOB, WORKSPACE)])
+        self.assertEqual(self._stage(), "transform_init_done")
+
+
+# --------------------------------------------------------------------------------------
+# #23: a started job whose recording fails is stopped and named
+# --------------------------------------------------------------------------------------
+class OrphanedJobs(_SequencerCaseBase):
+    def test_analyze_artifact_write_failure_stops_job(self):
+        self._make_env()
+        self._seed_foundation()
+        self._seed_checkpoint("transform_init_done")
+        self.s3.put_errors[f"{DEPLOYMENT}/transform-analyze-started.json"] = "KMS.DisabledException"
+
+        result = self._invoke()
+
+        self._assert_error(result, "transform_start_analyze failed", ANALYZE_JOB, "KMS.DisabledException",
+                           f"stop_job({ANALYZE_JOB}) succeeded")
+        self.assertEqual(self.fake_ops.stopped, [(ANALYZE_JOB, WORKSPACE)])
+        self.assertIn("tool.transform_start_analyze.orphan_stop", self.table.actions())
+        self.assertEqual(self._stage(), "transform_init_done")
+
+    def test_deploy_checkpoint_write_failure_reports_stop_failure(self):
+        self._make_env(transform_ops=FakeTransformOps(stop_error=RuntimeError("StopJob throttled")))
+        self._seed_foundation()
+        self._seed_judgment()
+        self._seed_checkpoint("iac_render_done")
+        self.s3.put_errors[CHECKPOINT_KEY] = "AccessDenied"
+
+        result = self._invoke()
+
+        self._assert_error(result, "transform_start_deploy failed", DEPLOY_JOB,
+                           f"stop_job({DEPLOY_JOB}) failed: StopJob throttled")
+        self.assertEqual(self.fake_ops.stopped, [(DEPLOY_JOB, WORKSPACE)])
+        self.assertEqual(self._stage(), "iac_render_done")
+
+    def test_create_job_failure_does_not_call_stop(self):
+        self._make_env(transform_ops=FakeTransformOps(create_error=RuntimeError("CreateJob 500")))
+        self._seed_foundation()
+        self._seed_checkpoint("transform_init_done")
+
+        self._assert_error(self._invoke(), "transform_start_analyze failed: CreateJob 500")
+        self.assertEqual(self.fake_ops.stopped, [])
+
+
+# --------------------------------------------------------------------------------------
+# #2 wiring: pending human input reaches the checkpoint and the C3 payload
+# --------------------------------------------------------------------------------------
+class PendingHumanInputWiring(_SequencerCaseBase):
+    def _env(self, script, stage="transform_analyze_started"):
+        self._make_env(transform_ops=FakeTransformOps(poll_script=script),
+                       meta_extra={"transformAnalyzeJobId": ANALYZE_JOB})
+        self._seed_foundation()
+        self._seed_checkpoint(stage, jobId=ANALYZE_JOB)
+
+    def test_pending_input_on_executing_job_sets_awaiting_hitl(self):
+        self._env([("EXECUTING", PENDING)])
+
+        result = self._invoke()
+
+        self._assert_continue(result, awaiting=True, pending=PENDING, job_id=ANALYZE_JOB)
+        cp = self._checkpoint()
+        self.assertEqual(cp["stage"], "transform_analyze_waiting")
+        self.assertIs(cp["awaitingHitl"], True)
+        self.assertEqual(cp["pendingHumanInput"], PENDING)
+
+    def test_awaiting_status_without_task_has_null_pending(self):
+        self._env(["AWAITING_HUMAN_INPUT"])
+
+        result = self._invoke()
+
+        self._assert_continue(result, awaiting=True, pending=None, job_id=ANALYZE_JOB)
+        self.assertEqual(self._stage(), "transform_analyze_waiting")
+
+    def test_answered_input_clears_pending_on_next_poll(self):
+        self._env([("EXECUTING", PENDING), "EXECUTING"])
+
+        self._assert_continue(self._invoke(), awaiting=True, pending=PENDING)
+        result = self._invoke()
+
+        self._assert_continue(result, awaiting=False, pending=None)
+        cp = self._checkpoint()
+        self.assertIsNone(cp["pendingHumanInput"])
+        self.assertIs(cp["awaitingHitl"], False)
+
+    def test_second_poll_in_one_invoke_is_deferred_with_c3_payload(self):
+        # Judgment artifacts already saved: analyze poll -> merge -> render -> start deploy, then
+        # the deploy poll is deferred to the next invoke (one Transform poll per invoke).
+        self._env(["COMPLETED"])
+        self._seed_judgment()
+
+        result = self._invoke()
+
+        self._assert_continue(result, awaiting=False, pending=None, job_id=DEPLOY_JOB)
+        self.assertEqual(result["reason"], "transform_poll_deploy_job already polled this invoke")
+        self.assertEqual(self._stage(), "transform_deploy_started")
+        self.assertEqual(self.fake_ops.polls, 1)
+
+
+# --------------------------------------------------------------------------------------
+# #4 / #31: judgment agent tools and prompt
+# --------------------------------------------------------------------------------------
+def _tool_name(t) -> str:
+    return getattr(t, "tool_name", None) or getattr(t, "__name__", None) or repr(t)
+
+
+class JudgmentAgentTools(_SequencerCaseBase):
+    JUDGMENT = {"read_deploy_context", "read_approved_scope", "get_catalog", "save_foundation_assessment",
+                "save_iac_change_plan", "yield_for_orchestrator"}
+
+    def test_deploy_tools_are_judgment_only(self):
+        names = {_tool_name(t) for t in tools.deploy_tools()}
+        self.assertEqual(names, self.JUDGMENT)
+        mechanical = {_tool_name(t) for t in dwt.workflow_tools()} - {"yield_for_orchestrator"}
+        self.assertFalse(names & mechanical)
+
+    def test_deploy_agent_gets_judgment_docs_and_transform_mcp_tools(self):
+        self._make_env()
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, *, model, system_prompt, tools):
+                captured.update(system_prompt=system_prompt, tools=tools)
+
+            def __call__(self, prompt):
+                return "ok"
+
+        @contextlib.contextmanager
+        def fake_mcp():
+            yield ["transform-mcp-tool"]
+
+        for target, attr, value in (
+            (app, "Agent", FakeAgent),
+            (app, "BedrockModel", lambda **k: "model"),
+            (app, "transform_tools", fake_mcp),
+            (tools, "aws_docs_tools", lambda: ["aws-docs-tool"]),
+        ):
+            p = mock.patch.object(target, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+        self.assertEqual(_REAL_DEPLOY_AGENT("prompt"), "ok")
+
+        names = [t if isinstance(t, str) else _tool_name(t) for t in captured["tools"]]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(set(names), self.JUDGMENT | {"aws-docs-tool", "transform-mcp-tool"})
+        self.assertEqual(captured["system_prompt"], app.DEPLOY_SYSTEM)
+
+    def test_deploy_prompts_have_no_account_ids(self):
+        import re
+
+        for text in (app.DEPLOY_SYSTEM, app.DEPLOY_PROMPT):
+            self.assertIsNone(re.search(r"\b(556|831)\d*\b|\b\d{12}\b", text),
+                              msg="hard-coded account id in deploy prompt")
+        self.assertIn("deploy target account", app.DEPLOY_SYSTEM)
+        self.assertIn("platform account", app.DEPLOY_SYSTEM)
+
+
+_REAL_DEPLOY_AGENT = app._deploy_agent
 
 
 if __name__ == "__main__":

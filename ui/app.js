@@ -350,22 +350,14 @@ function deployContinueNotice(audit, run) {
   if (!lastCont && !reason) return "";
   const targetAcct = run && run.deployTarget && run.deployTarget.accountId;
   if (/^Pre-discover failed for deploy target account/i.test(reason)) {
-    return `<div class="notice notice-warn" role="status"><strong>Deploy paused (target discover).</strong> ${esc(reason.length > 480 ? reason.slice(0, 480) + "…" : reason)}<br><span class="hint">Fix the issue in account ${esc(targetAcct || "556")}, then start a new deploy run.</span></div>`;
+    return `<div class="notice notice-warn" role="status"><strong>Deploy paused (target discover).</strong> ${esc(reason.length > 480 ? reason.slice(0, 480) + "…" : reason)}<br><span class="hint">Fix the issue in ${targetAcct ? `account ${esc(targetAcct)}` : "the target account"}, then start a new deploy run.</span></div>`;
   }
-  const wrong831OrgAdvice =
-    targetAcct &&
-    targetAcct !== "831493647146" &&
-    /831493647146.*(create|enable).*org|create-organization.*831|Organizations not yet created.*831493647146|management account 831493647146/i.test(reason);
   const platformBlock =
-    !wrong831OrgAdvice &&
-    /permission|IAM|AccessDenied|not authorized|s3:|organization|create-organization|831493647146|platform account|run_pre_discover|NotInUse/i.test(
+    /permission|IAM|AccessDenied|not authorized|s3:|organization|create-organization|platform account|run_pre_discover|NotInUse/i.test(
       reason
     );
-  if (d.awaitingHitl && !platformBlock && !wrong831OrgAdvice) {
+  if (d.awaitingHitl && !platformBlock) {
     return `<div class="notice notice-info" role="status"><strong>Waiting on AWS Transform.</strong> Complete the required step in the Transform workspace. The deploy agent will resume on its own.</div>`;
-  }
-  if (wrong831OrgAdvice) {
-    return `<div class="notice notice-warn" role="status"><strong>Deploy paused — ignore “create org in 831”.</strong> This run targets account <code>${esc(targetAcct)}</code>. The agent skipped discover and gave incorrect platform advice. Use valid <strong>${esc(targetAcct)}</strong> credentials (or AssumeRole), add AgentRole as Contributor+ on the Transform workspace in 831, then start a <strong>new</strong> deploy run after redeploying the latest agent.<br><span class="hint">Step Functions may keep retrying this run until you stop it.</span></div>`;
   }
   if (reason) {
     const cls = platformBlock ? "notice-warn" : "notice-info";
@@ -375,6 +367,33 @@ function deployContinueNotice(audit, run) {
     return `<div class="notice ${cls}" role="status">${lead} ${esc(reason.length > 420 ? reason.slice(0, 420) + "…" : reason)}<br><span class="hint">Step Functions will retry until you use <strong>Stop run</strong> or the run fails.</span></div>`;
   }
   return "";
+}
+
+// META.pendingHumanInput (phase_invoke) mirrors the question an AWS Transform job is waiting on.
+// Everything from Transform is untrusted text: escape it, and only link https console URLs.
+function humanInputBanner(run) {
+  if (run.status !== "RUNNING") return "";
+  const p = run.pendingHumanInput && typeof run.pendingHumanInput === "object" ? run.pendingHumanInput : null;
+  if (!p && run.awaitingHitl !== true) return "";
+  const url = p && typeof p.consoleUrl === "string" && /^https:\/\//i.test(p.consoleUrl) ? p.consoleUrl : "";
+  const options = p && Array.isArray(p.options) ? p.options.filter((o) => typeof o === "string" && o) : [];
+  const body = p
+    ? `${p.title ? `<p style="margin:6px 0 0"><strong>${esc(p.title)}</strong></p>` : ""}
+      ${p.text ? `<p style="margin:6px 0 0;white-space:pre-wrap">${esc(p.text)}</p>` : ""}
+      ${options.length ? `<p style="margin:8px 0 2px">Choices offered in Transform:</p><ul class="bullets">${options.map((o) => `<li>${esc(o)}</li>`).join("")}</ul>` : ""}
+      ${p.jobId ? `<p class="hint" style="margin:6px 0 0">Transform job <code>${esc(p.jobId)}</code>${p.kind ? ` · ${esc(p.kind === "task" ? "task" : "chat message")}` : ""}</p>` : ""}`
+    : `<p style="margin:6px 0 0">The Transform job is waiting for a person, but Transform did not return the question. Open the job in the Transform workspace to answer it.</p>`;
+  const link = url
+    ? `<p style="margin:8px 0 0"><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">Answer in AWS Transform<span class="sr-only"> (opens in a new tab)</span></a></p>`
+    : "";
+  return `<section class="notice notice-warn" role="region" aria-labelledby="hitl-heading">
+    <h2 id="hitl-heading" style="font-size:14px;margin:0">AWS Transform needs your input</h2>${body}${link}
+    <p class="hint" style="margin:8px 0 0">Answer in Transform; this deploy run resumes on its own. It fails if no answer arrives within about 24 hours.</p></section>`;
+}
+
+function credentialsCleanupNotice(run) {
+  if (!run.credentialsCleanupError) return "";
+  return `<div class="notice notice-err" role="alert"><strong>Stored target credentials were not deleted.</strong> ${esc(run.credentialsCleanupError)}<br><span class="hint">Ask a platform operator to delete them from the artifact bucket and rotate the access key.</span></div>`;
 }
 
 function renderDeployRun() {
@@ -404,7 +423,7 @@ function renderDeployRun() {
   layout("runs", `${name} deploy`, `<div class="crumbs"><a href="#/runs">← Runs</a></div>
     <div class="page-title" style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">${esc(name)} ${runTypeBadge(run)} ${stateBadge(run)} ${stopRunButton(run)}</div>
     <p class="page-sub" style="margin-bottom:18px">Started ${esc(when(run.createdAt))} · Deploy run <code>${esc(run.runId.slice(0, 8))}</code>${designLink}</p>
-    ${failure}${deployContinueNotice(audit, run)}
+    ${failure}${credentialsCleanupNotice(run)}${humanInputBanner(run) || deployContinueNotice(audit, run)}
     <div class="grid-3"><div class="card"><div class="card-head"><h2>Progress</h2></div>${deployStepsHtml(run, audit)}</div>${deployDeliverables(run)}</div>
     ${body}`);
   if (S.tab === "organization" && diagram) drawDiagram(diagram);
@@ -573,6 +592,10 @@ const ACTIONS = {
   "phase.started": "Agent started",
   "phase.completed": "Agent step finished",
   "phase.continue": "Agent waiting (orchestrator resume)",
+  "phase.awaiting_human": "AWS Transform asked for your input",
+  "phase.human_input_resolved": "Transform input received",
+  "deploy.target_credentials_deleted": "Stored target credentials deleted",
+  "deploy.target_credentials_delete_failed": "Deleting stored target credentials failed",
   "phase.failed": "Agent step failed",
   "bundle.rendered": "Code generated",
   "run.delivered": "Ready to download",
@@ -630,6 +653,8 @@ function deployAuthFields() {
   $("deployRoleFields").hidden = method !== "role";
   $("deployKeyFields").hidden = method !== "keys";
   $("deployForm").accountId.required = method !== "platform";
+  $("deployForm").roleArn.required = method === "role";
+  $("deployForm").externalId.required = method === "role";
   $("testDeployCreds").hidden = method === "platform";
   $("deployVerifyBox").hidden = true;
   $("deployVerifyBox").textContent = "";
@@ -646,7 +671,9 @@ function setDeployVerifyResult(kind, text) {
 async function testDeployCredentials() {
   const btn = $("testDeployCreds");
   try {
-    const body = deployPayloadFromForm();
+    if (!pendingDeployDesignId) throw new Error("Open this dialog from a delivered design run");
+    // The API only tests credentials for the owner of a DELIVERED design run.
+    const body = { ...deployPayloadFromForm(), designRunId: pendingDeployDesignId };
     btn.disabled = true;
     setDeployVerifyResult("pending", "Testing connection…");
     const r = await api("/deploy-target/verify", {
@@ -685,10 +712,9 @@ function deployPayloadFromForm() {
   if (method === "role") {
     const roleArn = f.roleArn.value.trim();
     if (!roleArn) throw new Error("Role ARN is required");
-    const body = { deployTarget: { accountId, roleArn } };
-    const ext = f.externalId.value.trim();
-    if (ext) body.deployTarget.externalId = ext;
-    return body;
+    const externalId = f.externalId.value.trim();
+    if (!externalId) throw new Error("External ID is required for the IAM role method");
+    return { deployTarget: { accountId, roleArn, externalId } };
   }
   const accessKeyId = f.accessKeyId.value.trim();
   const secretAccessKey = f.secretAccessKey.value.trim();

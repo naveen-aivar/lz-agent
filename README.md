@@ -35,14 +35,16 @@ API creates deploy run (runKind=deploy, links designRunId)
           pre-discover → Transform analyze (poll/HITL) → merge
           → foundation assessment + iac-change-plan → render bundles
           → Transform deploy (poll/HITL) → post-discover → finish_deploy_workflow
-        if Transform still running: SFN waits (30s/60s) and re-invokes same session (max 200 cycles)
+        if Transform still running: SFN waits 60 s and re-invokes the same session
+          progress budget 240 cycles (~4 h); HITL budget 1440 cycles (~24 h) while Transform waits on a person
+          (the question is shown in the UI: "AWS Transform needs your input")
   → on agent ok: attestation in phase_invoke (deployment-report.json, rule-based pass/fail)
-  → phase_deploy → DELIVERED or FAILED
+  → phase_deploy → DELIVERED or FAILED (stored target keys deleted; /stop deletes them too)
 ```
 
-Details: [docs/deployment-agent-transform.md](docs/deployment-agent-transform.md) and [docs/deployment-agent-scope.md](docs/deployment-agent-scope.md).
+Details: [docs/deployment-agent-transform.md](docs/deployment-agent-transform.md), [docs/cross-account-deploy.md](docs/cross-account-deploy.md) and [docs/deployment-agent-scope.md](docs/deployment-agent-scope.md).
 
-PoC note: org discover/attest use the **AgentCore runtime IAM role** (platform account org), not cross-account STS.
+Org discover/attest run in the platform account by default, or in a cross-account target (IAM role with a required external ID, recommended; or access keys stored per run and deleted when it ends). See `docs/cross-account-deploy.md`.
 
 ## How the scope is kept honest (`lzcore/`)
 | Concern | Enforced by |
@@ -107,6 +109,8 @@ aws s3 mb s3://<code-bucket>
 scripts/deploy.sh <code-bucket> <cognito-domain-prefix> <bedrock-model-id>        # pass 1: platform + ECR
 scripts/deploy.sh <code-bucket> <cognito-domain-prefix> <bedrock-model-id> v1     # pass 2: agent image + runtime (required for intake and deploy agent)
 ```
+Optional deploy-time variables: `TRANSFORM_ROLE_ARN` (+ `TRANSFORM_EXTERNAL_ID`, not a secret) when Transform lives in another account, and `DEPLOY_ASSUME_ROLE_ARN` (target-role pattern, default `arn:aws:iam::*:role/IngramLandingZoneDeploy*`; never `*`). With `ENABLE_CLOUDFRONT=false` the UI is served from the API endpoint (same origin, no CORS) by a Lambda that can only read the UI bucket.
+
 Pass 2 creates the AgentCore runtime. **Design** (`POST /runs/{id}/start`) and **deploy** (`POST /runs/{designId}/deploy`) both call that runtime; pass 1 alone is not enough for agent phases.
 
 Create Cognito users. Any signed-in user can start a run, and each user sees only their own runs. Design runs ship generated code to the customer; deploy runs use AWS Transform in the platform account (see `docs/deployment-agent-scope.md`).

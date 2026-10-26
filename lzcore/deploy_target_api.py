@@ -1,13 +1,51 @@
-"""Parse deploy target from API POST /runs/{id}/deploy body."""
+"""Parse deploy target from API POST /runs/{id}/deploy body; store and delete key-mode credentials."""
 from __future__ import annotations
 
 import json
 import re
 from typing import Any, Callable
 
-from .aws_target_session import normalize_deploy_target
+from .aws_target_session import _require_role_in_account, normalize_deploy_target, require_external_id
 
 _ACCOUNT_RE = re.compile(r"^\d{12}$")
+
+# Deploy-target access keys live outside runs/* so only AgentRole can read them (IAM + bucket policy in
+# infra/platform/platform.yaml). Written with the stack CMK; every version is deleted at DELIVERED, FAILED and /stop.
+CREDENTIALS_PREFIX = "deploy-target-credentials/"
+
+
+def credentials_key(deploy_id: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{32}", deploy_id or ""):
+        raise ValueError(f"deploy run id {deploy_id!r} must be 32 lowercase hex characters")
+    return f"{CREDENTIALS_PREFIX}{deploy_id}.json"
+
+
+def delete_deploy_target_credentials(s3_client, bucket: str, key: str) -> int:
+    """Delete every version and delete marker of the credentials object (the bucket is versioned).
+
+    Returns the number of versions/markers removed (0 when nothing was stored or it was already removed).
+    Raises on any S3 error or per-object delete error; callers must audit and surface the failure.
+    """
+    if not key.startswith(CREDENTIALS_PREFIX):
+        raise ValueError(f"refusing to delete {key!r}: deploy-target credentials live under {CREDENTIALS_PREFIX}")
+    versions: list[dict[str, str]] = []
+    kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": key}
+    while True:
+        page = s3_client.list_object_versions(**kwargs)
+        for entry in (page.get("Versions") or []) + (page.get("DeleteMarkers") or []):
+            if entry["Key"] == key:
+                versions.append({"Key": key, "VersionId": entry["VersionId"]})
+        if not page.get("IsTruncated"):
+            break
+        kwargs["KeyMarker"] = page["NextKeyMarker"]
+        kwargs["VersionIdMarker"] = page["NextVersionIdMarker"]
+    for i in range(0, len(versions), 1000):
+        out = s3_client.delete_objects(Bucket=bucket, Delete={"Objects": versions[i:i + 1000], "Quiet": True})
+        errors = out.get("Errors") or []
+        if errors:
+            detail = "; ".join(f"{e.get('VersionId')}: {e.get('Code')} {e.get('Message')}" for e in errors[:5])
+            raise RuntimeError(f"failed to delete {len(errors)} version(s) of s3://{bucket}/{key}: {detail}")
+    return len(versions)
 
 
 def _inline_deploy_target_raw(body: dict[str, Any]) -> dict[str, Any]:
@@ -44,20 +82,13 @@ def session_from_inline_deploy_target(raw: dict[str, Any]):
             aws_session_token=(raw.get("sessionToken") or "").strip() or None,
         )
     elif role_arn:
-        if not role_arn.startswith("arn:aws:iam::") or ":role/" not in role_arn:
-            raise ValueError("deployTarget.roleArn must be an IAM role ARN in the target account")
-        if account_id not in role_arn:
-            raise ValueError("deployTarget.roleArn must belong to deployTarget.accountId")
+        _require_role_in_account(role_arn, account_id)
+        ext = require_external_id(raw)
         sts = boto3.client("sts")
-        kwargs: dict[str, Any] = {
-            "RoleArn": role_arn,
-            "RoleSessionName": "ingram-lz-deploy-verify",
-        }
-        ext = (raw.get("externalId") or "").strip()
-        if ext:
-            kwargs["ExternalId"] = ext
         try:
-            creds = sts.assume_role(**kwargs)["Credentials"]
+            creds = sts.assume_role(
+                RoleArn=role_arn, RoleSessionName="ingram-lz-deploy-verify", ExternalId=ext
+            )["Credentials"]
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "ClientError")
             msg = e.response.get("Error", {}).get("Message", str(e))
@@ -97,7 +128,7 @@ def _probe_organizations(session) -> dict[str, Any]:
         }
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
-        if "NotInUse" in code or "NotInUse" in str(e):
+        if code == "AWSOrganizationsNotInUseException":
             return {
                 "status": "not_enabled",
                 "detail": "AWS Organizations is not enabled for this account. Enable it in the target account before deploy discover.",
@@ -107,13 +138,13 @@ def _probe_organizations(session) -> dict[str, Any]:
                 "status": "access_denied",
                 "detail": "Credentials are valid but cannot describe the organization (org read permissions may be missing).",
             }
-        return {"status": "error", "detail": str(e)[:300]}
+        return {"status": "error", "detail": f"DescribeOrganization failed ({code or 'ClientError'}): {str(e)[:300]}"}
 
 
 def verify_deploy_target_credentials(body: dict[str, Any]) -> dict[str, Any]:
     """
     Test deploy target credentials without storing secrets.
-    Returns {ok, message, ...} or {ok: false, error}.
+    Returns {ok: true, message, ...}, or {ok: false, error} when the credentials or the Organizations probe fail.
     """
     try:
         raw = _inline_deploy_target_raw(body)
@@ -122,21 +153,28 @@ def verify_deploy_target_credentials(body: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
     org = _probe_organizations(session)
+    if org["status"] == "error":
+        return {
+            "ok": False,
+            "error": f"Connected to account {ident.get('Account')}, but the Organizations probe failed: {org['detail']}",
+            "callerAccountId": ident.get("Account"),
+            "callerArn": ident.get("Arn"),
+            "targetAccountId": account_id,
+            "organizations": org,
+        }
     warnings: list[str] = []
-    if org.get("status") == "not_enabled":
-        warnings.append(org["detail"])
-    elif org.get("status") == "access_denied":
+    if org["status"] in ("not_enabled", "access_denied"):
         warnings.append(org["detail"])
 
     parts = [
         f"Connected to account {ident.get('Account')} as {ident.get('Arn', 'unknown')}.",
     ]
-    if org.get("status") == "enabled":
+    if org["status"] == "enabled":
         parts.append(
             f"Organizations enabled (org {org.get('organizationId', '?')}, "
             f"management account {org.get('masterAccountId', '?')})."
         )
-    elif org.get("status") == "not_enabled":
+    elif org["status"] == "not_enabled":
         parts.append("Organizations is not enabled on this account yet.")
 
     return {
@@ -161,7 +199,7 @@ def parse_deploy_target_from_request(
 
     Body shapes:
       {}  → platform account
-      { "deployTarget": { "accountId": "...", "roleArn": "...", "externalId": "..." } }
+      { "deployTarget": { "accountId": "...", "roleArn": "...", "externalId": "..." } }   (externalId required)
       { "deployTarget": { "accountId": "...", "accessKeyId", "secretAccessKey", "sessionToken"? } }
     """
     raw = body.get("deployTarget")
@@ -171,6 +209,8 @@ def parse_deploy_target_from_request(
             raw = body
         else:
             return None
+    if not isinstance(raw, dict):
+        raise ValueError("deployTarget must be an object")
 
     account_id = (raw.get("accountId") or raw.get("targetAccountId") or "").strip()
     role_arn = (raw.get("roleArn") or "").strip()
@@ -187,7 +227,7 @@ def parse_deploy_target_from_request(
             raise ValueError("deployTarget.secretAccessKey is required with accessKeyId")
         if not put_credentials:
             raise ValueError("internal: put_credentials required for key-based deploy")
-        key = f"runs/{deploy_id}/deployment/target-credentials.json"
+        key = credentials_key(deploy_id)
         cred_doc = {
             "accessKeyId": access_key,
             "secretAccessKey": secret_key,

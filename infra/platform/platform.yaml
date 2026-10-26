@@ -41,13 +41,30 @@ Parameters:
     Description: Set false when the AWS account is not yet verified for CloudFront (S3 website HTTP UI for PoC).
   DeployAssumeRoleArn:
     Type: String
-    Default: "*"
-    Description: IAM resource pattern for sts:AssumeRole on cross-account deploy targets (AgentCore role).
+    Default: "arn:aws:iam::*:role/IngramLandingZoneDeploy*"
+    MinLength: 1
+    Description: >-
+      IAM resource pattern for sts:AssumeRole on cross-account deploy targets (ApiRole for /deploy-target/verify,
+      AgentRole for discover/attest). Keep it narrow: name the target role(s), never "*".
+  TransformRoleArn:
+    Type: String
+    Default: ""
+    Description: >-
+      IAM role the agent assumes for AWS Transform calls (fixed session name). Set it when Transform runs in
+      another account (it must share the target's AWS Organization). Empty = AgentRole itself (Transform in this account).
+  TransformExternalId:
+    Type: String
+    Default: ""
+    # Not NoEcho: an sts:ExternalId is not a secret (it is a confused-deputy guard, visible in the runtime
+    # environment and in the caller's CloudTrail). Do not reuse a secret value here.
+    Description: sts:ExternalId required by TransformRoleArn's trust policy (empty when not required). Not a secret.
 
 Conditions:
   HasExternalRuntime: !Not [!Equals [!Ref AgentRuntimeArn, ""]]
   CreateRuntime: !And [!Not [!Equals [!Ref AgentImageUri, ""]], !Not [!Condition HasExternalRuntime]]
   HasBedrockApiKeySecret: !Not [!Equals [!Ref BedrockApiKeySecretArn, ""]]
+  HasTransformRole: !Not [!Equals [!Ref TransformRoleArn, ""]]
+  NoTransformRole: !Equals [!Ref TransformRoleArn, ""]   # Transform runs in this account as AgentRole itself
   UseCloudFront: !Equals [!Ref EnableCloudFront, "true"]
   UseS3WebsiteUi: !Equals [!Ref EnableCloudFront, "false"]
 
@@ -97,10 +114,19 @@ Resources:
               !If
                 - UseCloudFront
                 - [!Sub "https://${Distribution.DomainName}"]
-                - ["*"]
+                - [!GetAtt Api.ApiEndpoint]   # no-CloudFront mode: UiServeFn serves the UI from the API origin
             AllowedMethods: [POST]
             AllowedHeaders: ["*"]
             MaxAge: 600
+      LifecycleConfiguration:
+        Rules:
+          # Backstop only. Deploy-target keys are deleted explicitly (all versions) at DELIVERED, FAILED and /stop;
+          # this catches executions that end without reaching MarkFailed (e.g. the SFN execution timeout).
+          - Id: ExpireDeployTargetCredentials
+            Status: Enabled
+            Prefix: deploy-target-credentials/
+            ExpirationInDays: 4
+            NoncurrentVersionExpiration: {NoncurrentDays: 1}
 
   ArtifactBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -115,6 +141,20 @@ Resources:
             Action: "s3:*"
             Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
             Condition: {Bool: {"aws:SecureTransport": "false"}}
+          # Deploy-target access keys: only AgentRole may read them (account admins included in the deny).
+          - Sid: DeployTargetCredentialsReadOnlyByAgent
+            Effect: Deny
+            Principal: "*"
+            Action: ["s3:GetObject", "s3:GetObjectVersion"]
+            Resource: !Sub "${ArtifactBucket.Arn}/deploy-target-credentials/*"
+            Condition: {ArnNotEquals: {"aws:PrincipalArn": !GetAtt AgentRole.Arn}}
+          # ...and they must be written with the stack CMK, never aws/s3 or SSE-S3.
+          - Sid: DeployTargetCredentialsStackKeyOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:PutObject"
+            Resource: !Sub "${ArtifactBucket.Arn}/deploy-target-credentials/*"
+            Condition: {StringNotEquals: {"s3:x-amz-server-side-encryption-aws-kms-key-id": !GetAtt Key.Arn}}
 
   # ---------- UI hosting (S3 + CloudFront OAC, or private S3 + API Gateway when CloudFront unavailable) ----------
   UiBucket:
@@ -220,11 +260,14 @@ Resources:
               - Effect: Allow
                 Action: ["s3:GetObject", "s3:PutObject"]   # PutObject: presigned POST for the SOW is signed with this role
                 Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
+              # Deploy-target keys: write at /deploy, delete (every version) at /stop. No read.
               - Effect: Allow
-                Action: [s3:GetObject, s3:ListBucket]
-                Resource:
-                  - !GetAtt UiBucket.Arn
-                  - !Sub "${UiBucket.Arn}/*"
+                Action: ["s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"]
+                Resource: !Sub "${ArtifactBucket.Arn}/deploy-target-credentials/*"
+              - Effect: Allow
+                Action: ["s3:ListBucketVersions"]
+                Resource: !GetAtt ArtifactBucket.Arn
+                Condition: {StringLike: {"s3:prefix": "deploy-target-credentials/*"}}
               - Effect: Allow
                 Action: ["kms:Decrypt", "kms:GenerateDataKey"]
                 Resource: !GetAtt Key.Arn
@@ -248,6 +291,14 @@ Resources:
               - Effect: Allow
                 Action: ["s3:GetObject", "s3:PutObject"]
                 Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
+              # phase_deploy_status deletes deploy-target keys (every version) at DELIVERED/FAILED. No read.
+              - Effect: Allow
+                Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"]
+                Resource: !Sub "${ArtifactBucket.Arn}/deploy-target-credentials/*"
+              - Effect: Allow
+                Action: ["s3:ListBucketVersions"]
+                Resource: !GetAtt ArtifactBucket.Arn
+                Condition: {StringLike: {"s3:prefix": "deploy-target-credentials/*"}}
               - Effect: Allow
                 Action: ["kms:Decrypt", "kms:GenerateDataKey"]
                 Resource: !GetAtt Key.Arn
@@ -277,13 +328,22 @@ Resources:
             Principal: {Service: bedrock-agentcore.amazonaws.com}
             Action: "sts:AssumeRole"
             Condition: {StringEquals: {"aws:SourceAccount": !Ref "AWS::AccountId"}}
-          # Self-assume with a fixed session name (agent/stable_identity.py): AWS Transform keys
-          # workspace collaborators by RoleId:SessionName, and AgentCore session names change per run.
-          # Only this role may assume itself (aws:PrincipalArn is the role ARN for its sessions).
-          - Effect: Allow
-            Principal: {AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"}
-            Action: "sts:AssumeRole"
-            Condition: {ArnLike: {"aws:PrincipalArn": !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-AgentRole-*"}}
+          # Self-assume with a fixed session name (lzcore/transform_credentials.py), only when Transform runs in
+          # this account (TransformRoleArn empty): Transform keys workspace collaborators by RoleId:SessionName,
+          # and AgentCore session names change per run. With TransformRoleArn set this statement is absent.
+          # Trade-off: a trust policy cannot reference its own role's ARN (circular), so the principal is matched
+          # by the generated-name prefix. We deliberately do NOT set an explicit RoleName to get an exact ARN:
+          # changing RoleName replaces the role (new RoleId), which breaks the target-account trust policies and
+          # the Transform workspace collaborator mapping that are keyed to the current role. Exposure: a principal
+          # allowed to create roles named "<stack>-AgentRole-*" in this account could assume AgentRole.
+          # The matching sts:AssumeRole permission (AgentSelfAssumePolicy) uses the exact ARN.
+          - !If
+            - NoTransformRole
+            - Effect: Allow
+              Principal: {AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"}
+              Action: "sts:AssumeRole"
+              Condition: {ArnLike: {"aws:PrincipalArn": !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-AgentRole-*"}}
+            - !Ref AWS::NoValue
       Policies:
         - PolicyName: agent
           PolicyDocument:
@@ -307,30 +367,47 @@ Resources:
               - Effect: Allow
                 Action: ["s3:ListBucket"]
                 Resource: !GetAtt ArtifactBucket.Arn
-              - Effect: Allow
-                Action: ["s3:GetObject", "s3:HeadObject"]
+              - Effect: Allow   # GetObject also authorizes HEAD requests
+                Action: ["s3:GetObject", "s3:PutObject"]
                 Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
-              - Effect: Allow
-                Action: ["s3:PutObject"]
-                Resource: !Sub "${ArtifactBucket.Arn}/runs/*"
-              # AWS Transform (FES APIs + permission-only profile actions). Workspace collaborator role still required in console.
-              - Effect: Allow
-                Action: ["transform:*"]
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - transform:AccessTransformProfile
-                  - transform:GetWebAppUrl
-                  - transform:ListProfiles
-                  - transform:CreateProfile
-                  - transform:UpdateProfile
-                  - transform:DeleteProfile
-                  - transform:GetAccountSettings
-                  - transform:UpdateAccountSettings
-                  - transform:ListAgents
-                  - transform:GetAgent
-                  - transform:UpdateAgentAccess
-                Resource: "*"
+              - Effect: Allow   # deploy-target keys (the bucket policy denies every other reader)
+                Action: ["s3:GetObject"]
+                Resource: !Sub "${ArtifactBucket.Arn}/deploy-target-credentials/*"
+              # AWS Transform, only when Transform runs in this account (TransformRoleArn empty). Exactly the job,
+              # workspace, message, HITL-task (read) and artifact (download) operations the workflow and the
+              # Transform MCP read paths use; no profile/account/agent-access administration, no workspace or
+              # collaborator management, no HITL submission (humans answer in the Transform console).
+              # With TransformRoleArn set, AgentRole gets no transform:* at all (the Transform role holds them).
+              # Keep in sync with docs/deployment-agent-transform.md ("Transform IAM actions").
+              - !If
+                - NoTransformRole
+                - Effect: Allow
+                  Action:
+                    - transform:ListWorkspaces
+                    - transform:GetWorkspace
+                    - transform:CreateJob
+                    - transform:StartJob
+                    - transform:StopJob
+                    - transform:GetJob
+                    - transform:ListJobs
+                    - transform:ListJobPlanSteps
+                    - transform:ListPlanUpdates
+                    - transform:ListWorklogs
+                    - transform:SendMessage
+                    - transform:ListMessages
+                    - transform:BatchGetMessage
+                    - transform:ListHitlTasks
+                    - transform:GetHitlTask
+                    - transform:ListArtifacts
+                    - transform:CreateArtifactDownloadUrl
+                    - transform:CreateAssetDownloadUrl
+                    - transform:ListAgents
+                    - transform:GetAgent
+                    - transform:GetWebAppUrl
+                    - transform:AccessTransformProfile
+                    - transform:ListProfiles
+                  Resource: "*"
+                - !Ref AWS::NoValue
               - Effect: Allow
                 Action:
                   - organizations:DescribeOrganization
@@ -343,12 +420,16 @@ Resources:
               - Effect: Allow
                 Action: ["controltower:ListLandingZones"]
                 Resource: "*"
-              - Effect: Allow
+              - Effect: Allow   # cross-account deploy targets (role mode)
                 Action: ["sts:AssumeRole"]
                 Resource: !Ref DeployAssumeRoleArn
-              - Effect: Allow   # self-assume for the stable Transform identity
-                Action: ["sts:AssumeRole"]
-                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-AgentRole-*"
+              # Transform in another account: assume exactly TransformRoleArn (not via DeployAssumeRoleArn).
+              - !If
+                - HasTransformRole
+                - Effect: Allow
+                  Action: ["sts:AssumeRole"]
+                  Resource: !Ref TransformRoleArn
+                - !Ref AWS::NoValue
               - Effect: Allow
                 Action: ["kms:Decrypt", "kms:GenerateDataKey"]
                 Resource: !GetAtt Key.Arn
@@ -358,6 +439,36 @@ Resources:
                   Action: ["secretsmanager:GetSecretValue"]
                   Resource: !Ref BedrockApiKeySecretArn
                 - !Ref AWS::NoValue
+
+  # Self-assume permission for the stable Transform identity (Transform in this account only). A separate
+  # policy resource so it can name AgentRole's exact ARN (an inline policy cannot reference its own role).
+  AgentSelfAssumePolicy:
+    Condition: NoTransformRole
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref AgentRole
+      PolicyName: agent-self-assume
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: ["sts:AssumeRole"]
+            Resource: !GetAtt AgentRole.Arn
+
+  UiServeRole:   # no-CloudFront UI: read the UI bucket's files, nothing else
+    Condition: UseS3WebsiteUi
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: "2012-10-17", Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}]}
+      ManagedPolicyArns: [!Ref LambdaLogs]
+      Policies:
+        - PolicyName: ui-serve
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["s3:GetObject"]
+                Resource: !Sub "${UiBucket.Arn}/*"
 
   ValidateRole:
     Type: AWS::IAM::Role
@@ -438,7 +549,8 @@ Resources:
         BEDROCK_API_KEY_SECRET_ARN: !Ref BedrockApiKeySecretArn
         TRANSFORM_WORKSPACE_ID: !Ref TransformWorkspaceId
         TRANSFORM_ORCHESTRATOR_AGENT: !Ref TransformOrchestratorAgent
-        AGENT_ROLE_ARN: !GetAtt AgentRole.Arn
+        TRANSFORM_ROLE_ARN: !If [HasTransformRole, !Ref TransformRoleArn, !GetAtt AgentRole.Arn]
+        TRANSFORM_EXTERNAL_ID: !Ref TransformExternalId
 
   # ---------- Validation ----------
   ValidateProject:
@@ -476,6 +588,7 @@ Resources:
           STATE_MACHINE_ARN: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-run"
           DEPLOY_STATE_MACHINE_ARN: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-deploy"
           TRANSFORM_WORKSPACE_ID: !Ref TransformWorkspaceId
+          DATA_KEY_ARN: !GetAtt Key.Arn   # SSEKMSKeyId for deploy-target credentials (bucket policy enforces it)
 
   ApiArtifactsFn:
     Type: AWS::Lambda::Function
@@ -495,7 +608,7 @@ Resources:
       FunctionName: !Sub "${ProjectName}-ui-serve"
       Runtime: python3.12
       Handler: ui_serve.handler
-      Role: !GetAtt ApiRole.Arn
+      Role: !GetAtt UiServeRole.Arn
       Timeout: 10
       Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
       Environment: {Variables: {UI_BUCKET: !Ref UiBucket}}
@@ -611,14 +724,16 @@ Resources:
     Properties:
       Name: !Sub "${ProjectName}-api"
       ProtocolType: HTTP
+      # CloudFront mode: the UI origin is the distribution. No-CloudFront mode: UiServeFn serves the UI from this
+      # API's own origin, so browser calls are same-origin and need no CORS (and the API cannot name its own
+      # endpoint here without a circular reference). Either way, never "*".
       CorsConfiguration:
-        AllowOrigins:
-          !If
-            - UseCloudFront
-            - [!Sub "https://${Distribution.DomainName}"]
-            - ["*"]
-        AllowHeaders: [authorization, content-type]
-        AllowMethods: [GET, POST, OPTIONS]
+        !If
+          - UseCloudFront
+          - AllowOrigins: [!Sub "https://${Distribution.DomainName}"]
+            AllowHeaders: [authorization, content-type]
+            AllowMethods: [GET, POST, OPTIONS]
+          - !Ref AWS::NoValue
 
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient

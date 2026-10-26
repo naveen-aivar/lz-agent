@@ -43,9 +43,9 @@ The **Architecture Design Agent** turns a SOW or transcript into approved **scop
 
 **Cross-account (UI or API):** Optional `deployTarget` on deploy runs — **AssumeRole** into a customer role or short-lived keys stored in S3 for that run. Discover and attestation run in the **target account**. See [cross-account-deploy.md](./cross-account-deploy.md).
 
-**Transform** still uses the platform account and stack `TransformWorkspaceId` until the workspace is entitled for the target org.
+**Transform** runs in the account named by the stack's `TransformRoleArn` (default: the platform account) with workspace `TransformWorkspaceId`. Its target connector only accepts accounts in the same AWS Organization as that Transform account, so for a customer org the Transform profile/workspace and `TransformRoleArn` live in that org (see docs/deployment-agent-transform.md).
 
-For a valid PoC, the **target** credentials should be able to call Organizations **ListRoots** / **ListAccounts** — typically the org **management account** or a [delegated administrator](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_delegate_policies.html). Member-account-only discovery returns a **partial** snapshot (`discoveryLimitations` in `foundation.json`).
+For a valid PoC, the **target** credentials should be able to call Organizations **ListRoots** / **ListAccounts** — typically the org **management account** or a [delegated administrator](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_delegate_policies.html). If Organizations denies any tree read (for example a member account that is not a delegated administrator), discovery is **incomplete** and the run fails at `run_pre_discover` (or post-discover) with `FoundationUnverifiable`, naming the denied calls. Gaps and attestation are never computed from a partial snapshot.
 
 ## Attestation outcomes
 

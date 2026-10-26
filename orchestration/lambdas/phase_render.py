@@ -25,9 +25,9 @@ def handler(event, _ctx):
     base = f"runs/{run_id}"
     for fmt, files in render.render_all(scope).items():
         for name, content in files.items():
-            s3().put_object(Bucket=ARTIFACT_BUCKET, Key=f"{base}/bundle-src/{fmt}/{name}", Body=content.encode(), ServerSideEncryption="aws:kms")
+            s3().put_object(Bucket=ARTIFACT_BUCKET, Key=f"{base}/bundle-src/{fmt}/{name}", Body=content.encode())
         zkey = f"{base}/{fmt}.zip"
-        s3().put_object(Bucket=ARTIFACT_BUCKET, Key=zkey, Body=render.zip_bytes(files, fmt), ServerSideEncryption="aws:kms")
+        s3().put_object(Bucket=ARTIFACT_BUCKET, Key=zkey, Body=render.zip_bytes(files, fmt))
         sha = record_artifact(run_id, fmt, zkey)
         audit(run_id, "system", "bundle.rendered", {"format": fmt, "files": len(files), "sha": sha})
     table().update_item(Key={"PK": f"RUN#{run_id}", "SK": "META"}, UpdateExpression="SET orgSlug = :s",

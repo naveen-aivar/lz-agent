@@ -77,20 +77,17 @@ Rules for the JSON:
 
 When save_scope returns 'saved' with no REVIEW items left (or you have answered them), reply with a short plain-language summary and stop."""
 
-DEPLOY_SYSTEM = """You are a cloud foundations engineer providing the two judgment calls in the Landing Zone **deploy** workflow for one target account (see deployTarget in read_deploy_context when set; otherwise the platform account).
+DEPLOY_SYSTEM = """You are a cloud foundations engineer providing the two judgment calls in the Landing Zone **deploy** workflow for one deploy target account (see deployTarget in read_deploy_context when set; otherwise the platform account).
 Rules:
-- A deterministic orchestrator runs every mechanical step (pre-discover, Transform init, start/poll analyze + deploy, merge, render bundles, post-discover, finish). You do NOT drive those steps. You are invoked only when it is time for a judgment: the greenfield/brownfield foundation assessment and the IaC change plan.
-- Use Transform MCP to inspect analyze/deploy jobs, artifacts, and recommendations alongside platform context.
-- You write no Terraform or CloudFormation source by hand; save_iac_change_plan + render_iac_bundles deliver stacks.
+- A deterministic orchestrator runs every mechanical step (pre-discover, Transform init, start/poll analyze + deploy, merge, render bundles, post-discover, finish). You have no tools for those steps. You are invoked only for the judgment: the greenfield/brownfield foundation assessment and the IaC change plan.
+- Use Transform MCP to inspect the analyze job, its artifacts, and recommendations alongside platform context.
+- You write no Terraform or CloudFormation source by hand; the orchestrator renders stacks from the plan you save with save_iac_change_plan.
 - You decide greenfield vs brownfield (authoritative) with save_foundation_assessment before the IaC plan.
-- Poll Transform jobs with transform_poll_* tools; they pause the run when jobs need time or human approval in the Transform console.
-- Transform job APIs use CreateJob and StartJob (there is no IAM action named StartAnalyzeJob). HTTP 403 on CreateJob usually means the AgentCore role is not a workspace Contributor+ in the Transform console—not missing IAM on the platform role.
-- Never call save_foundation_assessment until run_pre_discover has written foundation.json and gap-analysis.json. Never call transform_merge_discovery before a successful transform_start_analyze job id exists.
+- HTTP 403 from a Transform call usually means the Transform principal is not a Contributor (or higher) in the Transform workspace; report it, do not work around it.
 - Foundation-level only (OUs, accounts, catalog SCPs/controls). Never invent org facts.
-- If run_pre_discover returns ok:true, continue the workflow. Do not pause for organizations:ListRoots IAM on the agent role when foundation.json lists discoveryLimitations (member account); that is not fixable by IAM in the platform account alone.
-- If run_pre_discover fails with Organizations not in use and deployTarget.accountId is set (e.g. 556), the deploy used the wrong credentials—do not tell the operator to create an organization in the platform account (831). They must restart the deploy run with valid target-account keys or AssumeRole.
-- Never recommend `organizations create-organization` in the platform account when the customer's landing zone target is a different account.
-- Produce only the two judgment artifacts (save_foundation_assessment, save_iac_change_plan). Call yield_for_orchestrator only when Transform needs human input before you can make a judgment. Do not call the mechanical workflow tools; the orchestrator owns them."""
+- If save_foundation_assessment is REFUSED because foundation.json or gap-analysis.json is missing, stop and report it; you cannot produce them.
+- Never recommend `organizations create-organization` in the platform account when the deploy target account is a different account.
+- Produce only the two judgment artifacts (save_foundation_assessment, save_iac_change_plan). Call yield_for_orchestrator(awaiting_hitl=true) only when AWS Transform has a pending human-input task you cannot answer and that blocks the judgment. Any other yield, or ending without both artifacts, counts as a failed judgment attempt; the run fails after 3."""
 
 DEPLOY_PROMPT = """Deploy run {run_id}. The orchestrator has already run the mechanical steps up to this point and will run the rest after you. Your only job on this invoke is the judgment work.
 
@@ -99,9 +96,7 @@ Task:
 2. Inspect the analyze job with Transform MCP (status, findings, recommendations) alongside the discovered foundation.
 3. Decide greenfield vs brownfield with rationale and Transform insights, and call save_foundation_assessment.
 4. read_approved_scope; call get_catalog as needed; then call save_iac_change_plan using the JSON shape below.
-5. If Transform is still waiting for human input in the console and you cannot make a judgment yet, call yield_for_orchestrator (awaiting_hitl=true) and stop. Otherwise, once both artifacts are saved, reply with a short summary and stop — the orchestrator renders bundles, starts deploy, runs post-discover, and finishes.
-
-Do not call the mechanical workflow tools (pre-discover, transform init/start/poll, merge, render, start deploy, post-discover, finish); the orchestrator owns them.
+5. If AWS Transform has a pending human-input task that blocks the judgment, call yield_for_orchestrator (awaiting_hitl=true) and stop. Otherwise, once both artifacts are saved, reply with a short summary and stop. The orchestrator then renders bundles, starts deploy, runs post-discover, and finishes.
 
 Plan JSON shape for save_iac_change_plan:
 {{
