@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .attestation import gap_analysis
+from .attestation import gap_analysis, require_complete_gaps
 from .discovery import classify_foundation, collect_foundation
 
 # Terminal Transform deploy job statuses treated as success (API variants).
@@ -56,7 +56,13 @@ def evaluate_deployment_outcome(
     plan: dict | None,
     transform_deploy_status: str | None,
 ) -> tuple[str, list[str]]:
-    """Return (overall, reasons). overall is pass | fail | pass_with_manual_steps."""
+    """Return (overall, reasons). overall is pass | fail | pass_with_manual_steps.
+
+    Raises attestation.FoundationUnverifiable when either gap analysis was not computed from a complete
+    Organizations read; an unread tree is never reported as "foundation aligned".
+    """
+    require_complete_gaps(pre_gaps, "evaluate_deployment_outcome(pre_gaps)")
+    require_complete_gaps(post_gaps, "evaluate_deployment_outcome(post_gaps)")
     reasons: list[str] = []
     plan = plan or {}
     strategy = plan.get("strategy", "apply_design_stacks")

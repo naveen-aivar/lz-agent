@@ -28,7 +28,7 @@ def handler(event, _ctx):
     if len(full) > MAX_CHARS:
         raise ValueError(f"input is {len(full)} chars, above the {MAX_CHARS} limit; split the SOW or remove appendices")
     out_key = f"runs/{run_id}/sow.txt"
-    s3().put_object(Bucket=ARTIFACT_BUCKET, Key=out_key, Body=full.encode(), ServerSideEncryption="aws:kms")
+    s3().put_object(Bucket=ARTIFACT_BUCKET, Key=out_key, Body=full.encode())
     sha = record_artifact(run_id, "sow", out_key)
     audit(run_id, "system", "sow.extracted", {"chars": len(full), "sha": sha, "file": run.get("inputName")})
     return {"runId": run_id}

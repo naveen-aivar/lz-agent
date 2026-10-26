@@ -1,1 +1,1 @@
-awslabs.aws-transform-mcp-server>=0.2.3
+awslabs.aws-transform-mcp-server==0.2.3

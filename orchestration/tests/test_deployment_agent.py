@@ -8,7 +8,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lzcore.attestation import build_deployment_report, gap_analysis  # noqa: E402
 from lzcore.deploy_artifacts import (  # noqa: E402
     DEPLOYMENT_FILE_NAMES,
-    MAX_DEPLOY_CONTINUE_CYCLES,
     deployment_artifact_keys,
 )
 from lzcore.deploy_workflow import evaluate_deployment_outcome, should_deliver_design_bundles  # noqa: E402
@@ -33,12 +32,15 @@ class DeploymentAgentTests(unittest.TestCase):
         self.assertTrue(any(k.endswith("iac-manifest.json") for k in keys))
         self.assertTrue(keys[-1].endswith("transform-poll-deploy.json"))
 
-    def test_deploy_sfn_continue_limit_matches_constant(self):
+    def test_deploy_sfn_has_separate_progress_and_hitl_budgets(self):
         asl_path = Path(__file__).resolve().parents[1] / "deployment.asl.json"
         doc = json.loads(asl_path.read_text(encoding="utf-8"))
-        choice = doc["States"]["ContinueLimitChoice"]
-        threshold = choice["Choices"][0]["NumericGreaterThanEquals"]
-        self.assertEqual(threshold, MAX_DEPLOY_CONTINUE_CYCLES)
+        rules = {r["Variable"]: r for r in doc["States"]["DeployAgentChoice"]["Choices"]}
+        self.assertEqual(rules["$.progressCount"]["NumericGreaterThanEquals"], 240)
+        self.assertEqual(rules["$.progressCount"]["Next"], "MarkFailedProgressBudget")
+        self.assertEqual(rules["$.hitlCount"]["NumericGreaterThanEquals"], 1440)
+        self.assertEqual(rules["$.hitlCount"]["Next"], "MarkFailedHitlBudget")
+        # Detailed simulation lives in test_platform_lambdas.DeployStateMachineTests.
 
     def test_transform_deploy_success_statuses(self):
         aligned = {"missingOus": [], "missingAccountsByName": []}

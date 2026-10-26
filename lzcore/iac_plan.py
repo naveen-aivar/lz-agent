@@ -5,6 +5,8 @@ import copy
 import re
 from typing import Any
 
+from .attestation import require_complete_gaps
+
 SCHEMA_VERSION = "1"
 PLAN_TYPE = "landing-zone-iac-reconciliation"
 STRATEGIES = ("no_changes_needed", "apply_design_stacks", "partial_manual")
@@ -28,7 +30,12 @@ LIMITATION = (
 
 
 def suggest_changes(scope: dict, gaps: dict) -> list[dict[str, Any]]:
-    """Deterministic starter changes the agent should refine (same inputs as gap_analysis)."""
+    """Deterministic starter changes the agent should refine (same inputs as gap_analysis).
+
+    Raises attestation.FoundationUnverifiable for gaps not computed from a complete Organizations read,
+    so the "names match" no_op is only ever emitted from a tree that was actually listed.
+    """
+    require_complete_gaps(gaps, "suggest_changes")
     out: list[dict[str, Any]] = []
     seq = 0
 
@@ -91,7 +98,7 @@ def suggest_changes(scope: dict, gaps: dict) -> list[dict[str, Any]]:
         )
 
     if not out and not (gaps.get("missingOus") or gaps.get("missingAccountsByName")):
-        add("no_op", "foundation", "gaps:none", True, "Foundation names in scope match the Organizations snapshot.", {})
+        add("no_op", "foundation", "gaps:none", True, "Foundation names in scope match the Organizations snapshot.")
     return out
 
 

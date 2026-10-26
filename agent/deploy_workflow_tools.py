@@ -1,9 +1,10 @@
-"""Deploy-run tools: discover, Transform jobs, render — used by the agent-heavy deploy phase.
+"""Deploy-run steps: discover, Transform jobs, merge, render, finish.
 
 Sequencing is deterministic: `run_deploy_invoke` drives every mechanical step in workflow
-order and invokes the model only for the two judgment steps (foundation assessment, IaC
-change plan). The `@tool` wrappers remain so the model can still call any step directly;
-each tool and the sequencer share the same `_execute_*` implementation.
+order and invokes the model only for the judgment step (foundation assessment + IaC change
+plan). The judgment agent is given only the judgment tools (see tools.deploy_tools); the
+mechanical `@tool` wrappers below are kept for direct use in tests (`workflow_tools`) and
+share the same `_execute_*` implementation as the sequencer.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from typing import Callable
 
 from strands import tool
 
+from lzcore import transform_ops
 from lzcore.deploy_render import render_deploy_iac
 from lzcore.deploy_transform import (
     init_transform,
@@ -29,12 +31,30 @@ from lzcore.discovery import classify_foundation
 import tools as base
 
 
-# Checkpoint stages the model is NOT expected to advance; the sequencer drives them.
+# Checkpoint stages at which the sequencer returns `continue` to Step Functions.
 WAIT_STAGES = frozenset({"paused", "transform_analyze_waiting", "transform_deploy_waiting"})
 
 # Judgment artifacts the model alone may produce.
 _FOUNDATION_ASSESSMENT = "foundation-assessment.json"
 _IAC_CHANGE_PLAN = "iac-change-plan.json"
+
+# Model turns at transform_merged that may end without both judgment artifacts (including
+# yields without awaiting_hitl=true) before the run fails.
+MAX_JUDGMENT_ATTEMPTS = 3
+# Model yields with awaiting_hitl=true during judgment before the run fails. Each one costs a
+# full model turn on the next invoke, so they are bounded separately from incomplete attempts.
+MAX_JUDGMENT_HITL_YIELDS = 3
+
+# Superseded stage written by an earlier release that recorded pre-discover failures as a HITL
+# wait. Runs left at this stage cannot resume; the sequencer reports that explicitly.
+_SUPERSEDED_PRE_DISCOVER_BLOCKED = "pre_discover_blocked"
+
+# Same not-found rule as tools.py (S3 absence is the only non-error read outcome).
+_is_absent = base._is_absent
+
+
+class RunNotRunning(RuntimeError):
+    """The run's META.status is not RUNNING, so a Transform job must not be started."""
 
 
 def _checkpoint_key() -> str:
@@ -53,11 +73,12 @@ def _json_value(value):
 
 
 def _put_json(key: str, body: dict) -> None:
+    # No ServerSideEncryption header: "aws:kms" without a key id selects the AWS-managed aws/s3
+    # key, while the bucket default is the stack CMK (infra/platform/platform.yaml BucketEncryption).
     base._s3.put_object(
         Bucket=base.BUCKET,
         Key=key,
         Body=json.dumps(body, indent=2, sort_keys=True, default=_json_value).encode(),
-        ServerSideEncryption="aws:kms",
     )
 
 
@@ -65,24 +86,11 @@ def _get_json(key: str) -> dict:
     return json.loads(base._s3.get_object(Bucket=base.BUCKET, Key=key)["Body"].read().decode())
 
 
-_ABSENT_CODES = {"NoSuchKey", "404", "NotFound"}
-
-
-def _is_absent(exc: Exception) -> bool:
-    """True only when the error means the object does not exist (a ClientError whose code is
-    one of the not-found codes). Any other condition is a real failure, not an absence."""
-    response = getattr(exc, "response", None)
-    if not isinstance(response, dict):
-        return False
-    code = str(response.get("Error", {}).get("Code", ""))
-    return code in _ABSENT_CODES
-
-
 def read_checkpoint() -> dict | None:
     """Current checkpoint dict, or None if it does not exist yet.
 
     Only an object-not-found error means "not started". Any other error (AccessDenied, KMS,
-    etc.) raises naming the key and cause — never swallowed into an empty checkpoint.
+    etc.) raises naming the key and cause; never swallowed into an empty checkpoint.
     """
     key = _checkpoint_key()
     try:
@@ -108,8 +116,34 @@ def _design_scope() -> dict:
     return _get_json(f"runs/{base._state['design_run_id']}/intake/scope.json")
 
 
+def _meta_key() -> dict:
+    return {"PK": f"RUN#{base._state['run']}", "SK": "META"}
+
+
 def _run_meta() -> dict:
-    return base._ddb.get_item(Key={"PK": f"RUN#{base._state['run']}", "SK": "META"}).get("Item") or {}
+    item = base._ddb.get_item(Key=_meta_key()).get("Item")
+    if not item:
+        raise RuntimeError(f"run META item RUN#{base._state['run']} not found in {base.TABLE}")
+    return item
+
+
+def _require_run_running(step: str) -> None:
+    """C4: refuse to start a Transform job unless META.status is RUNNING (e.g. after /stop)."""
+    status = _run_meta().get("status")
+    if status != "RUNNING":
+        raise RunNotRunning(f"{step} refused: run is {status}")
+
+
+def _record_job_on_meta(update_expression: str, values: dict) -> None:
+    """Write Transform job ids onto META only while the run is still RUNNING (conditional), so a
+    run stopped between the C4 check and CreateJob fails here and the new job is stopped."""
+    base._ddb.update_item(
+        Key=_meta_key(),
+        UpdateExpression=update_expression,
+        ConditionExpression="#s = :running",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={**values, ":running": "RUNNING"},
+    )
 
 
 def _save_checkpoint(stage: str, **extra) -> None:
@@ -128,12 +162,36 @@ def _one_poll_per_invoke(phase: str) -> str | None:
     return None
 
 
+def _stop_orphaned_job(step: str, label: str, job_id: str, workspace_id: str, cause: Exception) -> RuntimeError:
+    """A Transform job was created/started but recording it failed. Stop the job and return an
+    error naming the job id and whether stopping succeeded. Nothing here is swallowed: a
+    stop_job or audit failure is part of the returned message."""
+    try:
+        transform_ops.stop_job(job_id, workspace_id)
+        outcome = f"stop_job({job_id}) succeeded"
+        stopped = True
+    except Exception as stop_exc:  # noqa: BLE001 - reported in the returned error
+        outcome = f"stop_job({job_id}) failed: {stop_exc}; stop it in the Transform console"
+        stopped = False
+    try:
+        base.log_tool_event(
+            f"tool.{step}.orphan_stop",
+            {"jobId": job_id, "workspaceId": workspace_id, "stopped": stopped, "cause": str(cause)[:500]},
+        )
+    except Exception as log_exc:  # noqa: BLE001 - reported in the returned error
+        outcome += f"; audit write failed: {log_exc}"
+    return RuntimeError(
+        f"Transform {label} job {job_id} in workspace {workspace_id} was started but recording it "
+        f"failed: {cause}; {outcome}"
+    )
+
+
 # ------------------------------------------------------------------------------------
 # Mechanical step implementations (_execute_*). Shared by the @tool wrappers and the
 # sequencer, so artifacts, checkpoint stages, and audit events are identical either way.
 # ------------------------------------------------------------------------------------
 def _execute_pre_discover() -> dict:
-    """Shared pre-discover implementation (tool + deterministic bootstrap)."""
+    """Organizations snapshot + gap analysis + heuristic classification hint (pre-deploy)."""
     scope = _design_scope()
     snapshot, gaps = collect_snapshot_and_gaps(scope, base.deploy_boto_session())
     paths = deployment_paths(base._state["run"], "pre")
@@ -169,32 +227,30 @@ def _execute_pre_discover() -> dict:
     }
 
 
-def _execute_pre_discover_or_block() -> None:
-    """Run pre-discover; on failure save a HITL-blocked checkpoint (today's ensure_pre_discover
-    behavior). The blocked stage is a defined wait (awaitingHitl=true), persisted and audited —
-    it is a HITL pause, not a swallowed error. The sequencer returns `continue` from it (3.2).
-    """
+def _execute_pre_discover_step() -> dict:
+    """Sequencer pre-discover. Any failure (credentials, Organizations, incomplete discovery,
+    S3) is a run_pre_discover step error. The deploy target is fixed on META, so no in-run
+    human action can fix it; it is never recorded as a HITL wait."""
     target = base._state.get("deploy_target") or {}
     target_acct = (target.get("accountId") or "").strip()
     try:
-        _execute_pre_discover()
+        return _execute_pre_discover()
     except Exception as e:
-        msg = str(e)[:800]
-        if target_acct:
-            msg = (
-                f"Pre-discover failed for deploy target account {target_acct}: {msg} "
-                "Do not create an AWS Organization in the platform account for this run—use "
-                "valid credentials (or AssumeRole) for the target account that owns the org."
-            )
-        _save_checkpoint("pre_discover_blocked", reason=msg, awaitingHitl=True)
-        base.log_tool_event("tool.run_pre_discover.failed", {"error": msg[:500]})
+        if not target_acct:
+            raise
+        raise RuntimeError(
+            f"deploy target account {target_acct}: {e}. "
+            "Do not create an AWS Organization in the platform account for this run; use valid "
+            "credentials (or AssumeRole) for the target account that owns the org, then start a "
+            "new deploy run."
+        ) from e
 
 
 def _execute_transform_init() -> dict:
     out = init_transform(run_id=base._state["run"], put_json=_put_json)
     ws = out["workspaceId"]
     base._ddb.update_item(
-        Key={"PK": f"RUN#{base._state['run']}", "SK": "META"},
+        Key=_meta_key(),
         UpdateExpression="SET transformWorkspaceId = :w",
         ExpressionAttributeValues={":w": ws},
     )
@@ -205,26 +261,44 @@ def _execute_transform_init() -> dict:
 
 
 def _execute_transform_start_analyze() -> dict:
+    step = "transform_start_analyze"
+    _require_run_running(step)
     scope = _design_scope()
+    started: dict[str, str] = {}
 
     def persist(job_id: str, ws: str) -> None:
-        base._ddb.update_item(
-            Key={"PK": f"RUN#{base._state['run']}", "SK": "META"},
-            UpdateExpression="SET transformAnalyzeJobId = :j, transformWorkspaceId = :w",
-            ExpressionAttributeValues={":j": job_id, ":w": ws},
+        started.update(jobId=job_id, workspaceId=ws)
+        _record_job_on_meta(
+            "SET transformAnalyzeJobId = :j, transformWorkspaceId = :w",
+            {":j": job_id, ":w": ws},
         )
         base._state["transform_analyze_job_id"] = job_id
         base._state["transform_workspace_id"] = ws
 
-    out = start_analyze_job(
-        run_id=base._state["run"],
-        scope=scope,
-        put_json=_put_json,
-        persist_job=persist,
-    )
-    _save_checkpoint("transform_analyze_started", jobId=out["jobId"])
-    base.log_tool_event("tool.transform_start_analyze", {"jobId": out["jobId"]})
+    try:
+        out = start_analyze_job(
+            run_id=base._state["run"],
+            scope=scope,
+            put_json=_put_json,
+            persist_job=persist,
+        )
+        _save_checkpoint("transform_analyze_started", jobId=out["jobId"])
+        base.log_tool_event(f"tool.{step}", {"jobId": out["jobId"]})
+    except Exception as e:
+        if "jobId" not in started:
+            raise  # CreateJob/StartJob itself failed; no job of ours to stop
+        raise _stop_orphaned_job(step, "analyze", started["jobId"], started["workspaceId"], e) from e
     return out
+
+
+def _poll_result_checkpoint(out: dict) -> dict:
+    """Waiting-checkpoint fields from a poll_transform_job result (C1)."""
+    pending = out["pendingHumanInput"]
+    return {
+        "awaitingHitl": bool(out["transformAwaitingHitl"]) or pending is not None,
+        "pendingHumanInput": pending,
+        "status": out.get("status"),
+    }
 
 
 def _execute_transform_poll_analyze_once() -> dict:
@@ -239,19 +313,16 @@ def _execute_transform_poll_analyze_once() -> dict:
         label="analyze",
         put_json=_put_json,
     )
-    base.log_tool_event(
-        "tool.transform_poll_analyze_job",
-        {"status": out.get("status"), "done": out.get("transformDone")},
-    )
     if out["transformDone"]:
+        base.log_tool_event("tool.transform_poll_analyze_job", {"status": out.get("status"), "done": True})
         _save_checkpoint("transform_analyze_done", jobId=job_id)
     else:
-        _save_checkpoint(
-            "transform_analyze_waiting",
-            awaitingHitl=out["transformAwaitingHitl"],
-            jobId=job_id,
-            status=out.get("status"),
+        waiting = _poll_result_checkpoint(out)
+        base.log_tool_event(
+            "tool.transform_poll_analyze_job",
+            {"status": out.get("status"), "done": False, "awaitingHitl": waiting["awaitingHitl"]},
         )
+        _save_checkpoint("transform_analyze_waiting", jobId=job_id, **waiting)
     return out
 
 
@@ -267,19 +338,16 @@ def _execute_transform_poll_deploy_once() -> dict:
         label="deploy",
         put_json=_put_json,
     )
-    base.log_tool_event(
-        "tool.transform_poll_deploy_job",
-        {"status": out.get("status"), "done": out.get("transformDone")},
-    )
     if out["transformDone"]:
+        base.log_tool_event("tool.transform_poll_deploy_job", {"status": out.get("status"), "done": True})
         _save_checkpoint("transform_deploy_done", jobId=job_id)
     else:
-        _save_checkpoint(
-            "transform_deploy_waiting",
-            awaitingHitl=out["transformAwaitingHitl"],
-            jobId=job_id,
-            status=out.get("status"),
+        waiting = _poll_result_checkpoint(out)
+        base.log_tool_event(
+            "tool.transform_poll_deploy_job",
+            {"status": out.get("status"), "done": False, "awaitingHitl": waiting["awaitingHitl"]},
         )
+        _save_checkpoint("transform_deploy_waiting", jobId=job_id, **waiting)
     return out
 
 
@@ -299,7 +367,9 @@ def _execute_render() -> dict:
     design_run_id = base._state["design_run_id"]
     plan = _get_json(f"runs/{run_id}/deployment/iac-change-plan.json")
     scope = _design_scope()
-    design_meta = base._ddb.get_item(Key={"PK": f"RUN#{design_run_id}", "SK": "META"}).get("Item") or {}
+    design_meta = base._ddb.get_item(Key={"PK": f"RUN#{design_run_id}", "SK": "META"}).get("Item")
+    if not design_meta:
+        raise RuntimeError(f"design run META item RUN#{design_run_id} not found in {base.TABLE}")
     design_artifacts = design_meta.get("artifacts") or {}
 
     def record(name: str, key: str) -> None:
@@ -313,13 +383,12 @@ def _execute_render() -> dict:
         base_prefix=f"runs/{run_id}",
         put_json=_put_json,
         put_bytes=lambda k, b: base._s3.put_object(
-            Bucket=base.BUCKET, Key=k, Body=b, ServerSideEncryption="aws:kms"
+            Bucket=base.BUCKET, Key=k, Body=b
         ),
         copy_object=lambda src, dest: base._s3.copy_object(
             Bucket=base.BUCKET,
             Key=dest,
             CopySource={"Bucket": base.BUCKET, "Key": src},
-            ServerSideEncryption="aws:kms",
         ),
         record_artifact=record,
     )
@@ -329,26 +398,32 @@ def _execute_render() -> dict:
 
 
 def _execute_transform_start_deploy() -> dict:
+    step = "transform_start_deploy"
+    _require_run_running(step)
     scope = _design_scope()
     plan = _get_json(f"runs/{base._state['run']}/deployment/iac-change-plan.json")
+    started: dict[str, str] = {}
 
     def persist(job_id: str) -> None:
-        base._ddb.update_item(
-            Key={"PK": f"RUN#{base._state['run']}", "SK": "META"},
-            UpdateExpression="SET transformDeployJobId = :j",
-            ExpressionAttributeValues={":j": job_id},
-        )
+        # start_landing_zone_job creates the job in the configured workspace.
+        started.update(jobId=job_id, workspaceId=transform_ops.workspace_id())
+        _record_job_on_meta("SET transformDeployJobId = :j", {":j": job_id})
         base._state["transform_deploy_job_id"] = job_id
 
-    out = start_deploy_job(
-        run_id=base._state["run"],
-        scope=scope,
-        plan=plan,
-        put_json=_put_json,
-        persist_deploy_job=persist,
-    )
-    _save_checkpoint("transform_deploy_started", jobId=out["jobId"])
-    base.log_tool_event("tool.transform_start_deploy", {"jobId": out["jobId"]})
+    try:
+        out = start_deploy_job(
+            run_id=base._state["run"],
+            scope=scope,
+            plan=plan,
+            put_json=_put_json,
+            persist_deploy_job=persist,
+        )
+        _save_checkpoint("transform_deploy_started", jobId=out["jobId"])
+        base.log_tool_event(f"tool.{step}", {"jobId": out["jobId"]})
+    except Exception as e:
+        if "jobId" not in started:
+            raise  # CreateJob/StartJob itself failed; no job of ours to stop
+        raise _stop_orphaned_job(step, "deploy", started["jobId"], started["workspaceId"], e) from e
     return out
 
 
@@ -379,8 +454,8 @@ def _execute_finish() -> list[str]:
 
 
 # ------------------------------------------------------------------------------------
-# @tool wrappers: thin shells around the _execute_* implementations. Return text and
-# behavior (mode check, one-poll refusal) are unchanged from the pre-fix tools.
+# @tool wrappers. Only yield_for_orchestrator is given to the judgment agent; the rest are
+# thin shells kept for direct use in tests (workflow_tools).
 # ------------------------------------------------------------------------------------
 def _require_deploy_mode() -> None:
     if base._state.get("mode") != "deploy":
@@ -389,7 +464,7 @@ def _require_deploy_mode() -> None:
 
 @tool
 def read_deploy_checkpoint() -> str:
-    """Current deploy workflow checkpoint (stage, Transform job ids, HITL flags). Call first on every invoke."""
+    """Current deploy workflow checkpoint (stage, Transform job ids, HITL flags)."""
     _require_deploy_mode()
     meta = _run_meta()
     cp = read_checkpoint()
@@ -400,7 +475,6 @@ def read_deploy_checkpoint() -> str:
             "transformAnalyzeJobId": meta.get("transformAnalyzeJobId"),
             "transformDeployJobId": meta.get("transformDeployJobId"),
             "transformWorkspaceId": meta.get("transformWorkspaceId"),
-            "instruction": "Follow DEPLOY procedure from your current stage; use yield_for_orchestrator when a Transform job is not finished or awaiting human approval in the Transform console.",
         },
         default=str,
     )
@@ -408,7 +482,8 @@ def read_deploy_checkpoint() -> str:
 
 @tool
 def yield_for_orchestrator(reason: str, awaiting_hitl: bool = False, job_id: str = "") -> str:
-    """Pause this invoke so Step Functions can wait and resume your session. Use when Transform analyze/deploy is in progress or needs HITL."""
+    """Pause the judgment step because AWS Transform has a pending human-input task you cannot answer.
+    Set awaiting_hitl=true in that case. Any other yield counts as a failed judgment attempt."""
     _require_deploy_mode()
     cp = read_checkpoint() or {}
     current_stage = cp.get("stage")
@@ -423,6 +498,10 @@ def yield_for_orchestrator(reason: str, awaiting_hitl: bool = False, job_id: str
         awaitingHitl=awaiting_hitl,
         jobId=job_id or None,
         resumeStage=resume_stage,
+        pendingHumanInput=None,
+        # Carry the judgment counters so a pause can never reset the attempt bound.
+        judgmentAttempts=int(cp.get("judgmentAttempts") or 0),
+        judgmentHitlYields=int(cp.get("judgmentHitlYields") or 0),
     )
     base.log_tool_event("tool.yield_for_orchestrator", {"reason": reason, "awaitingHitl": awaiting_hitl})
     return (
@@ -464,7 +543,7 @@ def transform_start_analyze() -> str:
 
 @tool
 def transform_poll_analyze_job() -> str:
-    """Poll the analyze Transform job once. If not done, call yield_for_orchestrator (awaiting_hitl=true when status requires human approval)."""
+    """Poll the analyze Transform job once."""
     _require_deploy_mode()
     cap = _one_poll_per_invoke("analyze")
     if cap:
@@ -511,7 +590,7 @@ def transform_start_deploy() -> str:
 
 @tool
 def transform_poll_deploy_job() -> str:
-    """Poll the deploy Transform job once. If not done, call yield_for_orchestrator when needed."""
+    """Poll the deploy Transform job once."""
     _require_deploy_mode()
     cap = _one_poll_per_invoke("deploy")
     if cap:
@@ -555,15 +634,15 @@ def _poll_deploy_step() -> None:
     _execute_transform_poll_deploy_once()
 
 
-# stage -> (step name, executor, is_poll)
+# stage -> (step name, executor, is_poll). transform_merged (judgment) is handled inline.
 _STEPS: dict[str | None, tuple[str, Callable[[], object], bool]] = {
-    None: ("run_pre_discover", _execute_pre_discover_or_block, False),
-    "pre_discover_blocked": ("run_pre_discover", _execute_pre_discover_or_block, False),
+    None: ("run_pre_discover", _execute_pre_discover_step, False),
     "pre_discover_done": ("transform_init_connection", _execute_transform_init, False),
     "transform_init_done": ("transform_start_analyze", _execute_transform_start_analyze, False),
     "transform_analyze_started": ("transform_poll_analyze_job", _poll_analyze_step, True),
     "transform_analyze_waiting": ("transform_poll_analyze_job", _poll_analyze_step, True),
     "transform_analyze_done": ("transform_merge_discovery", _execute_merge, False),
+    "judgment_done": ("render_iac_bundles", _execute_render, False),
     "iac_render_done": ("transform_start_deploy", _execute_transform_start_deploy, False),
     "transform_deploy_started": ("transform_poll_deploy_job", _poll_deploy_step, True),
     "transform_deploy_waiting": ("transform_poll_deploy_job", _poll_deploy_step, True),
@@ -571,24 +650,36 @@ _STEPS: dict[str | None, tuple[str, Callable[[], object], bool]] = {
     "post_discover_done": ("finish_deploy_workflow", _execute_finish, False),
 }
 
-# Convergence guard: workflow step count + 2 slack for judgment + completion.
+# Convergence guard: every stage advances or returns, so one invoke runs at most one step per
+# stage. +2 slack for the inline transform_merged render and agent_complete validation.
 MAX_STEPS_PER_INVOKE = len(_STEPS) + 2
 
 
-def _continue_from(cp: dict) -> dict:
-    """Wait-stage continue payload, matching the old _deploy_invoke_result shape."""
+def _continue(reason: str, cp: dict) -> dict:
+    """C3 continue payload. awaitingHitl/jobId/pendingHumanInput come from the saved checkpoint
+    (only waiting checkpoints carry pendingHumanInput; others report None)."""
     return {
         "status": "continue",
-        "reason": cp.get("reason") or cp.get("stage"),
+        "reason": reason,
         "awaitingHitl": bool(cp.get("awaitingHitl")),
         "jobId": cp.get("jobId"),
+        "pendingHumanInput": cp.get("pendingHumanInput"),
     }
+
+
+def _continue_from(cp: dict) -> dict:
+    return _continue(cp.get("reason") or cp.get("stage"), cp)
 
 
 def _step_error(name: str, exc: Exception) -> dict:
     msg = str(exc)[:2000]
     base.log_tool_event(f"tool.{name}.failed", {"error": msg[:500]})
     return {"status": "error", "error": f"{name} failed: {msg}"}
+
+
+def _named_error(event: str, message: str) -> dict:
+    base.log_tool_event(event, {"error": message[:500]})
+    return {"status": "error", "error": message}
 
 
 def _judgment_missing() -> list[tuple[str, str]]:
@@ -611,24 +702,102 @@ def _validate_complete() -> dict:
     return {"status": "ok", "summary": "deploy agent phase complete"}
 
 
+def _run_judgment(run_model: Callable[[], object], cp: dict) -> dict:
+    """One bounded judgment attempt at transform_merged with a judgment artifact missing.
+
+    Always returns: continue after the judgment completes (render/start-deploy run on the next
+    invoke, so no destructive step shares an invoke with a model turn), continue for an accepted
+    HITL yield or an incomplete attempt below the bound, or a named error.
+    """
+    attempts = int(cp.get("judgmentAttempts") or 0)
+    hitl_yields = int(cp.get("judgmentHitlYields") or 0)
+    if attempts >= MAX_JUDGMENT_ATTEMPTS:
+        # A previous invoke used the last attempt and did not record an outcome (e.g. it died).
+        return _named_error(
+            "tool.deploy_judgment.failed",
+            f"deploy_judgment failed: {attempts} model turns used without both judgment artifacts "
+            f"(limit {MAX_JUDGMENT_ATTEMPTS}); missing {[k for _, k in _judgment_missing()]}",
+        )
+    attempts += 1
+    # Persist before the model runs so a crashed or timed-out turn still counts.
+    _save_checkpoint("transform_merged", judgmentAttempts=attempts, judgmentHitlYields=hitl_yields)
+    base.log_tool_event("deploy.sequencer.step", {"step": "deploy_judgment", "attempt": attempts})
+    try:
+        run_model()
+    except Exception as e:  # noqa: BLE001 - surfaced as a named, audited step error
+        return _step_error("deploy_judgment", e)
+
+    missing = _judgment_missing()
+    after = read_checkpoint() or {}
+    if not missing:
+        _save_checkpoint("judgment_done", judgmentAttempts=attempts, judgmentHitlYields=hitl_yields)
+        base.log_tool_event("tool.deploy_judgment", {"attempts": attempts})
+        return _continue(
+            "deploy_judgment complete; render and start deploy run on the next invoke",
+            read_checkpoint() or {},
+        )
+
+    if after.get("stage") == "paused" and after.get("awaitingHitl") is True:
+        hitl_yields += 1
+        if hitl_yields > MAX_JUDGMENT_HITL_YIELDS:
+            return _named_error(
+                "tool.deploy_judgment.failed",
+                f"deploy_judgment failed: model yielded for human input {hitl_yields} times "
+                f"(limit {MAX_JUDGMENT_HITL_YIELDS}) without saving {[k for _, k in missing]}; "
+                f"last reason: {after.get('reason')}",
+            )
+        # An accepted HITL yield is not an incomplete attempt.
+        _save_checkpoint(
+            "paused",
+            reason=after.get("reason"),
+            awaitingHitl=True,
+            jobId=after.get("jobId"),
+            resumeStage="transform_merged",
+            pendingHumanInput=None,
+            judgmentAttempts=attempts - 1,
+            judgmentHitlYields=hitl_yields,
+        )
+        return _continue_from(read_checkpoint() or {})
+
+    step, key = missing[0]
+    if attempts >= MAX_JUDGMENT_ATTEMPTS:
+        return _named_error(
+            "tool.deploy_judgment.failed",
+            f"deploy_judgment failed: judgment step {step} incomplete after {attempts} model turns "
+            f"(limit {MAX_JUDGMENT_ATTEMPTS}): missing {key}",
+        )
+    # Plain return or a yield without awaiting_hitl: counted; retry on the next invoke.
+    _save_checkpoint("transform_merged", judgmentAttempts=attempts, judgmentHitlYields=hitl_yields)
+    return _continue(
+        f"deploy_judgment attempt {attempts}/{MAX_JUDGMENT_ATTEMPTS} incomplete: {step} missing {key}",
+        read_checkpoint() or {},
+    )
+
+
 def run_deploy_invoke(run_model: Callable[[], object]) -> dict:
     """Drive the deploy workflow deterministically, invoking the model only for judgment.
 
     Reads the checkpoint strictly, runs every mechanical step in order, and returns:
       - ok       once all artifacts exist at agent_complete,
-      - continue when a Transform job is still running / awaiting HITL / the poll budget is
-                 spent this invoke,
-      - error    naming the failing step, unreadable checkpoint key, or incomplete judgment
-                 step and its missing artifact key. Never "deploy incomplete at stage=…".
+      - continue (C3 payload) when a Transform job is still running or awaiting human input,
+                 the poll budget is spent this invoke, or a judgment attempt ended,
+      - error    naming the failing step, unreadable checkpoint key, refused job start (run not
+                 RUNNING), or incomplete judgment step and its missing artifact key.
     """
     _require_deploy_mode()
-    model_ran = False
-    pre_discover_attempted = False
+    steps_run: list[str] = []
 
     cp = read_checkpoint()  # raises on non-404 errors
     stage = cp.get("stage") if cp else None
+    if stage == _SUPERSEDED_PRE_DISCOVER_BLOCKED:
+        return _named_error(
+            "deploy.sequencer.superseded_stage",
+            f"checkpoint stage {stage!r} was written by an earlier release that recorded a "
+            f"pre-discover failure as a HITL wait (recorded cause: {cp.get('reason')}); this run "
+            "cannot resume. Fix the deploy target credentials and start a new deploy run.",
+        )
     if stage == "paused":
-        resume = (cp or {}).get("resumeStage")
+        resume = cp.get("resumeStage")
         if resume is None:
             return {
                 "status": "error",
@@ -641,24 +810,16 @@ def run_deploy_invoke(run_model: Callable[[], object]) -> dict:
             return _validate_complete()
 
         if stage == "transform_merged":
-            missing = _judgment_missing()
-            if not missing:
-                try:
-                    _execute_render()
-                except Exception as e:  # noqa: BLE001 - surfaced as a named step error
-                    return _step_error("render_iac_bundles", e)
-                base.log_tool_event("deploy.sequencer.step", {"step": "render_iac_bundles", "fromStage": stage})
-                cp = read_checkpoint()
-                stage = cp.get("stage") if cp else None
-                continue
-            if model_ran:
-                step, key = missing[0]
-                return {"status": "error", "error": f"judgment step {step} incomplete: missing {key}"}
-            run_model()
-            model_ran = True
+            if _judgment_missing():
+                return _run_judgment(run_model, cp or {})
+            # Both judgment artifacts already exist (no model turn this invoke): render.
+            try:
+                _execute_render()
+            except Exception as e:  # noqa: BLE001 - surfaced as a named step error
+                return _step_error("render_iac_bundles", e)
+            steps_run.append("render_iac_bundles")
+            base.log_tool_event("deploy.sequencer.step", {"step": "render_iac_bundles", "fromStage": stage})
             cp = read_checkpoint()
-            if cp and (cp.get("stage") == "paused" or cp.get("awaitingHitl")):
-                return _continue_from(cp)
             stage = cp.get("stage") if cp else None
             continue
 
@@ -668,24 +829,16 @@ def run_deploy_invoke(run_model: Callable[[], object]) -> dict:
         name, fn, is_poll = _STEPS[stage]
 
         if is_poll and int(base._state.get("polls_this_invoke") or 0) >= 1:
-            cp = read_checkpoint() or {}
-            return {
-                "status": "continue",
-                "reason": f"{name} already polled this invoke",
-                "awaitingHitl": bool(cp.get("awaitingHitl")),
-                "jobId": cp.get("jobId"),
-            }
-
-        if name == "run_pre_discover" and pre_discover_attempted:
-            return _continue_from(read_checkpoint() or {})
-        if name == "run_pre_discover":
-            pre_discover_attempted = True
+            return _continue(f"{name} already polled this invoke", read_checkpoint() or {})
 
         try:
             result = fn()
-        except Exception as e:  # noqa: BLE001 - surfaced as a named step error; checkpoint untouched
+        except RunNotRunning as e:
+            return _named_error(f"tool.{name}.refused", str(e))
+        except Exception as e:  # noqa: BLE001 - surfaced as a named step error
             return _step_error(name, e)
 
+        steps_run.append(name)
         base.log_tool_event("deploy.sequencer.step", {"step": name, "fromStage": stage})
 
         if name == "finish_deploy_workflow" and result:
@@ -698,11 +851,15 @@ def run_deploy_invoke(run_model: Callable[[], object]) -> dict:
 
     return {
         "status": "error",
-        "error": f"deploy sequencer made no progress within {MAX_STEPS_PER_INVOKE} steps at stage {stage!r}",
+        "error": (
+            f"deploy sequencer did not reach a wait or terminal stage within {MAX_STEPS_PER_INVOKE} "
+            f"steps; steps run this invoke: {steps_run}; last stage {stage!r}"
+        ),
     }
 
 
 def workflow_tools():
+    """Every deploy @tool, for direct use in tests. The judgment agent gets tools.deploy_tools()."""
     return [
         read_deploy_checkpoint,
         yield_for_orchestrator,

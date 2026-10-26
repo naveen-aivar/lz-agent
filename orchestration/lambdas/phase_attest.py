@@ -84,7 +84,6 @@ def handler(event, _ctx):
         Bucket=ARTIFACT_BUCKET,
         Key=report_key,
         Body=json.dumps(report, indent=2, sort_keys=True).encode(),
-        ServerSideEncryption="aws:kms",
     )
     record_artifact(run_id, "deployment-report", report_key)
     audit(run_id, "system", "deploy.attested", {"overall": overall, "reasons": reasons})

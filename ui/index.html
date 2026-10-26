@@ -220,13 +220,14 @@ dialog.deploy .hint { font-size:12px; color:var(--faint); font-weight:400; line-
   <div class="bar"><span>Deploy target</span><button class="btn btn-sm" type="button" id="closeDeployDlg">Cancel</button></div>
   <form class="body" id="deployForm">
     <p class="hint">Discover and attest against the target AWS account. Use a cross-account IAM role (recommended) or temporary access keys. AWS Transform still runs from the platform account until your workspace is bound to the target org.</p>
-    <label>Target account ID<input name="accountId" inputmode="numeric" pattern="[0-9]{12}" placeholder="556880010183" required /></label>
+    <label>Target account ID<input name="accountId" inputmode="numeric" pattern="[0-9]{12}" placeholder="123456789012" required /></label>
     <label>Auth method<select name="authMethod"><option value="role">IAM role (AssumeRole)</option><option value="keys">Access keys (session)</option><option value="platform">Platform account only</option></select></label>
     <div id="deployRoleFields">
-      <label>Role ARN<span class="hint">Trust the platform AgentCore role in the target account</span><input name="roleArn" placeholder="arn:aws:iam::556880010183:role/IngramLandingZoneDeploy" /></label>
-      <label>External ID (optional)<input name="externalId" autocomplete="off" /></label>
+      <label>Role ARN<span class="hint">Trust the platform ApiRole and AgentRole in the target account; the name must match the stack's DeployAssumeRoleArn pattern</span><input name="roleArn" placeholder="arn:aws:iam::123456789012:role/IngramLandingZoneDeploy" /></label>
+      <label>External ID<span class="hint">Required. Same value as the sts:ExternalId condition in the role's trust policy (not a secret)</span><input name="externalId" autocomplete="off" /></label>
     </div>
     <div id="deployKeyFields" hidden>
+      <p class="hint">Keys are stored encrypted for this deploy run only and deleted when it finishes, fails or is stopped. Prefer the IAM role method or short-lived session credentials over long-lived access keys.</p>
       <label>Access key ID<input name="accessKeyId" autocomplete="off" /></label>
       <label>Secret access key<input name="secretAccessKey" type="password" autocomplete="off" /></label>
       <label>Session token (optional)<input name="sessionToken" autocomplete="off" /></label>

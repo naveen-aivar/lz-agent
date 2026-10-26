@@ -3,6 +3,50 @@ from __future__ import annotations
 
 from typing import Any
 
+ORG_READ_FIX = (
+    "Run discovery with deploy target credentials for the organization's management account, or for a "
+    "delegated administrator of AWS Organizations, with organizations:DescribeOrganization, ListRoots, "
+    "ListOrganizationalUnitsForParent, ListAccounts, ListPolicies and ListTargetsForPolicy allowed."
+)
+
+
+class FoundationUnverifiable(RuntimeError):
+    """The Organizations tree was not fully read, so foundation gaps cannot be computed or trusted.
+
+    Raised instead of returning empty gap lists that a caller would read as "foundation aligned".
+    """
+
+    def __init__(self, consumer: str, limitations: list[dict] | None = None, detail: str | None = None):
+        self.consumer = consumer
+        self.limitations = list(limitations or [])
+        parts = [f"{consumer}: foundation gaps are unverifiable"]
+        if self.limitations:
+            failed = "; ".join(f"{lim.get('code')}: {lim.get('message')}" for lim in self.limitations)
+            parts.append(f"Organizations discovery did not complete ({failed})")
+        if detail:
+            parts.append(detail)
+        parts.append(ORG_READ_FIX)
+        super().__init__(". ".join(parts))
+
+
+def require_complete_gaps(gaps: dict, consumer: str) -> None:
+    """Refuse a gap-analysis dict that was not computed from a complete Organizations read.
+
+    Covers stored artifacts written before gap_analysis raised on partial discovery (``incomplete``),
+    and dicts missing the gap lists (an absent list must never be read as "no gaps").
+    """
+    if not isinstance(gaps, dict):
+        raise FoundationUnverifiable(consumer, detail=f"gap analysis must be an object, got {type(gaps).__name__}")
+    if gaps.get("incomplete"):
+        raise FoundationUnverifiable(
+            consumer,
+            gaps.get("discoveryLimitations") or [],
+            detail="gap analysis is marked incomplete (OU/account tree was not read)",
+        )
+    for key in ("missingOus", "missingAccountsByName"):
+        if not isinstance(gaps.get(key), list):
+            raise FoundationUnverifiable(consumer, detail=f"gap analysis has no {key} list")
+
 
 def _ou_names(scope: dict) -> set[str]:
     return {o["name"] for o in scope.get("ous") or [] if isinstance(o, dict) and o.get("name")}
@@ -17,20 +61,18 @@ def _scp_ids(scope: dict) -> set[str]:
 
 
 def gap_analysis(scope: dict, snapshot: dict) -> dict[str, Any]:
-    """Identify foundation-level gaps between approved scope and live org (not full resource drift)."""
+    """Identify foundation-level gaps between approved scope and live org (not full resource drift).
+
+    Raises FoundationUnverifiable when the snapshot is not a complete Organizations read; never returns
+    empty gap lists for a tree it could not see.
+    """
+    if snapshot.get("error"):
+        raise FoundationUnverifiable("gap_analysis", detail=str(snapshot["error"]))
     if snapshot.get("discoveryLimitations"):
-        return {
-            "missingOus": [],
-            "extraOus": [],
-            "missingAccountsByName": [],
-            "extraAccountsByName": [],
-            "expectedScpIds": sorted(_scp_ids(scope)),
-            "incomplete": True,
-            "note": (
-                "Live OU/account tree was not readable from the runtime account (member account or "
-                "delegation). Gap lists are empty; use Transform analyze and save_foundation_assessment."
-            ),
-        }
+        raise FoundationUnverifiable("gap_analysis", snapshot["discoveryLimitations"])
+    for key in ("organizationalUnits", "accounts"):
+        if not isinstance(snapshot.get(key), list):
+            raise FoundationUnverifiable("gap_analysis", detail=f"Organizations snapshot has no {key} list")
     live_ous = {ou["name"] for ou in snapshot.get("organizationalUnits") or [] if ou.get("name")}
     live_accounts = {a["name"] for a in snapshot.get("accounts") or [] if a.get("name")}
     expected_ous = _ou_names(scope)

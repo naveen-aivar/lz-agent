@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .attestation import require_complete_gaps
+
 ENVIRONMENTS = ("greenfield", "brownfield")
 
 
@@ -13,8 +15,15 @@ def build_foundation_assessment(
     classification: dict,
     gaps: dict,
 ) -> dict[str, Any]:
-    """Document existing org setup and gap summary for operators and auditors."""
-    env = classification.get("classification", "unknown")
+    """Document existing org setup and gap summary for operators and auditors.
+
+    Raises attestation.FoundationUnverifiable for gaps from an incomplete Organizations read, and
+    ValueError when the classification is not greenfield/brownfield.
+    """
+    require_complete_gaps(gaps, "build_foundation_assessment")
+    env = classification.get("classification")
+    if env not in ENVIRONMENTS:
+        raise ValueError(f"build_foundation_assessment: classification must be one of {ENVIRONMENTS}, got {env!r}")
     ous = snapshot.get("organizationalUnits") or []
     accounts = snapshot.get("accounts") or []
     expected_ous = [o.get("name") for o in scope.get("ous") or [] if isinstance(o, dict)]

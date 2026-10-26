@@ -1,18 +1,33 @@
-"""AgentCore Runtime invocation for intake and deploy workflows."""
+"""AgentCore Runtime invocation for intake and deploy workflows.
+
+Deploy phase (orchestration/deployment.asl.json): the agent returns ok / continue / error. A continue payload
+follows contract C3:
+    {"status": "continue", "reason": str, "awaitingHitl": bool, "jobId": str | None,
+     "pendingHumanInput": None | {source, jobId, workspaceId, kind, taskId, title, text, options, consoleUrl}}
+This handler mirrors the pending question into META.pendingHumanInput (removed once a later result is not
+awaiting), audits it, and counts cycles for the state machine's two budgets: progressCount (awaitingHitl
+false) and hitlCount (awaitingHitl true). The state machine compares the counts with its limits.
+"""
+from __future__ import annotations
+
 import json
 import os
 
 import boto3
 from botocore.config import Config
 
-from common import audit, record_artifact
+from common import audit, get_run, record_artifact, table
 from phase_attest import handler as attest_handler
 
+WAIT_SECONDS = 60  # both progress polls and HITL waits; the budgets live in deployment.asl.json
+_REASON_MAX = 500
+_SUMMARY_MAX = 600
+
+
 def _agentcore_client():
-    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
     return boto3.client(
         "bedrock-agentcore",
-        region_name=region,
+        region_name=os.environ["AWS_REGION"],  # always set by the Lambda runtime
         config=Config(read_timeout=900, connect_timeout=10, retries={"max_attempts": 1}),
     )
 
@@ -29,15 +44,135 @@ _DEPLOY_ARTIFACTS_AFTER_ATTEST = (
     ("deployment-report", "runs/{run_id}/deployment/deployment-report.json"),
 )
 
+_PENDING_STR_FIELDS = ("source", "jobId", "workspaceId", "kind", "title", "text", "consoleUrl")
+
 
 def _session_id(run_id: str, phase: str) -> str:
     return f"{run_id}-{phase}".ljust(33, "0")
+
+
+def _budget_count(event: dict, name: str) -> int:
+    value = event.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"deploy phase payload needs a non-negative integer {name!r} (got {value!r}). The execution was "
+            "started from an older deployment.asl.json; stop it and start a new deploy run."
+        )
+    return value
+
+
+def _validate_pending(pending, run_id: str) -> dict | None:
+    """C1 shape check. A malformed payload is an agent/contract bug, so it fails the run."""
+    if pending is None:
+        return None
+    if not isinstance(pending, dict):
+        raise RuntimeError(f"agent continue payload for {run_id}: pendingHumanInput must be an object or null")
+    missing = [k for k in _PENDING_STR_FIELDS if not isinstance(pending.get(k), str)]
+    if missing:
+        raise RuntimeError(
+            f"agent continue payload for {run_id}: pendingHumanInput is missing string field(s) {missing}"
+        )
+    options = pending.get("options")
+    if not isinstance(options, list) or not all(isinstance(o, str) for o in options):
+        raise RuntimeError(f"agent continue payload for {run_id}: pendingHumanInput.options must be a list of strings")
+    task_id = pending.get("taskId")
+    if task_id is not None and not isinstance(task_id, str):
+        raise RuntimeError(f"agent continue payload for {run_id}: pendingHumanInput.taskId must be a string or null")
+    return pending
+
+
+def _parse_continue(result: dict, run_id: str) -> tuple[str, bool, str | None, dict | None]:
+    for key in ("reason", "awaitingHitl", "jobId", "pendingHumanInput"):
+        if key not in result:
+            raise RuntimeError(
+                f"agent continue payload for {run_id} is missing {key!r} (contract C3). "
+                "Redeploy the agent image built from this revision."
+            )
+    reason, awaiting, job_id = result["reason"], result["awaitingHitl"], result["jobId"]
+    if not isinstance(reason, str):
+        raise RuntimeError(f"agent continue payload for {run_id}: reason must be a string")
+    if not isinstance(awaiting, bool):
+        raise RuntimeError(f"agent continue payload for {run_id}: awaitingHitl must be a boolean")
+    if job_id is not None and not isinstance(job_id, str):
+        raise RuntimeError(f"agent continue payload for {run_id}: jobId must be a string or null")
+    pending = _validate_pending(result["pendingHumanInput"], run_id)
+    return reason, awaiting, job_id, pending
+
+
+def _pending_summary(pending: dict | None, awaiting: bool) -> str:
+    """Plain-text summary carried into the HITL-budget failure cause."""
+    if pending:
+        text = f"{pending['title']}: {pending['text']} ({pending['consoleUrl']})"
+        return text[:_SUMMARY_MAX]
+    if awaiting:
+        return "Transform reported a human-input wait but returned no question details"
+    return "none"
+
+
+def _sync_pending_human_input(run_id: str, phase: str, awaiting: bool, job_id, pending: dict | None) -> None:
+    """Mirror the Transform question into META; audit when it appears, changes, or is resolved."""
+    run = get_run(run_id)
+    if not run:
+        raise RuntimeError(f"deploy run {run_id} META not found while recording the continue result")
+    previous = run.get("pendingHumanInput")
+    key = {"PK": f"RUN#{run_id}", "SK": "META"}
+    if awaiting and pending is not None:
+        table().update_item(
+            Key=key,
+            UpdateExpression="SET pendingHumanInput = :p, awaitingHitl = :t",
+            ExpressionAttributeValues={":p": pending, ":t": True},
+        )
+        if previous != pending:
+            audit(
+                run_id,
+                "system",
+                "phase.awaiting_human",
+                {
+                    "phase": phase,
+                    "jobId": pending["jobId"],
+                    "kind": pending["kind"],
+                    "taskId": pending.get("taskId"),
+                    "title": pending["title"],
+                    "text": pending["text"],
+                    "options": pending["options"],
+                    "consoleUrl": pending["consoleUrl"],
+                },
+            )
+        return
+    table().update_item(
+        Key=key,
+        UpdateExpression="SET awaitingHitl = :a REMOVE pendingHumanInput",
+        ExpressionAttributeValues={":a": awaiting},
+    )
+    if awaiting and run.get("awaitingHitl") is not True:
+        # AWAITING_HUMAN_INPUT status without question details (C1 allows it): audit the wait itself.
+        audit(run_id, "system", "phase.awaiting_human", {"phase": phase, "jobId": job_id, "title": None,
+                                                           "text": None, "options": [], "consoleUrl": None})
+    if previous is not None:
+        audit(run_id, "system", "phase.human_input_resolved", {"phase": phase, "jobId": previous.get("jobId"),
+                                                                 "title": previous.get("title")})
+
+
+def _deploy_result(run_id, *, cont, awaiting, progress, hitl, reason, summary):
+    return {
+        "runId": run_id,
+        "agentContinue": cont,
+        "awaitingHitl": awaiting,
+        "waitSeconds": WAIT_SECONDS,
+        "progressCount": progress,
+        "hitlCount": hitl,
+        "lastReason": reason[:_REASON_MAX],
+        "pendingSummary": summary,
+    }
 
 
 def handler(event, _ctx):
     run_id, phase = event["runId"], event["phase"]
     if phase not in ("intake", "deploy"):
         raise ValueError(f"unknown agent phase {phase}")
+    if phase == "deploy":
+        progress = _budget_count(event, "progressCount")
+        hitl = _budget_count(event, "hitlCount")
 
     session_id = _session_id(run_id, phase)
     audit(run_id, "system", "phase.started", {"phase": phase})
@@ -58,19 +193,26 @@ def handler(event, _ctx):
     result = json.loads(resp["response"].read())
 
     if result.get("status") == "continue":
-        awaiting = bool(result.get("awaitingHitl"))
+        if phase != "deploy":
+            raise RuntimeError(f"agent phase {phase} returned continue; only the deploy phase can resume")
+        reason, awaiting, job_id, pending = _parse_continue(result, run_id)
+        _sync_pending_human_input(run_id, phase, awaiting, job_id, pending)
         audit(
             run_id,
             "system",
             "phase.continue",
-            {"phase": phase, "reason": result.get("reason"), "awaitingHitl": awaiting},
+            {"phase": phase, "reason": reason, "awaitingHitl": awaiting, "jobId": job_id,
+             "progressCount": progress + (0 if awaiting else 1), "hitlCount": hitl + (1 if awaiting else 0)},
         )
-        return {
-            "runId": run_id,
-            "agentContinue": True,
-            "awaitingHitl": awaiting,
-            "waitSeconds": 60 if awaiting else 30,
-        }
+        return _deploy_result(
+            run_id,
+            cont=True,
+            awaiting=awaiting,
+            progress=progress + (0 if awaiting else 1),
+            hitl=hitl + (1 if awaiting else 0),
+            reason=reason,
+            summary=_pending_summary(pending, awaiting),
+        )
 
     if result.get("status") != "ok":
         audit(run_id, "system", "phase.failed", {"phase": phase, "result": result})
@@ -83,7 +225,8 @@ def handler(event, _ctx):
             key = key_tpl.format(run_id=run_id)
             record_artifact(run_id, art_name, key)
         audit(run_id, "system", "phase.completed", {"phase": phase, "attested": True})
-        return {"runId": run_id, "agentContinue": False}
+        return _deploy_result(run_id, cont=False, awaiting=False, progress=progress, hitl=hitl,
+                              reason="", summary="none")
 
     art_name, key_tpl = PHASE_ARTIFACT[phase]
     artifact_key = key_tpl.format(run_id=run_id)

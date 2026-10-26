@@ -2,4 +2,4 @@ bedrock-agentcore>=0.1.0
 strands-agents>=1.0.0
 mcp>=1.0.0
 boto3>=1.39.0
-awslabs.aws-transform-mcp-server>=0.2.3
+awslabs.aws-transform-mcp-server==0.2.3

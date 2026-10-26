@@ -15,9 +15,6 @@ DEPLOYMENT_FILE_NAMES: tuple[str, ...] = (
     "transform-poll-deploy.json",
 )
 
-# Max Step Functions wait/resume cycles (keep in sync with ContinueLimitChoice in deployment.asl.json).
-MAX_DEPLOY_CONTINUE_CYCLES = 200
-
 
 def deployment_prefix(run_id: str) -> str:
     return f"runs/{run_id}/deployment"

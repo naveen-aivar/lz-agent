@@ -1,7 +1,9 @@
 """AgentCore Runtime entrypoint (Strands).
 
 intake: SOW → validated scope.json (no IaC).
-deploy: full deploy workflow (discover, Transform, plan, render) via tools + Transform MCP; SFN re-invokes on job pause."""
+deploy: deploy_workflow_tools.run_deploy_invoke drives every mechanical step deterministically and
+invokes the judgment agent (judgment tools + AWS docs + Transform MCP) only for the foundation
+assessment and IaC change plan. It returns ok / continue / error; SFN re-invokes on continue."""
 import os
 
 import bedrock_auth
@@ -12,7 +14,6 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
 from strands.models import BedrockModel
 
-import stable_identity
 import tools
 from prompts import DEPLOY_PROMPT, DEPLOY_SYSTEM, INTAKE_PROMPT, SYSTEM
 from deploy_workflow_tools import run_deploy_invoke
@@ -25,12 +26,15 @@ MODEL_ID = os.environ["MODEL_ID"]  # Bedrock inference-profile id for Claude, se
 def _complete(artifact_key: str, out) -> dict:
     try:
         tools._s3.head_object(Bucket=tools.BUCKET, Key=artifact_key)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - only not-found means "not saved"
+        if not tools._is_absent(exc):
+            raise RuntimeError(f"cannot read {artifact_key}: {exc}") from exc
         return {"status": "error", "error": f"agent finished without saving {artifact_key}"}
     return {"status": "ok", "summary": str(out)[:2000]}
 
 
 def _deploy_agent(prompt: str):
+    """One judgment turn. Tools: judgment-only platform tools (no mechanical steps), AWS docs, Transform MCP."""
     with transform_tools() as transform_mcp_tool_list:
         agent = Agent(
             model=BedrockModel(model_id=MODEL_ID, max_tokens=32768),
@@ -55,16 +59,14 @@ def invoke(payload, context):
             prompt = INTAKE_PROMPT.format(run_id=run_id)
             artifact_key = f"runs/{run_id}/intake/scope.json"
             out = agent(prompt)
+            return _complete(artifact_key, out)
         elif phase == "deploy":
-            # Transform keys collaborators by RoleId:SessionName; sign as one fixed session name.
-            stable_identity.assume_stable_session()
             tools.set_deploy_run(run_id)
             return run_deploy_invoke(lambda: _deploy_agent(DEPLOY_PROMPT.format(run_id=run_id)))
         else:
             return {"status": "error", "error": f"unknown phase {phase}"}
     except Exception as e:
         return {"status": "error", "error": str(e)[:2000]}
-    return _complete(artifact_key, out)
 
 
 if __name__ == "__main__":

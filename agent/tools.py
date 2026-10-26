@@ -143,7 +143,7 @@ def save_scope(scope_json: str) -> str:
         log_tool_event("tool.save_scope.rejected", {"errors": errors[:20]})
         return "ERRORS (fix and call save_scope again):\n- " + "\n- ".join(errors[:40])
     body = json.dumps(normalized, indent=2, sort_keys=True)
-    _s3.put_object(Bucket=BUCKET, Key=f"runs/{_state['run']}/intake/scope.json", Body=body.encode(), ServerSideEncryption="aws:kms")
+    _s3.put_object(Bucket=BUCKET, Key=f"runs/{_state['run']}/intake/scope.json", Body=body.encode())
     log_tool_event("tool.save_scope", {"summary": normalized["summary"], "status": normalized["status"]})
     out = f"saved. summary={json.dumps(normalized['summary'])} status={normalized['status']}"
     hints = scopelib.review_hints(normalized)
@@ -163,6 +163,29 @@ def _load_json(key: str) -> dict:
     return json.loads(_s3.get_object(Bucket=BUCKET, Key=key)["Body"].read().decode())
 
 
+_ABSENT_CODES = {"NoSuchKey", "404", "NotFound"}
+
+
+def _is_absent(exc: Exception) -> bool:
+    """True only when the error means the object does not exist (a ClientError whose code is
+    one of the not-found codes). Any other condition is a real failure, not an absence."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    code = str(response.get("Error", {}).get("Code", ""))
+    return code in _ABSENT_CODES
+
+
+def _load_json_if_exists(key: str) -> "dict | None":
+    """JSON object at key, or None only when it does not exist. Any other read error raises naming the key."""
+    try:
+        return _load_json(key)
+    except Exception as exc:  # noqa: BLE001 - absence is the only non-error outcome
+        if _is_absent(exc):
+            return None
+        raise RuntimeError(f"cannot read {key}: {exc}") from exc
+
+
 @tool
 def read_deploy_context() -> str:
     """Deploy run: classification, gap analysis, and deterministic suggested IaC changes."""
@@ -174,25 +197,14 @@ def read_deploy_context() -> str:
     scope = _load_json(scope_key)
     snapshot = _load_json(f"{base}/foundation.json")
     suggested = suggest_changes(scope, gaps)
-    heuristic = None
-    try:
-        heuristic = _load_json(f"{base}/classification-heuristic.json")
-    except Exception:
-        pass
-    saved_assessment = None
-    try:
-        saved_assessment = _load_json(f"{base}/foundation-assessment.json")
-    except Exception:
-        pass
+    heuristic = _load_json_if_exists(f"{base}/classification-heuristic.json")
+    saved_assessment = _load_json_if_exists(f"{base}/foundation-assessment.json")
     transform_ctx: dict = {
-        "workspaceId": _state.get("transform_workspace_id") or os.environ.get("TRANSFORM_WORKSPACE_ID"),
+        "workspaceId": _state.get("transform_workspace_id"),
         "analyzeJobId": _state.get("transform_analyze_job_id"),
         "deployJobId": _state.get("transform_deploy_job_id"),
+        "analyzePoll": _load_json_if_exists(f"{base}/transform-poll-analyze.json"),
     }
-    try:
-        transform_ctx["analyzePoll"] = _load_json(f"{base}/transform-poll-analyze.json")
-    except Exception:
-        pass
     if snapshot.get("transform"):
         transform_ctx["mergedFoundation"] = snapshot["transform"]
 
@@ -242,14 +254,16 @@ def save_foundation_assessment(assessment_json: str) -> str:
     base = _deployment_prefix()
     scope_key = f"runs/{_state['design_run_id']}/intake/scope.json"
     scope = _load_json(scope_key)
-    try:
-        snapshot = _load_json(f"{base}/foundation.json")
-        gaps = _load_json(f"{base}/gap-analysis.json")
-    except Exception:
+    snapshot_key = f"{base}/foundation.json"
+    gaps_key = f"{base}/gap-analysis.json"
+    snapshot = _load_json_if_exists(snapshot_key)  # raises naming the key on any non-404 error
+    gaps = _load_json_if_exists(gaps_key)
+    absent = [key for key, value in ((snapshot_key, snapshot), (gaps_key, gaps)) if value is None]
+    if absent:
         return (
-            "REFUSED: missing foundation.json or gap-analysis.json. "
-            "Call run_pre_discover successfully before save_foundation_assessment. "
-            "Do not call transform_merge_discovery until after a real Transform analyze job exists."
+            f"REFUSED: {absent} not found. The orchestrator writes these during pre-discover, before "
+            "the judgment step; this run is not in a state where an assessment can be saved. "
+            "Stop and report this; do not retry."
         )
     classification = classification_from_agent(normalized)
     assessment = build_foundation_assessment(
@@ -275,7 +289,6 @@ def save_foundation_assessment(assessment_json: str) -> str:
             Bucket=BUCKET,
             Key=key,
             Body=json.dumps(payload, indent=2, sort_keys=True).encode(),
-            ServerSideEncryption="aws:kms",
         )
     _record_artifact("foundation-assessment", assess_key)
     log_tool_event(
@@ -313,33 +326,51 @@ def save_iac_change_plan(plan_json: str) -> str:
         Bucket=BUCKET,
         Key=key,
         Body=json.dumps(normalized, indent=2, sort_keys=True).encode(),
-        ServerSideEncryption="aws:kms",
     )
     log_tool_event("tool.save_iac_change_plan", {"strategy": normalized.get("strategy"), "changes": len(normalized.get("changes") or [])})
     return f"saved. strategy={normalized.get('strategy')} changes={len(normalized.get('changes') or [])}"
 
 
 def deploy_tools():
-    from deploy_workflow_tools import workflow_tools
+    """Platform tools for the deploy judgment agent (app.py adds AWS docs + Transform MCP).
+
+    Judgment tools only. The mechanical workflow steps (discover, Transform start/poll, merge,
+    render, post-discover, finish) belong to the deterministic sequencer and are never given to
+    the model, so it cannot start a Transform job or run steps out of order or concurrently.
+    """
+    from deploy_workflow_tools import yield_for_orchestrator  # deferred: that module imports this one
 
     return [
-        *workflow_tools(),
         read_deploy_context,
         read_approved_scope,
         get_catalog,
         save_foundation_assessment,
         save_iac_change_plan,
+        yield_for_orchestrator,
     ]
 
 
-def aws_docs_tools():
-    """AWS Knowledge MCP tools (remote, no AWS credentials needed). Returns [] if unreachable."""
-    try:
-        from mcp.client.streamable_http import streamablehttp_client
-        from strands.tools.mcp import MCPClient
+AWS_KNOWLEDGE_MCP_URL = "https://knowledge-mcp.global.api.aws"
 
-        client = MCPClient(lambda: streamablehttp_client("https://knowledge-mcp.global.api.aws"))
+
+def aws_docs_tools():
+    """AWS Knowledge MCP tools (remote, no AWS credentials needed).
+
+    Raises when the server cannot be reached or returns no tools: an agent silently running
+    without its documentation tools would answer from memory instead.
+    """
+    from mcp.client.streamable_http import streamablehttp_client
+    from strands.tools.mcp import MCPClient
+
+    try:
+        client = MCPClient(lambda: streamablehttp_client(AWS_KNOWLEDGE_MCP_URL))
         client.start()
-        return client.list_tools_sync()
-    except Exception:
-        return []
+        loaded = client.list_tools_sync()
+    except Exception as e:
+        raise RuntimeError(
+            f"AWS Knowledge MCP at {AWS_KNOWLEDGE_MCP_URL} is unreachable: {e}. The AgentCore runtime needs "
+            "outbound HTTPS to that endpoint (NetworkMode PUBLIC)."
+        ) from e
+    if not loaded:
+        raise RuntimeError(f"AWS Knowledge MCP at {AWS_KNOWLEDGE_MCP_URL} returned no tools")
+    return loaded

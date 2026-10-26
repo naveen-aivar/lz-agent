@@ -5,10 +5,11 @@ import json
 from typing import Any, Callable
 
 from lzcore import transform_ops
-# Stable handle to the real transform_ops for the exception type and principal/workspace
-# resolution. `transform_ops` above may be monkeypatched (e.g. in tests) to a fake that lacks
+# Stable handle to the real transform_ops for the exception type and workspace resolution.
+# `transform_ops` above may be monkeypatched (e.g. in tests) to a fake that lacks
 # TransformAccessDenied; translation must always use the genuine module.
 from lzcore import transform_ops as _real_transform_ops
+from lzcore.transform_credentials import transform_principal_arn
 
 
 def _translate_403(operation: str, exc: Exception) -> Exception:
@@ -16,6 +17,7 @@ def _translate_403(operation: str, exc: Exception) -> Exception:
     original exception. Defense-in-depth: the primary translation is in transform_ops._call,
     but a 403 raised by any Transform boundary call surfaces the same actionable message
     (principal + workspace + Contributor guidance) instead of a bare "HTTP 403".
+    The principal is computed from TRANSFORM_ROLE_ARN (no STS call).
     """
     if getattr(exc, "status_code", None) == 403 and not isinstance(
         exc, _real_transform_ops.TransformAccessDenied
@@ -23,7 +25,7 @@ def _translate_403(operation: str, exc: Exception) -> Exception:
         return _real_transform_ops.TransformAccessDenied(
             operation,
             _real_transform_ops.workspace_id(),
-            _real_transform_ops._resolve_principal(),
+            transform_principal_arn(),
             cause=exc,
         )
     return exc
@@ -114,16 +116,21 @@ def poll_transform_job(
     except Exception as exc:
         raise _translate_403("GetJob", exc) from exc
     put_transform_artifact(put_json, run_id, f"poll-{label}", poll)
-    status = poll.get("status")
+    status = poll["status"]
     # Defense-in-depth with poll_job: fail on FAILED and on cancelled/stopped terminals so a
     # non-successful job never flows forward as if it completed.
     if status in {"FAILED", "STOPPED", "CANCELLED", "CANCELED"}:
         raise RuntimeError(f"Transform job {job_id} ended with status {status}")
+    if "pendingHumanInput" not in poll:
+        raise RuntimeError(f"Transform poll for job {job_id} has no pendingHumanInput field (contract C1)")
+    pending = poll["pendingHumanInput"]
     return {
         "jobId": job_id,
         "status": status,
-        "transformDone": bool(poll.get("done")),
-        "transformAwaitingHitl": bool(poll.get("awaitingHumanApproval")),
+        "transformDone": bool(poll["done"]),
+        # C1: awaiting iff the job reports AWAITING_HUMAN_INPUT or a pending task/question exists.
+        "transformAwaitingHitl": status == "AWAITING_HUMAN_INPUT" or pending is not None,
+        "pendingHumanInput": pending,
         "poll": poll,
     }
 
