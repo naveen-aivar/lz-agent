@@ -30,7 +30,7 @@ Organizations **discover** and **attestation** use the target credentials. **AWS
 
    The external ID is a confused-deputy guard, not a secret. Pick a unique value per customer; the platform refuses role mode without one.
 
-3. If the role name does not match the default pattern, deploy the platform with `DEPLOY_ASSUME_ROLE_ARN=<pattern>` (`scripts/deploy.sh` always passes `DeployAssumeRoleArn`, because `cloudformation deploy` would otherwise keep a stack's previous value, which was `*` on older stacks). Never set it to `*`.
+3. If the role name does not match the default pattern, deploy the platform with `DEPLOY_ASSUME_ROLE_ARN=<pattern>` (`scripts/deploy.sh` always passes `DeployAssumeRoleArn`, because `cloudformation deploy` would otherwise keep a stack's previous value, which was `*` on older stacks). The parameter's `AllowedPattern` rejects `*` and any role name without a literal prefix (e.g. `arn:aws:iam::*:role/*`); only an optional trailing `*` is allowed.
 
 4. In the UI: **Start deploy run** → target account id, role ARN, external ID.
 
@@ -38,8 +38,9 @@ Organizations **discover** and **attestation** use the target credentials. **AWS
 
 - Stored at `deploy-target-credentials/{deployRunId}.json` in the artifact bucket, outside `runs/*`, with SSE-KMS under the **stack CMK** (`SSEKMSKeyId` set explicitly; the bucket policy denies writes under that prefix with any other key).
 - Readers: only **AgentRole**. IAM grants nothing else `GetObject` on the prefix, and the bucket policy denies `GetObject`/`GetObjectVersion` there to every other principal, account admins included. ApiRole may write and delete; PhaseRole may delete.
-- Deleted (every version, since the bucket is versioned) when the run is **DELIVERED** or **FAILED** (`phase_deploy_status`) and on **`/stop`**. A failed delete is recorded in `META.credentialsCleanupError`, audited (`deploy.target_credentials_delete_failed`) and surfaced: `/stop` returns 500, and the state machine task fails. Rotate the key and delete the object by hand in that case.
-- Backstop: a lifecycle rule expires the prefix after 4 days (noncurrent versions after 1 more day) for executions that end without reaching `MarkFailed`, e.g. the 72 h execution timeout.
+- Deleted (every version, since the bucket is versioned) when the run is **DELIVERED** or **FAILED** (`phase_deploy_status`) and on **`/stop`**. A failed delete is recorded in `META.credentialsCleanupError`, audited (`deploy.target_credentials_delete_failed`) and surfaced: `/stop` returns 500, and the state machine task fails after its retries (4 attempts). Rotate the key and delete the object by hand if the error stays.
+- Executions that end without reaching `MarkFailed` (the 72 h execution timeout, a console abort, or a terminal task that fails after its retries) trigger the EventBridge rule `DeployExecutionEndedRule`. It runs `phase_deploy_status` again, which marks a still-`RUNNING` run FAILED and re-checks the keys. A later successful delete clears `credentialsCleanupError`. Async invokes that still fail land in the SQS queue `DeployCleanupDlq` (stack output `DeployCleanupDlqUrl`), which should stay empty.
+- Backstop: a lifecycle rule expires the prefix after 4 days (noncurrent versions after 1 more day), for the case where the cleanup above also failed.
 - Runs created before this change stored keys under `runs/{deployRunId}/deployment/target-credentials.json`. Those objects are not touched by the new cleanup; delete every version of them manually.
 - `META.deployTarget.credentialsKey` points to the object. API responses and audit rows show `deployTarget` as `{mode, accountId, roleArn}` only.
 

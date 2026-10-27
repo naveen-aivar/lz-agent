@@ -49,9 +49,10 @@ check_json cfn-security cloudformation checkov-cloudformation.json checkov -d . 
 python3 "$HERE/report.py" "$REP" "$RESULTS" "$SRC" "$OUT" "$RUN_ID" "$ROOT/files.txt" || FAILED=1
 if [ -z "${LOCAL_SRC:-}" ]; then
   P="s3://$ARTIFACT_BUCKET/runs/$RUN_ID"
-  for f in validation-report.json validation-reports.zip; do aws s3 cp "$OUT/$f" "$P/$f" --sse aws:kms --only-show-errors || FAILED=1; done
+  # No --sse flag: the bucket's default encryption (the stack CMK) applies. "--sse aws:kms" alone would use aws/s3.
+  for f in validation-report.json validation-reports.zip; do aws s3 cp "$OUT/$f" "$P/$f" --only-show-errors || FAILED=1; done
   if [ "$FAILED" = 0 ]; then  # the stack bundles are replaced by versions that carry their scan reports
-    for f in terraform.zip cloudformation.zip; do aws s3 cp "$OUT/$f" "$P/$f" --sse aws:kms --only-show-errors || FAILED=1; done
+    for f in terraform.zip cloudformation.zip; do aws s3 cp "$OUT/$f" "$P/$f" --only-show-errors || FAILED=1; done
   fi
 fi
 exit $FAILED

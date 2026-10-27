@@ -219,7 +219,7 @@ dialog.deploy .hint { font-size:12px; color:var(--faint); font-weight:400; line-
 <dialog class="deploy" id="deployDlg" aria-label="Deploy target account">
   <div class="bar"><span>Deploy target</span><button class="btn btn-sm" type="button" id="closeDeployDlg">Cancel</button></div>
   <form class="body" id="deployForm">
-    <p class="hint">Discover and attest against the target AWS account. Use a cross-account IAM role (recommended) or temporary access keys. AWS Transform still runs from the platform account until your workspace is bound to the target org.</p>
+    <p class="hint">Discover and attest against the target AWS account. Use a cross-account IAM role (recommended) or temporary access keys. AWS Transform jobs run in the account of the platform's Transform role (TransformRoleArn, or the platform account when it is not set), which must be in the same AWS Organization as the target.</p>
     <label>Target account ID<input name="accountId" inputmode="numeric" pattern="[0-9]{12}" placeholder="123456789012" required /></label>
     <label>Auth method<select name="authMethod"><option value="role">IAM role (AssumeRole)</option><option value="keys">Access keys (session)</option><option value="platform">Platform account only</option></select></label>
     <div id="deployRoleFields">

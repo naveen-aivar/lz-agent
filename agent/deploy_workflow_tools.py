@@ -16,6 +16,8 @@ from typing import Callable
 from strands import tool
 
 from lzcore import transform_ops
+# Pure URL formatter, bound to the real module so a stand-in transform_ops cannot change it.
+from lzcore.transform_ops import console_url as _transform_console_url
 from lzcore.deploy_render import render_deploy_iac
 from lzcore.deploy_transform import (
     init_transform,
@@ -38,12 +40,13 @@ WAIT_STAGES = frozenset({"paused", "transform_analyze_waiting", "transform_deplo
 _FOUNDATION_ASSESSMENT = "foundation-assessment.json"
 _IAC_CHANGE_PLAN = "iac-change-plan.json"
 
-# Model turns at transform_merged that may end without both judgment artifacts (including
-# yields without awaiting_hitl=true) before the run fails.
+# Model turns at transform_merged before the run fails. Every turn that does not leave both
+# judgment artifacts counts: a plain return, any yield_for_orchestrator call, and a turn that
+# raises (Bedrock throttling, MCP startup failure, ...). A yield never waits for a human: the
+# analyze job has finished before judgment starts, and the next turn runs on the next invoke.
 MAX_JUDGMENT_ATTEMPTS = 3
-# Model yields with awaiting_hitl=true during judgment before the run fails. Each one costs a
-# full model turn on the next invoke, so they are bounded separately from incomplete attempts.
-MAX_JUDGMENT_HITL_YIELDS = 3
+# Longest model-turn error kept in the checkpoint (lastJudgmentError) and in the final failure.
+_JUDGMENT_ERROR_LIMIT = 1000
 
 # Superseded stage written by an earlier release that recorded pre-discover failures as a HITL
 # wait. Runs left at this stage cannot resume; the sequencer reports that explicitly.
@@ -120,16 +123,19 @@ def _meta_key() -> dict:
     return {"PK": f"RUN#{base._state['run']}", "SK": "META"}
 
 
-def _run_meta() -> dict:
-    item = base._ddb.get_item(Key=_meta_key()).get("Item")
+def _run_meta(*, consistent: bool = False) -> dict:
+    kwargs = {"ConsistentRead": True} if consistent else {}
+    item = base._ddb.get_item(Key=_meta_key(), **kwargs).get("Item")
     if not item:
         raise RuntimeError(f"run META item RUN#{base._state['run']} not found in {base.TABLE}")
     return item
 
 
 def _require_run_running(step: str) -> None:
-    """C4: refuse to start a Transform job unless META.status is RUNNING (e.g. after /stop)."""
-    status = _run_meta().get("status")
+    """C4: refuse to start a Transform job unless META.status is RUNNING (e.g. after /stop).
+    Strongly consistent read, so a /stop that has already been acknowledged is always seen; the
+    conditional job-id write (_record_job_on_meta) covers a /stop that lands after this read."""
+    status = _run_meta(consistent=True).get("status")
     if status != "RUNNING":
         raise RunNotRunning(f"{step} refused: run is {status}")
 
@@ -249,10 +255,18 @@ def _execute_pre_discover_step() -> dict:
 def _execute_transform_init() -> dict:
     out = init_transform(run_id=base._state["run"], put_json=_put_json)
     ws = out["workspaceId"]
+    # C10: init_connection resolves the profile's Transform web app URL. It is kept on META so a
+    # later poll failure can name the console URL of the job it was polling (C12).
+    app_url = (out.get("init") or {}).get("applicationUrl")
+    if not isinstance(app_url, str) or not app_url.startswith("https://"):
+        raise RuntimeError(
+            f"Transform init_connection returned no https applicationUrl (got {app_url!r}); "
+            "contract C10 requires it so job console URLs are known before any job starts"
+        )
     base._ddb.update_item(
         Key=_meta_key(),
-        UpdateExpression="SET transformWorkspaceId = :w",
-        ExpressionAttributeValues={":w": ws},
+        UpdateExpression="SET transformWorkspaceId = :w, transformApplicationUrl = :u",
+        ExpressionAttributeValues={":w": ws, ":u": app_url},
     )
     base._state["transform_workspace_id"] = ws
     _save_checkpoint("transform_init_done", workspaceId=ws)
@@ -301,54 +315,97 @@ def _poll_result_checkpoint(out: dict) -> dict:
     }
 
 
-def _execute_transform_poll_analyze_once() -> dict:
-    meta = _run_meta()
-    job_id = meta.get("transformAnalyzeJobId") or base._state.get("transform_analyze_job_id")
-    if not job_id:
-        raise RuntimeError("no analyze job id")
-    out = poll_transform_job(
-        run_id=base._state["run"],
-        job_id=job_id,
-        workspace_id=meta.get("transformWorkspaceId"),
-        label="analyze",
-        put_json=_put_json,
-    )
-    if out["transformDone"]:
-        base.log_tool_event("tool.transform_poll_analyze_job", {"status": out.get("status"), "done": True})
-        _save_checkpoint("transform_analyze_done", jobId=job_id)
-    else:
-        waiting = _poll_result_checkpoint(out)
-        base.log_tool_event(
-            "tool.transform_poll_analyze_job",
-            {"status": out.get("status"), "done": False, "awaitingHitl": waiting["awaitingHitl"]},
+# label -> (META job-id field, _state job-id field, waiting stage, done stage)
+_POLL_SPECS: dict[str, tuple[str, str, str, str]] = {
+    "analyze": ("transformAnalyzeJobId", "transform_analyze_job_id", "transform_analyze_waiting", "transform_analyze_done"),
+    "deploy": ("transformDeployJobId", "transform_deploy_job_id", "transform_deploy_waiting", "transform_deploy_done"),
+}
+
+
+def _poll_resume_fields(cp: dict, waiting_stage: str, job_id: str) -> tuple[str | None, dict | None]:
+    """(messagesCursor, previous pendingHumanInput) to pass to the next poll (C7).
+
+    Both come only from this job's waiting checkpoint; the first poll after a start has neither.
+    A waiting checkpoint for a different job id is an inconsistent run state and raises."""
+    if cp.get("stage") != waiting_stage:
+        return None, None
+    if cp.get("jobId") != job_id:
+        raise RuntimeError(
+            f"checkpoint {waiting_stage} is for job {cp.get('jobId')!r} but META names job {job_id!r}; "
+            "refusing to reuse another job's message cursor"
         )
-        _save_checkpoint("transform_analyze_waiting", jobId=job_id, **waiting)
+    return cp.get("messagesCursor"), cp.get("pendingHumanInput")
+
+
+def _known_console_url(cp: dict, meta: dict, ws: str | None, job_id: str) -> str | None:
+    """Console URL of job_id when this run recorded one: the waiting checkpoint's pending input
+    (C1 consoleUrl), else META.transformApplicationUrl from init (C10). None when neither exists."""
+    pending = cp.get("pendingHumanInput") if cp.get("jobId") == job_id else None
+    if isinstance(pending, dict) and isinstance(pending.get("consoleUrl"), str) and pending["consoleUrl"]:
+        return pending["consoleUrl"]
+    app_url = meta.get("transformApplicationUrl")
+    if isinstance(app_url, str) and app_url and ws:
+        return _transform_console_url(app_url, ws, job_id)
+    return None
+
+
+def _poll_failure(label: str, job_id: str, ws: str | None, cp: dict, meta: dict, cause: Exception) -> RuntimeError:
+    """C12: a poll that fails after the job was started names the job, says it may still be
+    running, and gives its console URL when known. The cause comes last so truncation of a
+    long cause never drops the job details."""
+    url = _known_console_url(cp, meta, ws, job_id)
+    where = f"console: {url}" if url else "console URL unknown (none recorded for this run)"
+    return RuntimeError(
+        f"Transform {label} job {job_id} in workspace {ws}: poll failed; the Transform job may still be "
+        f"running ({where}); check or stop it in AWS Transform before starting a new deploy run. "
+        f"Cause: {cause}"
+    )
+
+
+def _execute_transform_poll_once(label: str) -> dict:
+    """Poll one Transform job once (C1/C7) and write the done or waiting checkpoint."""
+    meta_field, state_field, waiting_stage, done_stage = _POLL_SPECS[label]
+    event = f"tool.transform_poll_{label}_job"
+    cp = read_checkpoint() or {}
+    meta = _run_meta()
+    job_id = meta.get(meta_field) or base._state.get(state_field)
+    if not job_id:
+        raise RuntimeError(f"no {label} job id")
+    ws = meta.get("transformWorkspaceId")
+    try:
+        cursor, previous_pending = _poll_resume_fields(cp, waiting_stage, job_id)
+        out = poll_transform_job(
+            run_id=base._state["run"],
+            job_id=job_id,
+            workspace_id=ws,
+            label=label,
+            put_json=_put_json,
+            messages_cursor=cursor,
+            previous_pending=previous_pending,
+        )
+        if out["transformDone"]:
+            base.log_tool_event(event, {"status": out.get("status"), "done": True})
+            _save_checkpoint(done_stage, jobId=job_id)
+        else:
+            if "messagesCursor" not in out:
+                raise RuntimeError(f"Transform poll for job {job_id} has no messagesCursor field (contract C7)")
+            waiting = _poll_result_checkpoint(out)
+            base.log_tool_event(
+                event,
+                {"status": out.get("status"), "done": False, "awaitingHitl": waiting["awaitingHitl"]},
+            )
+            _save_checkpoint(waiting_stage, jobId=job_id, messagesCursor=out["messagesCursor"], **waiting)
+    except Exception as e:
+        raise _poll_failure(label, job_id, ws, cp, meta, e) from e
     return out
+
+
+def _execute_transform_poll_analyze_once() -> dict:
+    return _execute_transform_poll_once("analyze")
 
 
 def _execute_transform_poll_deploy_once() -> dict:
-    meta = _run_meta()
-    job_id = meta.get("transformDeployJobId") or base._state.get("transform_deploy_job_id")
-    if not job_id:
-        raise RuntimeError("no deploy job id")
-    out = poll_transform_job(
-        run_id=base._state["run"],
-        job_id=job_id,
-        workspace_id=meta.get("transformWorkspaceId"),
-        label="deploy",
-        put_json=_put_json,
-    )
-    if out["transformDone"]:
-        base.log_tool_event("tool.transform_poll_deploy_job", {"status": out.get("status"), "done": True})
-        _save_checkpoint("transform_deploy_done", jobId=job_id)
-    else:
-        waiting = _poll_result_checkpoint(out)
-        base.log_tool_event(
-            "tool.transform_poll_deploy_job",
-            {"status": out.get("status"), "done": False, "awaitingHitl": waiting["awaitingHitl"]},
-        )
-        _save_checkpoint("transform_deploy_waiting", jobId=job_id, **waiting)
-    return out
+    return _execute_transform_poll_once("deploy")
 
 
 def _execute_merge() -> None:
@@ -481,9 +538,14 @@ def read_deploy_checkpoint() -> str:
 
 
 @tool
-def yield_for_orchestrator(reason: str, awaiting_hitl: bool = False, job_id: str = "") -> str:
-    """Pause the judgment step because AWS Transform has a pending human-input task you cannot answer.
-    Set awaiting_hitl=true in that case. Any other yield counts as a failed judgment attempt."""
+def yield_for_orchestrator(reason: str) -> str:
+    """End this judgment turn early, giving the reason you cannot save both judgment artifacts now.
+
+    A yield does not wait for anyone, including a human: it ends the turn and uses one of your
+    at most 3 judgment turns, exactly like ending without both artifacts. The next turn starts on
+    the next orchestration invoke (about a minute later) and the run fails after the third.
+    Never yield to wait for an AWS Transform question or approval.
+    """
     _require_deploy_mode()
     cp = read_checkpoint() or {}
     current_stage = cp.get("stage")
@@ -495,18 +557,15 @@ def yield_for_orchestrator(reason: str, awaiting_hitl: bool = False, job_id: str
     _save_checkpoint(
         "paused",
         reason=reason,
-        awaitingHitl=awaiting_hitl,
-        jobId=job_id or None,
         resumeStage=resume_stage,
-        pendingHumanInput=None,
         # Carry the judgment counters so a pause can never reset the attempt bound.
         judgmentAttempts=int(cp.get("judgmentAttempts") or 0),
-        judgmentHitlYields=int(cp.get("judgmentHitlYields") or 0),
+        lastJudgmentError=cp.get("lastJudgmentError"),
     )
-    base.log_tool_event("tool.yield_for_orchestrator", {"reason": reason, "awaitingHitl": awaiting_hitl})
+    base.log_tool_event("tool.yield_for_orchestrator", {"reason": reason})
     return (
-        f"PAUSED: {reason}. Do not call more tools this turn; reply in one sentence. "
-        f"awaitingHitl={awaiting_hitl}"
+        f"YIELDED: {reason}. This counts as one of your {MAX_JUDGMENT_ATTEMPTS} judgment turns. "
+        "Do not call more tools this turn; reply in one sentence."
     )
 
 
@@ -705,73 +764,77 @@ def _validate_complete() -> dict:
 def _run_judgment(run_model: Callable[[], object], cp: dict) -> dict:
     """One bounded judgment attempt at transform_merged with a judgment artifact missing.
 
-    Always returns: continue after the judgment completes (render/start-deploy run on the next
-    invoke, so no destructive step shares an invoke with a model turn), continue for an accepted
-    HITL yield or an incomplete attempt below the bound, or a named error.
+    Every model turn is an attempt (MAX_JUDGMENT_ATTEMPTS): a turn that ends without both
+    artifacts, a yield_for_orchestrator call, and a turn that raises. A raised turn is audited
+    (tool.deploy_judgment.attempt_failed) and recorded as lastJudgmentError. Always returns:
+    continue after the judgment completes (render/start-deploy run on the next invoke, so no
+    destructive step shares an invoke with a model turn), continue for an attempt below the
+    bound, or a named error (tool.deploy_judgment.failed) that includes the last model error.
     """
     attempts = int(cp.get("judgmentAttempts") or 0)
-    hitl_yields = int(cp.get("judgmentHitlYields") or 0)
+    last_error = cp.get("lastJudgmentError")
     if attempts >= MAX_JUDGMENT_ATTEMPTS:
         # A previous invoke used the last attempt and did not record an outcome (e.g. it died).
         return _named_error(
             "tool.deploy_judgment.failed",
             f"deploy_judgment failed: {attempts} model turns used without both judgment artifacts "
-            f"(limit {MAX_JUDGMENT_ATTEMPTS}); missing {[k for _, k in _judgment_missing()]}",
+            f"(limit {MAX_JUDGMENT_ATTEMPTS}); missing {[k for _, k in _judgment_missing()]}"
+            + _last_error_suffix(last_error),
         )
     attempts += 1
     # Persist before the model runs so a crashed or timed-out turn still counts.
-    _save_checkpoint("transform_merged", judgmentAttempts=attempts, judgmentHitlYields=hitl_yields)
+    _save_checkpoint("transform_merged", judgmentAttempts=attempts, lastJudgmentError=last_error)
     base.log_tool_event("deploy.sequencer.step", {"step": "deploy_judgment", "attempt": attempts})
     try:
         run_model()
-    except Exception as e:  # noqa: BLE001 - surfaced as a named, audited step error
-        return _step_error("deploy_judgment", e)
+    except Exception as e:  # noqa: BLE001 - counted, recorded and audited; fails the run at the bound
+        last_error = f"{type(e).__name__}: {e}"[:_JUDGMENT_ERROR_LIMIT]
+        base.log_tool_event(
+            "tool.deploy_judgment.attempt_failed",
+            {"attempt": attempts, "limit": MAX_JUDGMENT_ATTEMPTS, "error": last_error[:500]},
+        )
+        if attempts >= MAX_JUDGMENT_ATTEMPTS:
+            return _named_error(
+                "tool.deploy_judgment.failed",
+                f"deploy_judgment failed: model turn {attempts} of {MAX_JUDGMENT_ATTEMPTS} raised"
+                + _last_error_suffix(last_error),
+            )
+        _save_checkpoint("transform_merged", judgmentAttempts=attempts, lastJudgmentError=last_error)
+        return _continue(
+            f"deploy_judgment attempt {attempts}/{MAX_JUDGMENT_ATTEMPTS} raised {last_error}; "
+            "the next attempt runs on the next invoke",
+            read_checkpoint() or {},
+        )
 
     missing = _judgment_missing()
     after = read_checkpoint() or {}
     if not missing:
-        _save_checkpoint("judgment_done", judgmentAttempts=attempts, judgmentHitlYields=hitl_yields)
+        _save_checkpoint("judgment_done", judgmentAttempts=attempts)
         base.log_tool_event("tool.deploy_judgment", {"attempts": attempts})
         return _continue(
             "deploy_judgment complete; render and start deploy run on the next invoke",
             read_checkpoint() or {},
         )
 
-    if after.get("stage") == "paused" and after.get("awaitingHitl") is True:
-        hitl_yields += 1
-        if hitl_yields > MAX_JUDGMENT_HITL_YIELDS:
-            return _named_error(
-                "tool.deploy_judgment.failed",
-                f"deploy_judgment failed: model yielded for human input {hitl_yields} times "
-                f"(limit {MAX_JUDGMENT_HITL_YIELDS}) without saving {[k for _, k in missing]}; "
-                f"last reason: {after.get('reason')}",
-            )
-        # An accepted HITL yield is not an incomplete attempt.
-        _save_checkpoint(
-            "paused",
-            reason=after.get("reason"),
-            awaitingHitl=True,
-            jobId=after.get("jobId"),
-            resumeStage="transform_merged",
-            pendingHumanInput=None,
-            judgmentAttempts=attempts - 1,
-            judgmentHitlYields=hitl_yields,
-        )
-        return _continue_from(read_checkpoint() or {})
-
+    # A plain return or a yield (any yield; none waits for a human): counted like any other turn.
+    ended = f"model yielded: {after.get('reason')}" if after.get("stage") == "paused" else "model ended the turn"
     step, key = missing[0]
     if attempts >= MAX_JUDGMENT_ATTEMPTS:
         return _named_error(
             "tool.deploy_judgment.failed",
             f"deploy_judgment failed: judgment step {step} incomplete after {attempts} model turns "
-            f"(limit {MAX_JUDGMENT_ATTEMPTS}): missing {key}",
+            f"(limit {MAX_JUDGMENT_ATTEMPTS}): missing {key}; last turn: {ended}"
+            + _last_error_suffix(last_error),
         )
-    # Plain return or a yield without awaiting_hitl: counted; retry on the next invoke.
-    _save_checkpoint("transform_merged", judgmentAttempts=attempts, judgmentHitlYields=hitl_yields)
+    _save_checkpoint("transform_merged", judgmentAttempts=attempts, lastJudgmentError=last_error)
     return _continue(
-        f"deploy_judgment attempt {attempts}/{MAX_JUDGMENT_ATTEMPTS} incomplete: {step} missing {key}",
+        f"deploy_judgment attempt {attempts}/{MAX_JUDGMENT_ATTEMPTS} incomplete: {step} missing {key} ({ended})",
         read_checkpoint() or {},
     )
+
+
+def _last_error_suffix(last_error: str | None) -> str:
+    return f"; last model error: {last_error}" if last_error else ""
 
 
 def run_deploy_invoke(run_model: Callable[[], object]) -> dict:

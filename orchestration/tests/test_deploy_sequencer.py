@@ -34,6 +34,7 @@ Harness rules:
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -128,7 +129,7 @@ def _install_import_stubs() -> None:
             stdio.StdioServerParameters = StdioServerParameters
             stdio.get_default_environment = _unused
             stdio.stdio_client = _unused
-            streamable.streamablehttp_client = _unused
+            streamable.streamable_http_client = _unused  # mcp 2.x name (agent/tools.aws_docs_tools)
             mcp.client = client
             client.stdio = stdio
             client.streamable_http = streamable
@@ -159,6 +160,12 @@ from lzcore.deploy_artifacts import deployment_artifact_keys  # noqa: E402
 from lzcore.iac_plan import PLAN_TYPE  # noqa: E402
 
 assert tools is sys.modules["tools"], "test must patch the same tools module app imports"
+
+# Contract C7 (stream B2): poll_transform_job(..., messages_cursor=, previous_pending=) returns
+# "messagesCursor". While B2's lzcore change has not landed, each test installs a C7-shaped
+# stand-in for dwt.poll_transform_job (see _c7_poll_transform_job). Once it lands, the real
+# lzcore.deploy_transform.poll_transform_job runs against FakeTransformOps.
+_C7_LANDED = "messages_cursor" in inspect.signature(deploy_transform.poll_transform_job).parameters
 
 
 DEPLOY_RUN = "deployrun00000000000000000000001"
@@ -193,6 +200,7 @@ PENDING = {
     "options": ["Approve", "Reject"],
     "consoleUrl": "https://transform.example.invalid/jobs/job-analyze",
 }
+APP_URL = "https://app.transform.example.invalid/"
 
 
 # --------------------------------------------------------------------------------------
@@ -266,8 +274,10 @@ class FakeTable:
         self.meta = dict(meta)
         self.audit: list[dict] = []
         self.updates: list[dict] = []
+        self.reads: list[bool] = []  # ConsistentRead flag of each get_item, in order
 
-    def get_item(self, Key):
+    def get_item(self, Key, ConsistentRead=False):
+        self.reads.append(bool(ConsistentRead))
         if Key.get("SK") == "META":
             return {"Item": dict(self.meta)}
         return {}
@@ -292,6 +302,8 @@ class FakeTable:
             self.meta["transformDeployJobId"] = vals[":j"]
         if ":w" in vals:
             self.meta["transformWorkspaceId"] = vals[":w"]
+        if ":u" in vals and "transformApplicationUrl" in UpdateExpression:
+            self.meta["transformApplicationUrl"] = vals[":u"]
         return {}
 
     def actions(self):
@@ -301,8 +313,10 @@ class FakeTable:
 class FakeTransformOps:
     """Stand-in for lzcore.transform_ops (installed on deploy_transform and the sequencer).
 
-    poll_script: list of statuses or (status, pendingHumanInput) pairs for successive poll_job
-    calls, shaped per contract C1. Mirrors the real module: CANCELLED/STOPPED raise.
+    poll_script: list of entries for successive poll_job calls: a status, a (status,
+    pendingHumanInput) pair shaped per contract C1, or an Exception instance to raise. Mirrors
+    the real module: CANCELLED/STOPPED raise. poll_job takes the C7 keyword args, records them in
+    poll_calls, and returns messagesCursor "cursor-<n>" for the n-th poll.
     """
 
     class HttpError(Exception):
@@ -312,20 +326,26 @@ class FakeTransformOps:
 
     _TERMINAL_OK = {"COMPLETED", "SUCCEEDED"}
 
-    def __init__(self, poll_script=None, create_error=None, on_create=None, stop_error=None):
+    def __init__(self, poll_script=None, create_error=None, on_create=None, stop_error=None,
+                 application_url=APP_URL):
         self.poll_script = list(poll_script or [])
         self.create_error = create_error
         self.on_create = on_create
         self.stop_error = stop_error
+        self.application_url = application_url
         self.started: list[tuple[str, str]] = []
         self.stopped: list[tuple[str, str]] = []
+        self.poll_calls: list[dict] = []
         self.polls = 0
 
     def workspace_id(self):
         return WORKSPACE
 
     def init_connection(self, preferred_region=None):
-        return {"ok": True, "authMode": "sigv4", "region": "us-east-1"}
+        out = {"ok": True, "authMode": "sigv4", "region": "us-east-1"}
+        if self.application_url is not None:
+            out["applicationUrl"] = self.application_url  # contract C10
+        return out
 
     def start_landing_zone_job(self, *, run_id, phase, prompt):
         if self.create_error is not None:
@@ -336,12 +356,18 @@ class FakeTransformOps:
             self.on_create(phase, job_id)
         return {"workspaceId": WORKSPACE, "jobId": job_id, "jobStatus": "EXECUTING", "init": {}}
 
-    def poll_job(self, job_id, workspace=None):
+    def poll_job(self, job_id, workspace=None, *, messages_cursor=None, previous_pending=None):
         if not self.poll_script:
             raise AssertionError("FakeTransformOps.poll_job called with no scripted status left")
+        self.poll_calls.append(
+            {"jobId": job_id, "workspace": workspace, "messages_cursor": messages_cursor,
+             "previous_pending": previous_pending}
+        )
         entry = self.poll_script.pop(0)
-        status, pending = entry if isinstance(entry, tuple) else (entry, None)
         self.polls += 1
+        if isinstance(entry, Exception):
+            raise entry
+        status, pending = entry if isinstance(entry, tuple) else (entry, None)
         if status in {"STOPPED", "CANCELLED"}:
             raise RuntimeError(f"Transform job {job_id} ended with status {status}")
         return {
@@ -351,6 +377,7 @@ class FakeTransformOps:
             "done": status in self._TERMINAL_OK or status == "FAILED",
             "awaitingHumanApproval": status == "AWAITING_HUMAN_INPUT" or pending is not None,
             "pendingHumanInput": pending,
+            "messagesCursor": f"cursor-{self.polls}",
             "job": {"statusDetails": {"status": status}},
         }
 

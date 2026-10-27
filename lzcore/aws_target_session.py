@@ -3,33 +3,17 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable
+
+from . import arns
+from .arns import RoleArn
 
 _ACCOUNT_RE = re.compile(r"^\d{12}$")
-_PARTITIONS = ("aws", "aws-cn", "aws-us-gov")
-
-
-class RoleArn(NamedTuple):
-    partition: str
-    account_id: str
-    resource: str  # "role/<path/>name"
 
 
 def parse_role_arn(arn: str) -> RoleArn:
-    """Parse arn:<partition>:iam::<account>:role/<path/>name, or raise ValueError naming the problem."""
-    parts = (arn or "").split(":", 5)
-    if len(parts) != 6 or parts[0] != "arn":
-        raise ValueError(f"deployTarget.roleArn {arn!r} is not an ARN (arn:<partition>:iam::<account>:role/<name>)")
-    _, partition, service, region, account_id, resource = parts
-    if partition not in _PARTITIONS:
-        raise ValueError(f"deployTarget.roleArn partition {partition!r} must be one of {list(_PARTITIONS)}")
-    if service != "iam" or region != "":
-        raise ValueError(f"deployTarget.roleArn {arn!r} must be an IAM ARN (arn:<partition>:iam::<account>:role/...)")
-    if not _ACCOUNT_RE.fullmatch(account_id):
-        raise ValueError(f"deployTarget.roleArn account {account_id!r} must be a 12-digit AWS account id")
-    if not resource.startswith("role/") or len(resource) <= len("role/"):
-        raise ValueError(f"deployTarget.roleArn {arn!r} must name an IAM role (resource role/<name>)")
-    return RoleArn(partition, account_id, resource)
+    """Parse a deploy-target role ARN (shared parser, errors labelled deployTarget.roleArn)."""
+    return arns.parse_role_arn(arn, label="deployTarget.roleArn")
 
 
 def _require_role_in_account(role_arn: str, account_id: str) -> RoleArn:

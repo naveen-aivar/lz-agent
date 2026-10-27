@@ -42,7 +42,12 @@ Parameters:
   DeployAssumeRoleArn:
     Type: String
     Default: "arn:aws:iam::*:role/IngramLandingZoneDeploy*"
-    MinLength: 1
+    # An IAM role ARN (account id or *) whose role name starts with literal characters; an optional trailing *
+    # is the only wildcard. Rejects "*", "arn:aws:iam::*:role/*" and "arn:aws:iam::*:role/path/*".
+    AllowedPattern: 'arn:aws[a-z-]*:iam::([0-9]{12}|[*]):role/([A-Za-z0-9+=,.@_-]+/)*[A-Za-z0-9+=,.@_-]+[*]?'
+    ConstraintDescription: >-
+      must be an IAM role ARN such as arn:aws:iam::*:role/IngramLandingZoneDeploy*: account id or *, a role
+      name with a literal prefix, and at most one trailing *. A bare * or a role name of * is not allowed.
     Description: >-
       IAM resource pattern for sts:AssumeRole on cross-account deploy targets (ApiRole for /deploy-target/verify,
       AgentRole for discover/attest). Keep it narrow: name the target role(s), never "*".
@@ -120,8 +125,9 @@ Resources:
             MaxAge: 600
       LifecycleConfiguration:
         Rules:
-          # Backstop only. Deploy-target keys are deleted explicitly (all versions) at DELIVERED, FAILED and /stop;
-          # this catches executions that end without reaching MarkFailed (e.g. the SFN execution timeout).
+          # Backstop only. Deploy-target keys are deleted explicitly (all versions) at DELIVERED, FAILED and /stop,
+          # and DeployExecutionEndedRule covers executions that end without reaching MarkFailed (timeout, abort).
+          # This catches the case where that cleanup also failed (see DeployCleanupDlq).
           - Id: ExpireDeployTargetCredentials
             Status: Enabled
             Prefix: deploy-target-credentials/
@@ -302,6 +308,10 @@ Resources:
               - Effect: Allow
                 Action: ["kms:Decrypt", "kms:GenerateDataKey"]
                 Resource: !GetAtt Key.Arn
+              # PhaseDeployAsyncConfig: a failed async (EventBridge) invoke of phase_deploy_status lands here.
+              - Effect: Allow
+                Action: ["sqs:SendMessage"]
+                Resource: !GetAtt DeployCleanupDlq.Arn
               - Effect: Allow
                 Action: ["bedrock-agentcore:InvokeAgentRuntime"]
                 Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
@@ -681,6 +691,9 @@ Resources:
         Variables:
           STATE_TABLE: !Ref StateTable
           ARTIFACT_BUCKET: !Ref ArtifactBucket
+          # Execution-status events must name this state machine (built from the name: !Ref DeployStateMachine
+          # would be circular, since the state machine references this function).
+          DEPLOY_STATE_MACHINE_ARN: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-deploy"
 
   # ---------- Orchestration ----------
   SfnLogGroup:
@@ -717,6 +730,71 @@ Resources:
         Level: ALL
         IncludeExecutionData: false
         Destinations: [{CloudWatchLogsLogGroup: {LogGroupArn: !GetAtt SfnLogGroup.Arn}}]
+
+  # ---------- Deploy terminal cleanup (contract C11) ----------
+  # Deploy executions that end without reaching MarkFailed (72 h timeout, console/API abort, MarkDelivered or
+  # MarkFailed failing after their retries) still get META marked FAILED and stored target keys deleted by
+  # phase_deploy_status. The normal MarkFailed path and /stop also produce FAILED/ABORTED events: the handler is
+  # idempotent and only re-checks the keys for a run that is already DELIVERED or FAILED.
+  DeployExecutionEndedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-deploy-execution-ended"
+      Description: Deploy execution TIMED_OUT, ABORTED or FAILED -> phase_deploy_status (mark FAILED, delete target keys)
+      State: ENABLED
+      EventPattern:
+        source: [aws.states]
+        detail-type: ["Step Functions Execution Status Change"]
+        detail:
+          stateMachineArn: [!Ref DeployStateMachine]
+          status: [TIMED_OUT, ABORTED, FAILED]
+      Targets:
+        - Id: phase-deploy-status
+          Arn: !GetAtt PhaseDeployFn.Arn
+          RetryPolicy: {MaximumRetryAttempts: 185, MaximumEventAgeInSeconds: 86400}   # delivery retries
+          DeadLetterConfig: {Arn: !GetAtt DeployCleanupDlq.Arn}
+
+  PermDeployExecutionEnded:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref PhaseDeployFn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DeployExecutionEndedRule.Arn
+
+  # EventBridge invokes Lambda asynchronously: after 2 Lambda retries the event goes to the DLQ, never dropped.
+  # A message here means a deploy run may still be RUNNING in META and/or still have stored target keys:
+  # read the run id (execution name) from the message, fix the cause, and delete the keys by hand.
+  PhaseDeployAsyncConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref PhaseDeployFn
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 2
+      MaximumEventAgeInSeconds: 21600
+      DestinationConfig:
+        OnFailure: {Destination: !GetAtt DeployCleanupDlq.Arn}
+
+  DeployCleanupDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-deploy-cleanup-dlq"
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600   # 14 days (the maximum)
+
+  DeployCleanupDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref DeployCleanupDlq]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EventBridgeDeadLetters
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: "sqs:SendMessage"
+            Resource: !GetAtt DeployCleanupDlq.Arn
+            Condition: {ArnEquals: {"aws:SourceArn": !GetAtt DeployExecutionEndedRule.Arn}}
 
   # ---------- API ----------
   Api:
@@ -860,6 +938,9 @@ Outputs:
   UserPoolClientId: {Value: !Ref UserPoolClient}
   CognitoDomain: {Value: !Sub "${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"}
   AgentRepoUri: {Value: !GetAtt AgentRepo.RepositoryUri}
+  DeployCleanupDlqUrl:
+    Description: Failed deploy terminal-cleanup events (runs possibly still RUNNING or holding target keys). Should stay empty.
+    Value: !Ref DeployCleanupDlq
   AgentRuntimeArnInUse:
     Value:
       !If

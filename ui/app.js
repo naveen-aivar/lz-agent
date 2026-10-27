@@ -342,16 +342,14 @@ function deployStepsHtml(run, audit) {
   }).join("")}</div>`;
 }
 
-function deployContinueNotice(audit, run) {
+function deployContinueNotice(audit) {
   const lastCont = [...audit].reverse().find((a) => a.action === "phase.continue");
   const lastYield = [...audit].reverse().find((a) => a.action === "tool.yield_for_orchestrator");
   const d = lastCont ? parseAuditDetail(lastCont) : {};
   const reason = String(d.reason || (lastYield ? parseAuditDetail(lastYield).reason : "") || "").trim();
   if (!lastCont && !reason) return "";
-  const targetAcct = run && run.deployTarget && run.deployTarget.accountId;
-  if (/^Pre-discover failed for deploy target account/i.test(reason)) {
-    return `<div class="notice notice-warn" role="status"><strong>Deploy paused (target discover).</strong> ${esc(reason.length > 480 ? reason.slice(0, 480) + "…" : reason)}<br><span class="hint">Fix the issue in ${targetAcct ? `account ${esc(targetAcct)}` : "the target account"}, then start a new deploy run.</span></div>`;
-  }
+  // A pre-discover failure ("run_pre_discover failed: deploy target account …") is a step error: the run goes
+  // FAILED and the failure banner shows it. It never arrives as a phase.continue reason.
   const platformBlock =
     /permission|IAM|AccessDenied|not authorized|s3:|organization|create-organization|platform account|run_pre_discover|NotInUse/i.test(
       reason
@@ -423,7 +421,7 @@ function renderDeployRun() {
   layout("runs", `${name} deploy`, `<div class="crumbs"><a href="#/runs">← Runs</a></div>
     <div class="page-title" style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">${esc(name)} ${runTypeBadge(run)} ${stateBadge(run)} ${stopRunButton(run)}</div>
     <p class="page-sub" style="margin-bottom:18px">Started ${esc(when(run.createdAt))} · Deploy run <code>${esc(run.runId.slice(0, 8))}</code>${designLink}</p>
-    ${failure}${credentialsCleanupNotice(run)}${humanInputBanner(run) || deployContinueNotice(audit, run)}
+    ${failure}${credentialsCleanupNotice(run)}${humanInputBanner(run) || deployContinueNotice(audit)}
     <div class="grid-3"><div class="card"><div class="card-head"><h2>Progress</h2></div>${deployStepsHtml(run, audit)}</div>${deployDeliverables(run)}</div>
     ${body}`);
   if (S.tab === "organization" && diagram) drawDiagram(diagram);

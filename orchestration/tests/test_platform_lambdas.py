@@ -59,9 +59,12 @@ class FakeTable:
             assert m, f"fake supports only 'a = :v' conditions, got {ConditionExpression!r}"
             if item.get(names.get(m.group(1), m.group(1))) != values[m.group(2)]:
                 raise ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": "x"}}, "UpdateItem")
-        set_part, _, remove_part = UpdateExpression.partition(" REMOVE ")
-        assert set_part.startswith("SET "), UpdateExpression
-        for assignment in set_part[4:].split(", "):
+        if UpdateExpression.startswith("REMOVE "):
+            set_part, remove_part = "", UpdateExpression[len("REMOVE "):]
+        else:
+            set_part, _, remove_part = UpdateExpression.partition(" REMOVE ")
+            assert set_part.startswith("SET "), UpdateExpression
+        for assignment in filter(None, set_part[4:].split(", ")):
             name, val = (s.strip() for s in assignment.split(" = "))
             item[names.get(name, name)] = copy.deepcopy(values[val])
         for name in filter(None, (s.strip() for s in remove_part.split(","))):

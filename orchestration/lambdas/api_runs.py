@@ -41,6 +41,11 @@ class BadRequest(ValueError):
     pass
 
 
+class DeployStartFailed(RuntimeError):
+    """Deploy start failed and deleting the just-stored target keys failed too. The message names both
+    errors; __cause__ is the original start error (the same on python3.9 and the 3.12 Lambda runtime)."""
+
+
 def _resp(code, body):
     return {"statusCode": code, "headers": {"content-type": "application/json"}, "body": json.dumps(body, default=str)}
 
@@ -222,10 +227,20 @@ def _deploy(design_run_id, sub, event, invoked_by):
             name=deploy_id,
             input=json.dumps({"runId": deploy_id, "progressCount": 0, "hitlCount": 0}),
         )
-    except Exception:
+    except Exception as start_error:
         # Nothing will ever run for these keys: remove them before surfacing the original error.
         if deploy_target and deploy_target.get("mode") == "keys":
-            delete_deploy_target_credentials(s3(), ARTIFACT_BUCKET, deploy_target["credentialsKey"])
+            key = deploy_target["credentialsKey"]
+            try:
+                delete_deploy_target_credentials(s3(), ARTIFACT_BUCKET, key)
+            except Exception as delete_error:
+                # Never let the cleanup failure hide why the deploy did not start: name both, chain the original.
+                raise DeployStartFailed(
+                    f"starting deploy run {deploy_id} failed: {type(start_error).__name__}: {start_error}. "
+                    f"Deleting its stored deploy-target credentials s3://{ARTIFACT_BUCKET}/{key} also failed: "
+                    f"{type(delete_error).__name__}: {delete_error}. Delete every version of that object by hand "
+                    "and rotate the access key."
+                ) from start_error
         raise
     table().update_item(
         Key={"PK": f"RUN#{deploy_id}", "SK": "META"},
@@ -287,6 +302,7 @@ def _stop(run_id, sub, invoked_by):
     if run.get("status") != "RUNNING":
         return _resp(409, {"error": f"run is {run.get('status')}; only RUNNING runs can be stopped"})
     arn = (run.get("executionArn") or "").strip()
+    stopped_execution = False
     if arn:
         try:
             sfn.stop_execution(
@@ -294,10 +310,12 @@ def _stop(run_id, sub, invoked_by):
                 error="UserStopped",
                 cause="Stopped by user from UI",
             )
+            stopped_execution = True
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
             if code not in ("ExecutionDoesNotExist", "ExecutionAlreadyCompleted"):
                 raise
+    recheck = False
     try:
         table().update_item(
             Key={"PK": f"RUN#{run_id}", "SK": "META"},
@@ -307,12 +325,17 @@ def _stop(run_id, sub, invoked_by):
             ExpressionAttributeValues={":f": "FAILED", ":r": "RUNNING", ":msg": "Stopped by user.", ":no": False},
         )
     except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        # The ABORTED execution event (phase_deploy_status, contract C11) can mark the run FAILED between our
+        # StopExecution and this write. The stop is still ours: record it and re-check cleanup.
+        run = get_run(run_id) or {}
+        if not (stopped_execution and run.get("status") == "FAILED"):
             return _resp(409, {"error": "run is no longer RUNNING"})
-        raise
+        recheck = True
     audit(run_id, sub, "run.stopped", {"invokedBy": invoked_by})
     try:
-        delete_run_credentials(run, sub)
+        delete_run_credentials(run, sub, recheck=recheck)
     except Exception as e:
         return _resp(500, {"runId": run_id, "status": "FAILED",
                            "error": f"run stopped, but deleting stored deploy-target credentials failed: {str(e)[:300]}"})

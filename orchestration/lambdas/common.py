@@ -75,28 +75,41 @@ def sha256_s3(key: str) -> str:
     return h.hexdigest()
 
 
-def delete_run_credentials(run: dict, actor: str):
+def delete_run_credentials(run: dict, actor: str, *, recheck: bool = False):
     """Delete a deploy run's stored key-mode credentials (every S3 version). Returns the number removed, or
-    None when the run has no stored keys. Audits success. On failure: records META.credentialsCleanupError,
-    audits deploy.target_credentials_delete_failed, and re-raises (never swallowed)."""
+    None when the run has no stored keys. On failure: records META.credentialsCleanupError, audits
+    deploy.target_credentials_delete_failed, and re-raises (never swallowed).
+
+    First cleanup (recheck=False): always audits deploy.target_credentials_deleted with the count.
+    Re-check of an already terminal run (recheck=True, contract C11): audits only when it removed something or
+    cleared an earlier META.credentialsCleanupError, so repeated terminal signals do not add noise.
+    A successful delete removes a stale META.credentialsCleanupError (the UI shows it as an error banner)."""
     from lzcore.deploy_target_api import delete_deploy_target_credentials
 
     dt = run.get("deployTarget") or {}
     if dt.get("mode") != "keys":
         return None
     run_id = run["runId"]
+    key = {"PK": f"RUN#{run_id}", "SK": "META"}
     try:
         removed = delete_deploy_target_credentials(s3(), ARTIFACT_BUCKET, dt["credentialsKey"])
     except Exception as e:
         msg = f"deleting stored deploy-target credentials failed: {str(e)[:400]}"
         table().update_item(
-            Key={"PK": f"RUN#{run_id}", "SK": "META"},
+            Key=key,
             UpdateExpression="SET credentialsCleanupError = :m",
             ExpressionAttributeValues={":m": msg},
         )
         audit(run_id, actor, "deploy.target_credentials_delete_failed", {"error": msg})
         raise
-    audit(run_id, actor, "deploy.target_credentials_deleted", {"versionsDeleted": removed})
+    cleared = bool(run.get("credentialsCleanupError"))
+    if cleared:
+        table().update_item(Key=key, UpdateExpression="REMOVE credentialsCleanupError")
+    if not recheck or removed or cleared:
+        detail = {"versionsDeleted": removed}
+        if cleared:
+            detail["clearedError"] = run["credentialsCleanupError"]
+        audit(run_id, actor, "deploy.target_credentials_deleted", detail)
     return removed
 
 

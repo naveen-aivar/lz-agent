@@ -40,7 +40,10 @@ API creates deploy run (runKind=deploy, links designRunId)
           (the question is shown in the UI: "AWS Transform needs your input")
   → on agent ok: attestation in phase_invoke (deployment-report.json, rule-based pass/fail)
   → phase_deploy → DELIVERED or FAILED (stored target keys deleted; /stop deletes them too)
+     (retried 3 times; an execution that times out, is aborted or fails there is cleaned up by an EventBridge rule)
 ```
+
+The deploy agent's model gets only read-only Transform MCP tools (`get_resource`, `list_resources`, `get_status`, `load_instructions`); every Transform job start and stop is done by the deterministic sequencer. Transform MCP startup is preflighted (credential helper, then `get_status` must report SigV4 connected). See `docs/deployment-agent-transform.md`.
 
 Details: [docs/deployment-agent-transform.md](docs/deployment-agent-transform.md), [docs/cross-account-deploy.md](docs/cross-account-deploy.md) and [docs/deployment-agent-scope.md](docs/deployment-agent-scope.md).
 
@@ -113,7 +116,7 @@ Optional deploy-time variables: `TRANSFORM_ROLE_ARN` (+ `TRANSFORM_EXTERNAL_ID`,
 
 Pass 2 creates the AgentCore runtime. **Design** (`POST /runs/{id}/start`) and **deploy** (`POST /runs/{designId}/deploy`) both call that runtime; pass 1 alone is not enough for agent phases.
 
-Create Cognito users. Any signed-in user can start a run, and each user sees only their own runs. Design runs ship generated code to the customer; deploy runs use AWS Transform in the platform account (see `docs/deployment-agent-scope.md`).
+Create Cognito users. Any signed-in user can start a run, and each user sees only their own runs. Design runs ship generated code to the customer; deploy runs use AWS Transform in the account of `TransformRoleArn` (the platform account when it is empty), which must share the target's AWS Organization (see `docs/deployment-agent-scope.md` and `docs/deployment-agent-transform.md`).
 
 ## Tests
 ```

@@ -24,10 +24,13 @@ from __future__ import annotations
 import datetime
 import os
 import threading
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import boto3
 from botocore.credentials import RefreshableCredentials
+
+from lzcore import arns
+from lzcore.arns import RoleArn
 
 STABLE_SESSION_NAME = "ingram-lz-agent"
 ASSUME_DURATION_SECONDS = 3600
@@ -39,12 +42,6 @@ _CREDENTIAL_METHOD = "ingram-transform-assume-role"
 _BASE_SESSION: Optional[boto3.Session] = None
 _lock = threading.Lock()
 _refreshable: dict = {}
-
-
-class RoleArnParts(NamedTuple):
-    partition: str
-    account_id: str
-    role_name: str
 
 
 def transform_role_arn() -> str:
@@ -62,22 +59,9 @@ def transform_external_id() -> Optional[str]:
     return value or None
 
 
-def parse_role_arn(arn: str) -> RoleArnParts:
-    """Parse ``arn:<partition>:iam::<account>:role[/<path>]/<name>``; raise on anything else."""
-    parts = arn.split(":", 5)
-    if len(parts) != 6 or parts[0] != "arn" or not parts[1]:
-        raise ValueError(f"TRANSFORM_ROLE_ARN {arn!r} is not an ARN (expected arn:<partition>:iam::<account>:role/<name>)")
-    _, partition, service, region, account_id, resource = parts
-    if service != "iam" or region:
-        raise ValueError(f"TRANSFORM_ROLE_ARN {arn!r} is not an IAM ARN (service must be iam, region empty)")
-    if len(account_id) != 12 or not account_id.isdigit():
-        raise ValueError(f"TRANSFORM_ROLE_ARN {arn!r} has an invalid account id {account_id!r}")
-    if not resource.startswith("role/"):
-        raise ValueError(f"TRANSFORM_ROLE_ARN {arn!r} is not an IAM role ARN (resource must start with role/)")
-    role_name = resource.rsplit("/", 1)[-1]
-    if not role_name:
-        raise ValueError(f"TRANSFORM_ROLE_ARN {arn!r} has an empty role name")
-    return RoleArnParts(partition, account_id, role_name)
+def parse_role_arn(arn: str) -> RoleArn:
+    """Parse TRANSFORM_ROLE_ARN (shared parser, errors labelled TRANSFORM_ROLE_ARN)."""
+    return arns.parse_role_arn(arn, label="TRANSFORM_ROLE_ARN")
 
 
 def transform_principal_arn() -> str:

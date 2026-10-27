@@ -1,5 +1,5 @@
 {
-  "Comment": "Deploy agent loop with two budgets. phase_invoke counts cycles: progressCount (awaitingHitl=false, 60 s waits, limit 240 = about 4 h of polling) and hitlCount (awaitingHitl=true, 60 s waits, limit 1440 = about 24 h waiting on a human in AWS Transform). History: each cycle is Task (5 events) + Choice (2) + Wait (2) = 9 events; worst case (240 + 1440) cycles x 9 = 15,120 events plus about 10 start/end events, well under the 25,000-event limit. Wall time: 1680 cycles x (60 s + invoke time) is about 42 h at 30 s per invoke, inside the 72 h execution timeout. Attestation runs inside phase_invoke when the agent returns ok; MarkDelivered/MarkFailed update DynamoDB and delete deploy-target keys.",
+  "Comment": "Deploy agent loop with two budgets. phase_invoke counts cycles: progressCount (awaitingHitl=false, 60 s waits, limit 240 = about 4 h of polling) and hitlCount (awaitingHitl=true, 60 s waits, limit 1440 = about 24 h waiting on a human in AWS Transform). History: each cycle is Task (5 events) + Choice (2) + Wait (2) = 9 events; worst case (240 + 1440) cycles x 9 = 15,120 events, plus the terminal path (Pass 2 + MarkFailed 5 + up to 3 retries x 3 events + Fail 1 = 17) and about 5 start/end events, about 15,142 in total, well under the 25,000-event limit. Wall time: 1680 cycles x (60 s + invoke time) is about 42 h at 30 s per invoke, inside the 72 h execution timeout; the terminal retries add at most 4 x 120 s Lambda timeouts + 14 s of backoff. Attestation runs inside phase_invoke when the agent returns ok; MarkDelivered/MarkFailed update DynamoDB and delete deploy-target keys (phase_deploy_status is idempotent, so a retry after a partial success only re-checks the keys). Executions that end without reaching MarkFailed (timeout, abort, a terminal task failing after its retries) are cleaned up by the EventBridge rule DeployExecutionEndedRule (infra/platform/platform.yaml).",
   "TimeoutSeconds": 259200,
   "StartAt": "RunDeployAgent",
   "States": {
@@ -50,6 +50,19 @@
         "FunctionName": "${PhaseDeployArn}",
         "Payload": {"runId.$": "$.runId", "status": "DELIVERED"}
       },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.SdkClientException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "MaxAttempts": 3
+        }
+      ],
       "ResultPath": null,
       "End": true
     },
@@ -82,6 +95,19 @@
         "FunctionName": "${PhaseDeployArn}",
         "Payload": {"runId.$": "$.runId", "status": "FAILED", "error.$": "$.error"}
       },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.SdkClientException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "MaxAttempts": 3
+        }
+      ],
       "ResultPath": null,
       "Next": "Failed"
     },

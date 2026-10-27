@@ -5,6 +5,7 @@ import json
 import os
 import time
 import uuid
+from contextlib import contextmanager
 
 import boto3
 from strands import tool
@@ -332,11 +333,18 @@ def save_iac_change_plan(plan_json: str) -> str:
 
 
 def deploy_tools():
-    """Platform tools for the deploy judgment agent (app.py adds AWS docs + Transform MCP).
+    """Platform tools for the deploy judgment agent.
 
     Judgment tools only. The mechanical workflow steps (discover, Transform start/poll, merge,
     render, post-discover, finish) belong to the deterministic sequencer and are never given to
-    the model, so it cannot start a Transform job or run steps out of order or concurrently.
+    the model, so it cannot run them out of order or concurrently.
+
+    app.py adds the AWS Knowledge MCP documentation tools and the read-only Transform MCP tools:
+    transform_mcp.transform_tools() yields only ALLOWED_TRANSFORM_MCP_TOOLS (get_resource,
+    list_resources, get_status, load_instructions; contract C8), and app.py refuses any other
+    Transform MCP tool name. The model therefore holds no tool that creates, starts, stops or
+    deletes a Transform job, sends a Transform chat message, or completes a Transform task. That
+    rests on the tool surface: the runtime role's IAM policy still allows those Transform actions.
     """
     from deploy_workflow_tools import yield_for_orchestrator  # deferred: that module imports this one
 
@@ -353,24 +361,39 @@ def deploy_tools():
 AWS_KNOWLEDGE_MCP_URL = "https://knowledge-mcp.global.api.aws"
 
 
+@contextmanager
 def aws_docs_tools():
-    """AWS Knowledge MCP tools (remote, no AWS credentials needed).
+    """AWS Knowledge MCP tools (remote, no AWS credentials needed) for the life of the `with` block.
 
     Raises when the server cannot be reached or returns no tools: an agent silently running
-    without its documentation tools would answer from memory instead.
+    without its documentation tools would answer from memory instead. The MCP client is stopped
+    when the block exits, on success and on error.
+
+    The transport is mcp's `streamable_http_client`: awslabs.aws-transform-mcp-server 0.2.3
+    requires mcp>=2, and mcp 2.x no longer has the 1.x name `streamablehttp_client`.
     """
-    from mcp.client.streamable_http import streamablehttp_client
+    from mcp.client.streamable_http import streamable_http_client
     from strands.tools.mcp import MCPClient
 
     try:
-        client = MCPClient(lambda: streamablehttp_client(AWS_KNOWLEDGE_MCP_URL))
+        client = MCPClient(lambda: streamable_http_client(AWS_KNOWLEDGE_MCP_URL))
         client.start()
-        loaded = client.list_tools_sync()
     except Exception as e:
-        raise RuntimeError(
-            f"AWS Knowledge MCP at {AWS_KNOWLEDGE_MCP_URL} is unreachable: {e}. The AgentCore runtime needs "
-            "outbound HTTPS to that endpoint (NetworkMode PUBLIC)."
-        ) from e
-    if not loaded:
-        raise RuntimeError(f"AWS Knowledge MCP at {AWS_KNOWLEDGE_MCP_URL} returned no tools")
-    return loaded
+        raise _docs_unreachable(e) from e
+    try:
+        try:
+            loaded = client.list_tools_sync()
+        except Exception as e:
+            raise _docs_unreachable(e) from e
+        if not loaded:
+            raise RuntimeError(f"AWS Knowledge MCP at {AWS_KNOWLEDGE_MCP_URL} returned no tools")
+        yield loaded
+    finally:
+        client.stop(None, None, None)
+
+
+def _docs_unreachable(cause: Exception) -> RuntimeError:
+    return RuntimeError(
+        f"AWS Knowledge MCP at {AWS_KNOWLEDGE_MCP_URL} is unreachable: {cause}. The AgentCore runtime needs "
+        "outbound HTTPS to that endpoint (NetworkMode PUBLIC)."
+    )

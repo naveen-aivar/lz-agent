@@ -7,6 +7,8 @@ follows contract C3:
 This handler mirrors the pending question into META.pendingHumanInput (removed once a later result is not
 awaiting), audits it, and counts cycles for the state machine's two budgets: progressCount (awaitingHitl
 false) and hitlCount (awaitingHitl true). The state machine compares the counts with its limits.
+The META writes are conditional on status RUNNING: a run stopped while the invoke was in flight raises
+RunNotRunning instead of getting HITL state written onto it.
 """
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ import os
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from common import audit, get_run, record_artifact, table
 from phase_attest import handler as attest_handler
@@ -109,19 +112,41 @@ def _pending_summary(pending: dict | None, awaiting: bool) -> str:
     return "none"
 
 
+class RunNotRunning(RuntimeError):
+    """META.status left RUNNING while this invoke was in flight (normally /stop). Raised instead of writing
+    HITL state onto a stopped run. If the execution is still alive, RunDeployAgent's Catch sends it to
+    MarkFailed, which finds the run already FAILED and only re-checks key cleanup (contract C11)."""
+
+
+def _update_running_meta(run_id: str, update_expression: str, values: dict) -> None:
+    """META update that applies only while the run is RUNNING (m7)."""
+    try:
+        table().update_item(
+            Key={"PK": f"RUN#{run_id}", "SK": "META"},
+            UpdateExpression=update_expression,
+            ConditionExpression="#s = :running",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={**values, ":running": "RUNNING"},
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+        current = (get_run(run_id) or {}).get("status")
+        raise RunNotRunning(
+            f"deploy run {run_id} is {current!r}, not RUNNING (stopped while this invoke was in flight); "
+            "the Transform human-input state was not recorded"
+        ) from e
+
+
 def _sync_pending_human_input(run_id: str, phase: str, awaiting: bool, job_id, pending: dict | None) -> None:
-    """Mirror the Transform question into META; audit when it appears, changes, or is resolved."""
+    """Mirror the Transform question into META; audit when it appears, changes, or is resolved.
+    Writes only while META.status is RUNNING; otherwise raises RunNotRunning before any audit."""
     run = get_run(run_id)
     if not run:
         raise RuntimeError(f"deploy run {run_id} META not found while recording the continue result")
     previous = run.get("pendingHumanInput")
-    key = {"PK": f"RUN#{run_id}", "SK": "META"}
     if awaiting and pending is not None:
-        table().update_item(
-            Key=key,
-            UpdateExpression="SET pendingHumanInput = :p, awaitingHitl = :t",
-            ExpressionAttributeValues={":p": pending, ":t": True},
-        )
+        _update_running_meta(run_id, "SET pendingHumanInput = :p, awaitingHitl = :t", {":p": pending, ":t": True})
         if previous != pending:
             audit(
                 run_id,
@@ -139,11 +164,7 @@ def _sync_pending_human_input(run_id: str, phase: str, awaiting: bool, job_id, p
                 },
             )
         return
-    table().update_item(
-        Key=key,
-        UpdateExpression="SET awaitingHitl = :a REMOVE pendingHumanInput",
-        ExpressionAttributeValues={":a": awaiting},
-    )
+    _update_running_meta(run_id, "SET awaitingHitl = :a REMOVE pendingHumanInput", {":a": awaiting})
     if awaiting and run.get("awaitingHitl") is not True:
         # AWAITING_HUMAN_INPUT status without question details (C1 allows it): audit the wait itself.
         audit(run_id, "system", "phase.awaiting_human", {"phase": phase, "jobId": job_id, "title": None,
