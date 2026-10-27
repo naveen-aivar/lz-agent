@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import json
 import uuid
 from typing import Any, Optional
 
@@ -41,26 +42,31 @@ try:
         is_fes_available,
         set_sigv4_fes_available,
         set_sigv4_region,
-        set_sigv4_regions,
     )
-    from awslabs.aws_transform_mcp_server.consts import (
-        FES_REGIONS,
-        MAX_RETRIES,
-        PROFILE_DISCOVERY_TIMEOUT_SECONDS,
-        TIMEOUT_SECONDS,
-    )
+    from awslabs.aws_transform_mcp_server.consts import FES_REGIONS, MAX_RETRIES, TIMEOUT_SECONDS
     from awslabs.aws_transform_mcp_server.tcp_client import call_tcp
+    from awslabs.aws_transform_mcp_server.hitl_schemas import format_and_validate
+    from awslabs.aws_transform_mcp_server.tools.hitl import download_agent_artifact
     from awslabs.aws_transform_mcp_server.tools.job_status import _ACTIONABLE_HITL_STATUSES
+    from awslabs.aws_transform_mcp_server.upload_helper import upload_json_artifact
     from awslabs.aws_transform_mcp_server.transform_api_client import (
         call_fes_direct_sigv4,
         call_transform_api,
     )
     from awslabs.aws_transform_mcp_server.transform_api_models import (
+        AccountConnectionRequest,
+        AwsAccountConnectionRequest,
         BatchGetMessageRequest,
         ChatJobMetadata,
+        CreateConnectorRequest,
         CreateJobRequest,
+        GetConnectorRequest,
+        GetHitlTaskRequest,
         GetJobRequest,
+        HitlTaskArtifact,
         HitlTaskFilter,
+        SubmitCriticalHitlTaskRequest,
+        SubmitStandardHitlTaskRequest,
         ListHitlTasksRequest,
         ListMessagesRequest,
         Metadata,
@@ -234,67 +240,45 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-async def _discover_sigv4_regions() -> tuple[list[str], dict[str, Exception]]:
-    """Probe every FES region. Return (successful regions, {region: error}).
+def transform_region() -> str:
+    """AWS Transform region of the profile and workspace (TRANSFORM_REGION). Required, no default.
 
-    Per-region errors are collected (not dropped) so init_connection can report why no
-    region succeeded instead of a generic "probe failed".
+    A Transform account can have a profile in more than one region (each with its own tenant and
+    workspaces), so the region is configuration, never discovered or guessed.
     """
-    async def _call_region(region: str) -> tuple[str, Optional[Exception]]:
-        try:
-            endpoint = derive_transform_api_endpoint(region)
-            await asyncio.wait_for(
-                call_fes_direct_sigv4(
-                    endpoint,
-                    "ListWorkspaces",
-                    {},
-                    timeout_seconds=PROFILE_DISCOVERY_TIMEOUT_SECONDS,
-                    max_retries=0,
-                    region=region,
-                ),
-                timeout=PROFILE_DISCOVERY_TIMEOUT_SECONDS + 2,
-            )
-            return region, None
-        except Exception as exc:  # noqa: BLE001 - error retained for diagnostics
-            return region, exc
-
-    results = await asyncio.gather(*[_call_region(r) for r in FES_REGIONS])
-    ok = [region for region, err in results if err is None]
-    errors = {region: err for region, err in results if err is not None}
-    return ok, errors
-
-
-def init_connection(preferred_region: Optional[str] = None) -> dict[str, Any]:
-    """Probe SigV4 Transform access (same as MCP server startup)."""
-    require_workspace_id()
     _require_library()
-    region = preferred_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    region = os.environ.get("TRANSFORM_REGION", "").strip()
+    if not region:
+        raise RuntimeError(
+            "TRANSFORM_REGION is not set: the AWS Transform region of the profile that owns "
+            "TRANSFORM_WORKSPACE_ID (TransformRegion stack parameter)"
+        )
+    if region not in FES_REGIONS:
+        raise RuntimeError(f"TRANSFORM_REGION {region!r} is not an AWS Transform region; expected one of {list(FES_REGIONS)}")
+    return region
+
+
+def init_connection() -> dict[str, Any]:
+    """Probe SigV4 Transform access in TRANSFORM_REGION (ListWorkspaces) and select that region."""
+    require_workspace_id()
+    region = transform_region()
 
     async def _probe():
-        if is_fes_available():
+        if is_fes_available() and get_sigv4_region() == region:
             return {"ok": True, "authMode": "configured", "region": region}
-        regions, region_errors = await _discover_sigv4_regions()
-        if not regions:
+        try:
+            await call_fes_direct_sigv4(derive_transform_api_endpoint(region), "ListWorkspaces", {}, region=region)
+        except Exception as exc:
             set_sigv4_fes_available(False)
-            forbidden = next(
-                (err for err in region_errors.values() if _is_403(err)), None
-            )
-            if forbidden is not None:
-                raise _access_denied("ListWorkspaces", forbidden) from forbidden
-            causes = "; ".join(f"{r}: {e}" for r, e in region_errors.items()) or "no regions probed"
+            if _is_403(exc):
+                raise _access_denied("ListWorkspaces", exc) from exc
             raise RuntimeError(
-                "Transform SigV4 probe failed: enable Transform for this account/role in "
-                f"the console. Per-region causes: {causes}"
-            )
-        if len(regions) == 1:
-            set_sigv4_region(regions[0])
-            set_sigv4_fes_available(True)
-            return {"ok": True, "authMode": "sigv4", "region": regions[0]}
-        pick = region if region in regions else regions[0]
-        set_sigv4_region(pick)
-        set_sigv4_regions(regions)
+                f"Transform SigV4 probe failed in {region} (TRANSFORM_REGION): {exc}. Enable AWS Transform "
+                "with IAM access in that region for the Transform account."
+            ) from exc
+        set_sigv4_region(region)
         set_sigv4_fes_available(True)
-        return {"ok": True, "authMode": "sigv4", "region": pick, "availableRegions": regions}
+        return {"ok": True, "authMode": "sigv4", "region": region}
 
     return _run(_probe())
 
@@ -441,9 +425,15 @@ async def _list_pages(operation: str, make_request, items_key: str) -> list:
     token = None
     for _ in range(_MAX_PAGES):
         resp = await _call(operation, make_request(token))
-        if not isinstance(resp, dict) or not isinstance(resp.get(items_key), list):
-            raise RuntimeError(f"Transform {operation} returned no '{items_key}' list: {resp!r}")
-        items.extend(resp[items_key])
+        if not isinstance(resp, dict):
+            raise RuntimeError(f"Transform {operation} returned a non-object response: {resp!r}")
+        # The service model marks hitlTasks/messageIds optional: the service omits the key when the list
+        # is empty (observed live: ListHitlTasks -> {} on a new job). Absent means empty; any other type
+        # is malformed and fails loudly.
+        page = resp.get(items_key, [])
+        if not isinstance(page, list):
+            raise RuntimeError(f"Transform {operation} returned a non-list '{items_key}': {resp!r}")
+        items.extend(page)
         token = resp.get("nextToken")
         if not token:
             return items
@@ -502,10 +492,10 @@ def _by_created(items: list[dict], id_key: str, what: str) -> list[dict]:
     return sorted(items, key=lambda i: (i["createdAt"], str(i.get(id_key))))
 
 
-def _select_labels(interactions: Any, message_id: str) -> list[str]:
-    """Labels of selectable options: interactions[].data.selectInteractionData.options[].label
-    (group interactions' children included)."""
-    labels: list[str] = []
+def _select_choices(interactions: Any, message_id: str) -> list[dict]:
+    """Selectable options as [{label, value}]: interactions[].data.selectInteractionData.options[]
+    (group interactions' children included). value is None when Transform sent none."""
+    choices: list[dict] = []
     for interaction in interactions or []:
         if not isinstance(interaction, dict):
             raise RuntimeError(f"Transform message {message_id} has a malformed interaction: {interaction!r}")
@@ -514,9 +504,16 @@ def _select_labels(interactions: Any, message_id: str) -> list[str]:
             label = option.get("label") if isinstance(option, dict) else None
             if not isinstance(label, str) or not label.strip():
                 raise RuntimeError(f"Transform message {message_id} has a select option without a label: {option!r}")
-            labels.append(label)
-        labels.extend(_select_labels((data.get("groupInteractionData") or {}).get("children"), message_id))
-    return labels
+            value = option.get("value")
+            if value is not None and not isinstance(value, str):
+                raise RuntimeError(f"Transform message {message_id} has a select option with a non-string value: {option!r}")
+            choices.append({"label": label, "value": value})
+        choices.extend(_select_choices((data.get("groupInteractionData") or {}).get("children"), message_id))
+    return choices
+
+
+def _select_labels(interactions: Any, message_id: str) -> list[str]:
+    return [c["label"] for c in _select_choices(interactions, message_id)]
 
 
 async def _application_url() -> str:
@@ -533,11 +530,13 @@ async def _application_url() -> str:
         raise
     except Exception as exc:
         raise RuntimeError(f"Transform ListProfiles failed in {region}; cannot build the console URL: {exc}") from exc
-    if not isinstance(resp, dict) or not isinstance(resp.get("profiles"), list):
-        raise RuntimeError(f"Transform ListProfiles in {region} returned no 'profiles' list: {resp!r}")
-    if resp.get("nextToken"):
+    # Live TCP ListProfiles shape (verified 2026-10-27): {"Profiles": [{"ProfileName", "accountId",
+    # "applicationUrl", "arn", "status", ...}]}. Only profiles of this region are returned.
+    if not isinstance(resp, dict) or not isinstance(resp.get("Profiles"), list):
+        raise RuntimeError(f"Transform ListProfiles in {region} returned no 'Profiles' list: {resp!r}")
+    if resp.get("NextToken") or resp.get("nextToken"):
         raise RuntimeError(f"Transform ListProfiles in {region} returned more than one page; cannot pick a profile")
-    urls = sorted({p["applicationUrl"] for p in resp["profiles"] if isinstance(p, dict) and p.get("applicationUrl")})
+    urls = sorted({p["applicationUrl"] for p in resp["Profiles"] if isinstance(p, dict) and p.get("applicationUrl")})
     if len(urls) != 1:
         raise RuntimeError(
             f"Transform ListProfiles in {region} returned {len(urls)} profile applicationUrls {urls}; expected exactly one"
@@ -550,9 +549,11 @@ def console_url(application_url: str, ws: str, job_id: str) -> str:
     return f"{application_url.rstrip('/')}/workspaces/{ws}/jobs/{job_id}"
 
 
-async def _pending_human_input(ws: str, job_id: str) -> Optional[dict]:
+async def _pending_human_input(ws: str, job_id: str, free_text: bool = False) -> Optional[dict]:
     """C1: (a) an actionable NORMAL HITL task, else (b) a newest non-USER message with
-    selectable interactions. None when neither holds."""
+    selectable interactions, else (c) when ``free_text`` (the job reports AWAITING_HUMAN_INPUT),
+    or the newest non-USER message is a FINAL_RESPONSE (Transform ended its turn), that message as a
+    free-text question (options []). None when none holds."""
     tasks = await _actionable_tasks(ws, job_id)
     if tasks:
         task = _by_created(tasks, "taskId", "HITL task")[0]  # oldest outstanding task first
@@ -565,9 +566,11 @@ async def _pending_human_input(ws: str, job_id: str) -> Optional[dict]:
             "workspaceId": ws,
             "kind": "task",
             "taskId": task["taskId"],
+            "messageId": None,
             "title": title,
             "text": (task.get("description") or "")[:PENDING_TEXT_LIMIT],
             "options": [],
+            "choices": [],
             "consoleUrl": console_url(await _application_url(), ws, job_id),
         }
     messages = await _job_messages(ws, job_id)
@@ -579,8 +582,14 @@ async def _pending_human_input(ws: str, job_id: str) -> Optional[dict]:
         raise RuntimeError(f"Transform message {newest.get('messageId')!r} for job {job_id} has no messageOrigin")
     if origin == "USER":
         return None
-    options = _select_labels(newest.get("interactions"), newest.get("messageId"))
-    if not options:
+    message_id = newest.get("messageId")
+    if not isinstance(message_id, str) or not message_id:
+        raise RuntimeError(f"Transform message for job {job_id} has no messageId: {newest!r}")
+    choices = _select_choices(newest.get("interactions"), message_id)
+    # A SYSTEM message of type FINAL_RESPONSE ends Transform's chat turn: it is waiting for the reply,
+    # even while GetJob still says EXECUTING (seen live 2026-10-27 for the MAP question).
+    turn_ended = (newest.get("processingInfo") or {}).get("messageType") == "FINAL_RESPONSE"
+    if not choices and not (free_text or turn_ended):
         return None
     return {
         "source": "transform",
@@ -588,11 +597,264 @@ async def _pending_human_input(ws: str, job_id: str) -> Optional[dict]:
         "workspaceId": ws,
         "kind": "message",
         "taskId": None,
-        "title": "Transform is asking for a decision",
+        "messageId": message_id,
+        "title": "Transform is asking for a decision" if choices else "Transform is asking for a reply",
         "text": (newest.get("text") or "")[:PENDING_TEXT_LIMIT],
-        "options": options,
+        "options": [c["label"] for c in choices],
+        "choices": choices,
         "consoleUrl": console_url(await _application_url(), ws, job_id),
     }
+
+
+ANSWER_TEXT_LIMIT = 4000
+
+
+class QuestionChanged(RuntimeError):
+    """The Transform job is no longer waiting on the message the caller is answering."""
+
+
+def answer_message(
+    job_id: str,
+    message_id: str,
+    *,
+    idempotency_token: str,
+    option: Optional[str] = None,
+    text: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> dict[str, Any]:
+    """Reply to the select question a Transform job is waiting on.
+
+    The live question is re-read first: the reply is sent only while message_id is still the newest
+    system message with options (else QuestionChanged). option must be one of its labels and is sent as
+    that option's value, the way a reply typed in the Transform chat reaches the job. text is a free-form
+    reply. Exactly one of option/text.
+    """
+    if (option is None) == (text is None):
+        raise ValueError("answer_message needs exactly one of option or text")
+    if text is not None and not (0 < len(text.strip()) <= ANSWER_TEXT_LIMIT):
+        raise ValueError(f"reply text must be 1-{ANSWER_TEXT_LIMIT} characters")
+    ws = workspace or workspace_id()
+    _ensure_connected()
+
+    async def _go():
+        live = await _pending_human_input(ws, job_id, free_text=True)
+        if live is None or live["kind"] != "message" or live["messageId"] != message_id:
+            now_waiting = (
+                "nothing is pending" if live is None
+                else f"it now waits on {live['kind']} {live.get('messageId') or live.get('taskId')}"
+            )
+            raise QuestionChanged(f"Transform job {job_id} is no longer waiting on message {message_id}; {now_waiting}")
+        if option is not None:
+            choice = next((c for c in live["choices"] if c["label"] == option), None)
+            if choice is None:
+                raise ValueError(f"{option!r} is not one of the offered options {[c['label'] for c in live['choices']]}")
+            if not choice["value"]:
+                raise RuntimeError(f"Transform option {option!r} has no value; reply with a message instead")
+            reply = choice["value"]
+        else:
+            reply = text.strip()
+        resp = await _call(
+            "SendMessage",
+            SendMessageRequest(text=reply, idempotencyToken=idempotency_token, metadata=_job_metadata(ws, job_id)),
+        )
+        sent = resp.get("message") if isinstance(resp, dict) else None
+        if not isinstance(sent, dict) or not sent.get("messageId"):
+            raise RuntimeError(f"Transform SendMessage for job {job_id} returned no message: {resp!r}")
+        return {"jobId": job_id, "answeredMessageId": message_id, "sentMessageId": sent["messageId"], "text": reply}
+
+    return _run(_go())
+
+
+# --------------------------------------------------------------------------------------
+# Target-account connector task (HITL uxComponentId CreateOrSelectConnectors).
+# Transform asks for a connector of the type named in the task's agent artifact. The platform
+# finds (or creates) that connector for the deploy target account; a person approves it once in
+# the AWS console (verification link); the platform then submits the task with its id.
+# --------------------------------------------------------------------------------------
+CONNECTOR_TASK_COMPONENT = "CreateOrSelectConnectors"
+
+
+class ConnectorRejected(RuntimeError):
+    """The target-account connector was rejected in the AWS console."""
+
+
+def connector_verification_link(connector_id: str, region: str) -> str:
+    """Same link the library's create_connector returns (AWS console approval page)."""
+    return f"https://{region}.console.aws.amazon.com/transform/connector/{connector_id}/configure?region={region}"
+
+
+async def _get_task(ws: str, job_id: str, task_id: str) -> dict:
+    resp = await _call("GetHitlTask", GetHitlTaskRequest(workspaceId=ws, jobId=job_id, taskId=task_id))
+    task = resp.get("task") if isinstance(resp, dict) else None
+    if not isinstance(task, dict):
+        raise RuntimeError(f"Transform GetHitlTask for task {task_id} returned no task: {resp!r}")
+    return task
+
+
+def connector_task(job_id: str, task_id: str, workspace: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """The connector request of a CreateOrSelectConnectors task, or None for any other task.
+
+    Returns {taskId, severity, status, connectorType, artifact}. Raises when the task's agent
+    artifact does not name exactly one connector type (min 1, max 1), the only shape handled.
+    """
+    ws = workspace or workspace_id()
+    _ensure_connected()
+
+    async def _go():
+        task = await _get_task(ws, job_id, task_id)
+        if task.get("uxComponentId") != CONNECTOR_TASK_COMPONENT:
+            return None
+        artifact_id = (task.get("agentArtifact") or {}).get("artifactId")
+        if not artifact_id:
+            raise RuntimeError(f"Transform connector task {task_id} has no agent artifact")
+        artifact = (await download_agent_artifact(workspace_id=ws, job_id=job_id, artifact_id=artifact_id)).get("content")
+        wanted = ((artifact or {}).get("properties") or {}).get("connectors")
+        if not isinstance(wanted, list) or len(wanted) != 1 or not isinstance(wanted[0], dict) \
+                or not wanted[0].get("connectorType") or wanted[0].get("min") != 1 or wanted[0].get("max") != 1:
+            raise RuntimeError(
+                f"Transform connector task {task_id} asks for {wanted!r}; only exactly one connector type "
+                "(min 1, max 1) is supported"
+            )
+        return {"taskId": task_id, "severity": task.get("severity"), "status": task.get("status"),
+                "connectorType": wanted[0]["connectorType"], "artifact": artifact}
+
+    return _run(_go())
+
+
+def _connector_status(connector: dict) -> tuple[Optional[str], Optional[str]]:
+    conn = (connector.get("accountConnection") or {}).get("awsAccountConnection") or {}
+    return conn.get("accountId"), conn.get("status")
+
+
+def ensure_target_connector(*, connector_type: str, account_id: str, region: str,
+                            workspace: Optional[str] = None) -> dict[str, Any]:
+    """The workspace connector of ``connector_type`` for ``account_id`` in ``region``.
+
+    Reuses an ACTIVE one, else a PENDING one, else creates one (PENDING until a person approves it
+    in the AWS console). A REJECTED connector is skipped. Returns {connectorId, status, created,
+    verificationLink}.
+    """
+    ws = workspace or workspace_id()
+    _ensure_connected()
+
+    async def _go():
+        summaries = await _list_pages(
+            "ListConnectors",
+            lambda token: {"workspaceId": ws, **({"nextToken": token} if token else {})},
+            "connectors",
+        )
+        found: dict[str, dict] = {}
+        for s in summaries:
+            if s.get("connectorType") != connector_type or region not in (s.get("targetRegions") or []):
+                continue
+            full = await _call("GetConnector", GetConnectorRequest(workspaceId=ws, connectorId=s["connectorId"]))
+            acct, status = _connector_status(full)
+            if acct == account_id and status in ("ACTIVE", "PENDING") and status not in found:
+                found[status] = full
+        chosen = found.get("ACTIVE") or found.get("PENDING")
+        created = False
+        if chosen is None:
+            resp = await _call("CreateConnector", CreateConnectorRequest(
+                workspaceId=ws,
+                connectorName=f"lz-agent-target-{account_id}-{region}",
+                connectorType=connector_type,
+                configuration={},
+                accountConnectionRequest=AccountConnectionRequest(
+                    awsAccountConnectionRequest=AwsAccountConnectionRequest(awsAccountId=account_id)),
+                idempotencyToken=str(uuid.uuid4()),
+                targetRegions=[region],
+                description="Landing zone target account (created by the lz-agent deploy run)",
+            ))
+            if not isinstance(resp, dict) or not resp.get("connectorId"):
+                raise RuntimeError(f"Transform CreateConnector returned no connectorId: {resp!r}")
+            chosen = await _call("GetConnector", GetConnectorRequest(workspaceId=ws, connectorId=resp["connectorId"]))
+            created = True
+        _, status = _connector_status(chosen)
+        if status not in ("ACTIVE", "PENDING"):
+            raise RuntimeError(f"Transform connector {chosen.get('connectorId')} has status {status!r}")
+        return {"connectorId": chosen["connectorId"], "status": status, "created": created,
+                "verificationLink": connector_verification_link(chosen["connectorId"], region)}
+
+    return _run(_go())
+
+
+def connector_state(connector_id: str, workspace: Optional[str] = None) -> str:
+    """ACTIVE | PENDING; raises ConnectorRejected for REJECTED and RuntimeError for anything else."""
+    ws = workspace or workspace_id()
+    _ensure_connected()
+    full = _run(_call("GetConnector", GetConnectorRequest(workspaceId=ws, connectorId=connector_id)))
+    _, status = _connector_status(full)
+    if status == "REJECTED":
+        raise ConnectorRejected(f"Transform connector {connector_id} was rejected in the AWS console")
+    if status not in ("ACTIVE", "PENDING"):
+        raise RuntimeError(f"Transform connector {connector_id} has status {status!r}")
+    return status
+
+
+def submit_connector_task(*, job_id: str, task_id: str, connector_id: str, connector_type: str,
+                          workspace: Optional[str] = None) -> dict[str, Any]:
+    """Approve the CreateOrSelectConnectors task with an ACTIVE connector (library submit path:
+    validate against the component schema, upload the response artifact, Submit*HitlTask)."""
+    ws = workspace or workspace_id()
+    _ensure_connected()
+
+    async def _go():
+        task = await _get_task(ws, job_id, task_id)
+        if task.get("uxComponentId") != CONNECTOR_TASK_COMPONENT or task.get("status") not in _ACTIONABLE_HITL_STATUSES:
+            raise QuestionChanged(
+                f"Transform task {task_id} is {task.get('uxComponentId')}/{task.get('status')}, not an open connector task"
+            )
+        artifact_id = (task.get("agentArtifact") or {}).get("artifactId")
+        artifact = (await download_agent_artifact(workspace_id=ws, job_id=job_id, artifact_id=artifact_id)).get("content") \
+            if artifact_id else None
+        fmt = format_and_validate(CONNECTOR_TASK_COMPONENT,
+                                  json.dumps({"connectorId": connector_id, "connectorType": connector_type}), artifact)
+        if not fmt.ok:
+            raise RuntimeError(f"connector task response failed the {CONNECTOR_TASK_COMPONENT} schema: {fmt.error}")
+        response_id = await upload_json_artifact(workspace_id=ws, job_id=job_id, content=fmt.content)
+        request_cls = SubmitCriticalHitlTaskRequest if task.get("severity") == "CRITICAL" else SubmitStandardHitlTaskRequest
+        await _call(
+            "SubmitCriticalHitlTask" if task.get("severity") == "CRITICAL" else "SubmitStandardHitlTask",
+            request_cls(workspaceId=ws, jobId=job_id, taskId=task_id, action="APPROVE",
+                        humanArtifact=HitlTaskArtifact(artifactId=response_id), idempotencyToken=str(uuid.uuid4())),
+        )
+        after = await _get_task(ws, job_id, task_id)
+        return {"taskId": task_id, "status": after.get("status"), "responseArtifactId": response_id}
+
+    return _run(_go())
+
+
+CONVERSATION_TEXT_LIMIT = 1500
+
+
+def recent_conversation(job_id: str, workspace: Optional[str] = None, limit: int = 12) -> list[dict[str, Any]]:
+    """The last ``limit`` chat messages of a job, oldest first, for the deploy agent's context.
+
+    Each entry: {messageId, origin (USER | SYSTEM | ...), createdAt, text (truncated), options}.
+    Raises on a malformed message (no messageOrigin / createdAt), like the pending-input parser.
+    """
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    ws = workspace or workspace_id()
+    _ensure_connected()
+
+    async def _go():
+        messages = _by_created(await _job_messages(ws, job_id), "messageId", "message")
+        out = []
+        for m in messages[-limit:]:
+            origin = m.get("messageOrigin")
+            if not origin:
+                raise RuntimeError(f"Transform message {m.get('messageId')!r} for job {job_id} has no messageOrigin")
+            out.append({
+                "messageId": m.get("messageId"),
+                "origin": origin,
+                "createdAt": str(m["createdAt"]),
+                "text": (m.get("text") or "")[:CONVERSATION_TEXT_LIMIT],
+                "options": _select_labels(m.get("interactions"), m.get("messageId")),
+            })
+        return out
+
+    return _run(_go())
 
 
 _CANCELLED_STATUSES = {"STOPPED", "CANCELLED", "CANCELED"}
@@ -611,7 +873,7 @@ def poll_job(job_id: str, workspace: Optional[str] = None) -> dict[str, Any]:
         if status in _CANCELLED_STATUSES:
             raise RuntimeError(f"Transform job {job_id} ended with status {status}")
         terminal = status in _TERMINAL_STATUSES
-        pending = None if terminal else await _pending_human_input(ws, job_id)
+        pending = None if terminal else await _pending_human_input(ws, job_id, free_text=status == "AWAITING_HUMAN_INPUT")
         return {
             "ok": True,
             "jobId": job_id,

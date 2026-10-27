@@ -6,7 +6,7 @@ from typing import Any
 from .attestation import gap_analysis, require_complete_gaps
 from .discovery import classify_foundation, collect_foundation
 
-# Terminal Transform deploy job statuses treated as success (API variants).
+# Terminal statuses of the Transform landing zone job treated as success (API variants).
 TRANSFORM_DEPLOY_SUCCESS_STATUSES = frozenset(
     {"SUCCEEDED", "SUCCESS", "COMPLETED", "COMPLETE", "DONE"},
 )
@@ -73,11 +73,11 @@ def evaluate_deployment_outcome(
 
     status = (transform_deploy_status or "").upper()
     if not status:
-        reasons.append("Transform deploy job status unknown")
+        reasons.append("Transform job status unknown")
         transform_ok = False
     elif status not in TRANSFORM_DEPLOY_SUCCESS_STATUSES:
         reasons.append(
-            f"Transform deploy job status is {status}, expected one of {sorted(TRANSFORM_DEPLOY_SUCCESS_STATUSES)}"
+            f"Transform job status is {status}, expected one of {sorted(TRANSFORM_DEPLOY_SUCCESS_STATUSES)}"
         )
         transform_ok = False
     else:

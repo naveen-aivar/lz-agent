@@ -32,9 +32,10 @@ State machine: `orchestration/deployment.asl.json` (`{ProjectName}-deploy`).
 API creates deploy run (runKind=deploy, links designRunId)
   → loop: phase_invoke (AgentCore `phase: deploy`)
         Strands agent + Transform MCP + tools:
-          pre-discover → Transform analyze (poll/HITL) → merge
+          pre-discover → Transform landing zone job (poll; the agent answers each question from the
+            approved design or hands it to a person) → merge
           → foundation assessment + iac-change-plan → render bundles
-          → Transform deploy (poll/HITL) → post-discover → finish_deploy_workflow
+          → post-discover → finish_deploy_workflow
         if Transform still running: SFN waits 60 s and re-invokes the same session
           progress budget 240 cycles (~4 h); HITL budget 1440 cycles (~24 h) while Transform waits on a person
           (the question is shown in the UI: "AWS Transform needs your input")

@@ -17,7 +17,7 @@ The **Architecture Design Agent** turns a SOW or transcript into approved **scop
 | Greenfield vs brownfield | N/A | **Yes** — **deploy agent** (Transform MCP + snapshot) via **`save_foundation_assessment`**; discover only provides a heuristic hint |
 | Assess existing setup | N/A | **Yes** — foundation snapshot + Transform |
 | Identify required IaC **changes** | N/A | **Yes** — **`foundation-assessment.json`** (discover) + agent **`iac-change-plan.json`** (uses gaps + suggested changes; not hand-edited HCL/YAML in repo) |
-| Deploy / apply in target account | **No** (customer pipeline) | **Yes** — **AWS Transform** deploy job + HITL in Transform console |
+| Deploy / apply in target account | **No** (customer pipeline) | **Yes** — one **AWS Transform** landing zone job; the deploy agent answers its questions from the approved design and hands approvals, missing facts and console tasks to a person |
 | Validation report | Pre-deploy **validation report** (scans on design bundles) | **Post-deploy `deployment-report.json`** (custom attest vs approved scope; Transform job IDs recorded) |
 
 ## Expected behaviors (stakeholder list)
@@ -92,7 +92,7 @@ Optional future enhancements (not committed):
 
 1. Design run must be **DELIVERED**; platform must have **`TransformWorkspaceId`**.  
 2. `POST /runs/{designRunId}/deploy` — new deploy run + **deploy** Step Functions.  
-3. Agent loop (Transform analyze → plan → Transform deploy, with SFN wait/resume for HITL) → attestation in **`phase_invoke`** → deploy run **DELIVERED** or **FAILED**.  
+3. Agent loop (Transform landing zone job with the agent answering from the design → assessment + plan → post-discover, with SFN wait/resume for HITL) → attestation in **`phase_invoke`** → deploy run **DELIVERED** or **FAILED**.  
 4. On **DELIVERED**, download on the **deploy run** id: **`foundation-assessment`**, **`deployment-report`**, **`iac-change-plan`**, **`iac-manifest`**, optional stack zips.
 
 Full technical sequence: [deployment-agent-transform.md](./deployment-agent-transform.md).

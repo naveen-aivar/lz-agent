@@ -12,7 +12,7 @@ DEPLOYMENT_FILE_NAMES: tuple[str, ...] = (
     "foundation-post.json",
     "gap-analysis-post.json",
     "classification-post.json",
-    "transform-poll-deploy.json",
+    "transform-poll-analyze.json",
 )
 
 

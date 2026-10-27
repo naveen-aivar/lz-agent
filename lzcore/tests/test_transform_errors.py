@@ -47,7 +47,7 @@ class _HttpError(Exception):
 class _EnvCase(unittest.TestCase):
     def setUp(self):
         for patcher in (
-            mock.patch.dict(os.environ, {"TRANSFORM_WORKSPACE_ID": WS, "TRANSFORM_ROLE_ARN": ROLE}),
+            mock.patch.dict(os.environ, {"TRANSFORM_WORKSPACE_ID": WS, "TRANSFORM_ROLE_ARN": ROLE, "TRANSFORM_REGION": "us-east-1"}),
             mock.patch.object(transform_credentials, "_BASE_SESSION", _NoNetworkBase()),
         ):
             patcher.start()

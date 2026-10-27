@@ -52,28 +52,38 @@ Each invoke starts with **`read_deploy_checkpoint`** and resumes from the last s
 |------|----------------|
 | 1 | `run_pre_discover` — org snapshot, gaps, heuristic hint |
 | 2 | `transform_init_connection`, `transform_start_analyze` |
-| 3 | `transform_poll_analyze_job` (once per invoke; pause if not done / HITL) |
-| 4 | `transform_merge_discovery` |
+| 3 | `transform_poll_analyze_job` (once per invoke). When Transform asks a question, the conversation agent decides it (see below), then the run waits |
+| 4 | `transform_merge_discovery` once the Transform job has finished |
 | 5 | Transform MCP inspect + `save_foundation_assessment`, `save_iac_change_plan` |
 | 6 | `render_iac_bundles` |
-| 7 | `transform_start_deploy`, `transform_poll_deploy_job` (once per invoke; pause if needed) |
-| 8 | `run_post_discover` |
-| 9 | `finish_deploy_workflow` → checkpoint `agent_complete` |
+| 7 | `run_post_discover` |
+| 8 | `finish_deploy_workflow` → checkpoint `agent_complete` |
 
-Implementation: `agent/deploy_workflow_tools.py`, prompts in `agent/prompts.py`.
+There is one Transform job per deploy run. Transform's landing zone workflow plans and applies the landing zone inside that job; there is no second "deploy" job. Its first message is the approved design itself (`deploy_transform.scope_summary_from_scope`: Regions, OUs, accounts, SCPs, controls).
+
+Implementation: `agent/deploy_workflow_tools.py`, `agent/transform_conversation.py`, prompts in `agent/prompts.py`.
+
+## The Transform conversation
+
+Each question the Transform job asks (`pendingHumanInput`, contract C1) goes to the conversation agent (`CONVERSE_SYSTEM`) once. It has two tools and must call exactly one:
+
+- **`answer_transform_question`**: the approved design (category `design`) or the run purpose and context (category `workflow`) answers it. Every `basis` entry must resolve (`scope:<JSON pointer>` or `context:<key>`), and an option must be an offered label. The answer goes through `lzcore/transform_answers.send_answer`, the same `ANSWER#<messageId>` reservation the UI uses, so whoever answers first wins and nothing is sent twice. `transform.answer_sent` is audited with actor `agent`, the category, rationale and basis.
+- **`escalate_to_human`**: approval gates (anything that creates, changes or deletes resources, starts a deployment, accepts cost, or cannot be undone), facts the design does not hold (emails, MAP ids), Transform tasks with their own form, and anything uncertain. The reason and suggestion reach META and the UI as `pendingHumanInput.agentNote`.
+
+Per-question state is the `AGENTQ#<message:id | task:id>` item. A turn that raises or ends without a decision is retried on the next invoke; after `MAX_TURNS_PER_QUESTION` (3) the run fails naming the question. The agent sends at most `MAX_AGENT_ANSWERS_PER_RUN` (40) answers per run; after that every question goes to a person. A question a person already answered in the UI is never given to the model. While the job reports `AWAITING_HUMAN_INPUT`, a Transform message without options is treated as a free-text question.
 
 ## Pause / resume
 
-- Poll tools write **`agent-checkpoint.json`** (`transform_analyze_waiting`, `transform_deploy_waiting`, etc.).
+- Poll tools write **`agent-checkpoint.json`** (`transform_analyze_waiting`, etc.).
 - Agent returns **`continue`** → SFN waits and re-invokes the **same** AgentCore session.
-- At most **one** analyze poll and **one** deploy poll **per invoke** (extra polls are refused).
+- At most **one** Transform poll **per invoke** (extra polls are refused).
 
 ## Attestation (rules, not LLM)
 
 After required S3 artifacts exist (`lzcore/deploy_artifacts.py`), **`phase_attest`**:
 
 - Compares pre/post org snapshots and gaps to the **approved design scope**
-- Checks Transform deploy job status from **`transform-poll-deploy.json`**
+- Checks the Transform job's final status from **`transform-poll-analyze.json`**
 - Writes **`deployment-report.json`** with `overall`: `pass` | `pass_with_manual_steps` | `fail`
 
 See [deployment-agent-scope.md](./deployment-agent-scope.md) for outcomes and PoC credentials scope.
@@ -153,7 +163,7 @@ Drop the `sts:ExternalId` condition only if `TransformExternalId` is empty. The 
 | SFN execution timeout | 72 hours |
 | Progress-poll budget | **240** cycles × 60 s (`awaitingHitl: false`), ASL `DeployAgentChoice` |
 | HITL wait budget | **1440** cycles × 60 s ≈ 24 h (`awaitingHitl: true`), ASL `DeployAgentChoice` |
-| Artifact contract | `lzcore/deploy_artifacts.py` (includes `iac-manifest.json`, post-discover, Transform deploy poll) |
+| Artifact contract | `lzcore/deploy_artifacts.py` (includes `iac-manifest.json`, post-discover, final Transform job poll) |
 | `phase_invoke` timeout | 900s (agent + attest in one Lambda) |
 
 ## Related paths

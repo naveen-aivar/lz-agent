@@ -33,7 +33,6 @@ _state = {
     "design_run_id": None,
     "transform_workspace_id": None,
     "transform_analyze_job_id": None,
-    "transform_deploy_job_id": None,
     "deploy_target": None,
 }
 
@@ -68,7 +67,6 @@ def set_deploy_run(run_id: str) -> None:
         design_run_id=design_run_id,
         transform_workspace_id=meta.get("transformWorkspaceId"),
         transform_analyze_job_id=meta.get("transformAnalyzeJobId"),
-        transform_deploy_job_id=meta.get("transformDeployJobId"),
         polls_this_invoke=0,
         deploy_target=meta.get("deployTarget"),
     )
@@ -202,7 +200,6 @@ def read_deploy_context() -> str:
     transform_ctx: dict = {
         "workspaceId": _state.get("transform_workspace_id"),
         "analyzeJobId": _state.get("transform_analyze_job_id"),
-        "deployJobId": _state.get("transform_deploy_job_id"),
         "analyzePoll": _load_json_if_exists(f"{base}/transform-poll-analyze.json"),
     }
     if snapshot.get("transform"):

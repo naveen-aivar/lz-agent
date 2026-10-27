@@ -47,7 +47,13 @@ class FakeTable:
         item = self.items.get(self._k(Key))
         return {"Item": copy.deepcopy(item)} if item is not None else {}
 
-    def put_item(self, Item):
+    def put_item(self, Item, ConditionExpression=None, ExpressionAttributeNames=None, ExpressionAttributeValues=None):
+        if ConditionExpression is not None:
+            # Only the /answer reservation condition is modelled.
+            assert ConditionExpression == "attribute_not_exists(PK) OR #st = :failed", ConditionExpression
+            current = self.items.get((Item["PK"], Item["SK"]))
+            if current is not None and current.get(ExpressionAttributeNames["#st"]) != ExpressionAttributeValues[":failed"]:
+                raise ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": "x"}}, "PutItem")
         self.items[(Item["PK"], Item["SK"])] = copy.deepcopy(Item)
 
     def update_item(self, Key, UpdateExpression, ExpressionAttributeValues=None, ExpressionAttributeNames=None,
@@ -169,8 +175,11 @@ class _Base(unittest.TestCase):
         self.table.put_item({"PK": f"RUN#{DESIGN_ID}", "SK": "META", "runId": DESIGN_ID, "requester": USER,
                              "status": "DELIVERED", "customerId": "acme", "artifacts": {"intake": {"key": "k", "sha": "s"}}})
 
-    def api(self, route, body=None, run_id=None, sub=USER, direct=False, invoked_by=None):
-        ctx = {"authorizer": {"jwt": {"claims": {"sub": sub}}}}
+    def api(self, route, body=None, run_id=None, sub=USER, direct=False, invoked_by=None, groups=None):
+        claims = {"sub": sub}
+        if groups is not None:
+            claims["cognito:groups"] = groups
+        ctx = {"authorizer": {"jwt": {"claims": claims}}}
         if not direct:
             ctx["http"] = {"method": route.split()[0]}
         event = {"routeKey": route, "requestContext": ctx, "body": json.dumps(body or {})}
@@ -291,6 +300,144 @@ class ApiRunsTests(_Base):
         self.assertEqual(self.table.meta(run_id)["status"], "FAILED")
 
 
+# ---------------------------------------------------------------- api_runs /answer
+GROUP = "transform-approvers"
+
+
+def question(mid="m-2", job="job-1"):
+    return {"source": "transform", "jobId": job, "workspaceId": "ws-1", "kind": "message", "taskId": None,
+            "messageId": mid, "title": "Transform is asking for a decision", "text": "Plan ready. Proceed?",
+            "options": ["Proceed", "Modify plan"],
+            "choices": [{"label": "Proceed", "value": "Proceed"}, {"label": "Modify plan", "value": "Modify plan"}],
+            "consoleUrl": "https://example.transform.aws/jobs/job-1"}
+
+
+class AnswerTests(_Base):
+    RUN = "f" * 32
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {"TRANSFORM_APPROVER_GROUP": GROUP,
+                                           "TRANSFORM_ROLE_ARN": "arn:aws:iam::222222222222:role/IngramLandingZoneTransform"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.table.put_item({"PK": f"RUN#{self.RUN}", "SK": "META", "runId": self.RUN, "runKind": "deploy",
+                             "status": "RUNNING", "requester": USER, "pendingHumanInput": question(), "awaitingHitl": True})
+        self.sent, self.send_error = [], None
+
+        def fake_send(**kw):
+            self.sent.append(kw)
+            if self.send_error is not None:
+                raise self.send_error
+            return {"jobId": kw["job_id"], "answeredMessageId": kw["message_id"], "sentMessageId": "m-sent", "text": "x"}
+
+        p = mock.patch.object(api_runs, "_send_transform_answer", fake_send)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def answer(self, body=None, groups=(GROUP,), **kw):
+        body = {"jobId": "job-1", "messageId": "m-2", "option": "Proceed"} if body is None else body
+        return self.api("POST /runs/{runId}/answer", body, run_id=self.RUN,
+                        groups=list(groups) if groups is not None else None, **kw)
+
+    def test_option_is_sent_recorded_and_audited(self):
+        code, out = self.answer()
+        self.assertEqual(code, 200, out)
+        (call,) = self.sent
+        self.assertEqual((call["job_id"], call["message_id"], call["option"], call["text"]), ("job-1", "m-2", "Proceed", None))
+        meta = self.table.meta(self.RUN)
+        self.assertEqual(meta["pendingAnswer"]["status"], "sent")
+        self.assertEqual(meta["pendingAnswer"]["option"], "Proceed")
+        self.assertEqual(meta["pendingAnswer"]["by"], USER)
+        lock = self.table.items[(f"RUN#{self.RUN}", "ANSWER#m-2")]
+        self.assertEqual((lock["status"], lock["sentMessageId"], lock["idempotencyToken"]), ("sent", "m-sent", call["idempotency_token"]))
+        detail = json.loads(self.table.audit(self.RUN, "transform.answer_sent")[0]["detail"])
+        self.assertEqual(detail, {"jobId": "job-1", "messageId": "m-2", "option": "Proceed", "text": None})
+
+    def test_free_text_reply(self):
+        code, _ = self.answer({"jobId": "job-1", "messageId": "m-2", "text": "  Add a second region  "})
+        self.assertEqual(code, 200)
+        self.assertEqual((self.sent[0]["option"], self.sent[0]["text"]), (None, "Add a second region"))
+
+    def test_second_answer_to_same_question_is_rejected(self):
+        self.assertEqual(self.answer()[0], 200)
+        code, out = self.answer({"jobId": "job-1", "messageId": "m-2", "option": "Modify plan"})
+        self.assertEqual((code, out["error"]), (409, "this question already has an answer"))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_failed_send_is_released_audited_and_retryable(self):
+        self.send_error = RuntimeError("Transform 500")
+        code, out = self.answer()
+        self.assertEqual(code, 502)
+        self.assertIn("Transform 500", out["error"])
+        self.assertEqual(self.table.items[(f"RUN#{self.RUN}", "ANSWER#m-2")]["status"], "failed")
+        self.assertNotIn("pendingAnswer", self.table.meta(self.RUN))
+        self.assertEqual(len(self.table.audit(self.RUN, "transform.answer_failed")), 1)
+        self.send_error = None
+        self.assertEqual(self.answer()[0], 200)
+        self.assertEqual(len(self.sent), 2)
+        self.assertNotEqual(self.sent[0]["idempotency_token"], self.sent[1]["idempotency_token"])
+
+    def test_question_changed_in_transform_is_409(self):
+        from lzcore.transform_ops import QuestionChanged
+        self.send_error = QuestionChanged("no longer waiting on message m-2; it now waits on message m-3")
+        code, out = self.answer()
+        self.assertEqual(code, 409)
+        self.assertIn("moved on", out["error"])
+
+    def test_access_denied_is_502_naming_the_principal(self):
+        from lzcore.transform_ops import TransformAccessDenied
+        self.send_error = TransformAccessDenied("SendMessage", "ws-1", "arn:aws:sts::2:assumed-role/T/ingram-lz-agent", "403")
+        code, out = self.answer()
+        self.assertEqual(code, 502)
+        self.assertIn("ingram-lz-agent", out["error"])
+
+    def test_requires_approver_group(self):
+        for groups in (None, (), ("other",)):
+            code, out = self.answer(groups=groups)
+            self.assertEqual(code, 403, groups)
+            self.assertIn(GROUP, out["error"])
+        self.assertEqual(self.sent, [])
+
+    def test_group_claim_string_form_from_http_api(self):
+        code, _ = self.api("POST /runs/{runId}/answer", {"jobId": "job-1", "messageId": "m-2", "option": "Proceed"},
+                           run_id=self.RUN, groups=f"[admins {GROUP}]")
+        self.assertEqual(code, 200)
+
+    def test_stale_question_is_409_and_sends_nothing(self):
+        code, out = self.answer({"jobId": "job-1", "messageId": "m-1", "option": "Proceed"})
+        self.assertEqual(code, 409)
+        self.assertIn("changed", out["error"])
+        self.assertEqual(self.sent, [])
+
+    def test_body_validation(self):
+        for body in ({"jobId": "job-1", "messageId": "m-2", "option": "Approve all"},
+                     {"jobId": "job-1", "messageId": "m-2", "option": "Proceed", "text": "x"},
+                     {"jobId": "job-1", "messageId": "m-2"},
+                     {"jobId": "job-1", "messageId": "m-2", "text": "   "},
+                     {"jobId": "job-1", "messageId": "m-2", "text": "x" * 4001}):
+            self.assertEqual(self.answer(body)[0], 400, body)
+        self.assertEqual(self.sent, [])
+
+    def test_task_questions_are_answered_in_transform(self):
+        self.table.meta(self.RUN)["pendingHumanInput"] = pending()
+        code, out = self.answer({"jobId": "job-1", "messageId": None, "option": "Approve"})
+        self.assertEqual(code, 409)
+        self.assertIn("answered in AWS Transform", out["error"])
+
+    def test_owner_running_deploy_and_ui_only(self):
+        self.assertEqual(self.answer(sub=OTHER_USER)[0], 404)
+        self.assertEqual(self.answer(direct=True, invoked_by=OPERATOR)[0], 400)
+        self.table.meta(self.RUN)["status"] = "FAILED"
+        self.assertEqual(self.answer()[0], 409)
+        self.assertEqual(self.sent, [])
+
+    def test_no_transform_role_is_501(self):
+        os.environ["TRANSFORM_ROLE_ARN"] = ""
+        self.assertEqual(self.answer()[0], 501)
+        self.assertEqual(self.sent, [])
+
+
 # ---------------------------------------------------------------- phase_invoke
 class PhaseInvokeTests(_Base):
     RUN = "e" * 32
@@ -334,6 +481,23 @@ class PhaseInvokeTests(_Base):
         self.assertEqual(out["pendingSummary"], "none")
         self.assertNotIn("pendingHumanInput", self.table.meta(self.RUN))
         self.assertEqual(len(self.table.audit(self.RUN, "phase.human_input_resolved")), 1)
+
+    def test_message_choices_are_validated(self):
+        self.invoke([cont(True, {**pending(), "kind": "message", "taskId": None, "messageId": "m-1",
+                                 "choices": [{"label": "Approve", "value": "approve"}]})])
+        self.assertEqual(self.table.meta(self.RUN)["pendingHumanInput"]["messageId"], "m-1")
+        with self.assertRaisesRegex(RuntimeError, "choices must be a list"):
+            self.invoke([cont(True, {**pending(), "choices": [{"label": 3}]})])
+        with self.assertRaisesRegex(RuntimeError, "messageId must be a string"):
+            self.invoke([cont(True, {**pending(), "messageId": 7})])
+
+    def test_agent_note_is_stored_with_the_question_and_validated(self):
+        note = {"reason": "Connect account 222222222222 in ap-south-1.", "suggestion": None}
+        self.invoke([cont(True, {**pending(), "agentNote": note})])
+        self.assertEqual(self.table.meta(self.RUN)["pendingHumanInput"]["agentNote"], note)
+        for bad in ("text", {"suggestion": "x"}, {"reason": 3}, {"reason": "r", "suggestion": 4}):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RuntimeError, "agentNote must be"):
+                self.invoke([cont(True, {**pending(), "agentNote": bad})])
 
     def test_awaiting_without_details_still_counts_as_hitl(self):
         out, _ = self.invoke([cont(True, None)])
@@ -579,6 +743,21 @@ class PlatformTemplateTests(unittest.TestCase):
         doc = (ROOT / "docs" / "deployment-agent-transform.md").read_text()
         for a in acts:
             self.assertIn(f"`{a}`", doc, f"{a} not documented")
+
+    def test_answer_route_and_api_transform_wiring(self):
+        route = RES["RouteAnswerRun"]["Properties"]
+        self.assertEqual((route["RouteKey"], route["AuthorizationType"]), ("POST /runs/{runId}/answer", "JWT"))
+        stmts = _statements("ApiRole")
+        self.assertIn({"If": ["HasTransformRole", {"Effect": "Allow", "Action": ["sts:AssumeRole"],
+                                                   "Resource": {"Ref": "TransformRoleArn"}}, {"Ref": "AWS::NoValue"}]},
+                      stmts)
+        self.assertFalse(any(a.startswith("transform:") for c, st in (u for s in stmts for u in _unwrap(s)) for a in _actions(st)))
+        env = RES["ApiRunsFn"]["Properties"]["Environment"]["Variables"]
+        self.assertEqual(env["TRANSFORM_APPROVER_GROUP"], {"Ref": "TransformApproversGroup"})
+        self.assertEqual(env["TRANSFORM_ROLE_ARN"], {"If": ["HasTransformRole", {"Ref": "TransformRoleArn"}, ""]})
+        self.assertEqual(env["TRANSFORM_REGION"], {"Ref": "TransformRegion"})
+        self.assertLessEqual(RES["ApiRunsFn"]["Properties"]["Timeout"], 29)
+        self.assertEqual(RES["TransformApproversGroup"]["Properties"]["GroupName"], "transform-approvers")
 
     def test_transform_role_assume_is_explicit_and_self_assume_conditional(self):
         stmts = _statements("AgentRole")

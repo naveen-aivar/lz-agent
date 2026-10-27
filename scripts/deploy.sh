@@ -14,14 +14,23 @@ PROJECT="${PROJECT_NAME:-lz-agent}"
 echo "Packaging Lambdas (python3.12, linux x86_64 wheels) and buildspecs"
 rm -rf build && mkdir -p build/pkg
 pip install -q --target build/pkg --platform manylinux2014_x86_64 --python-version 3.12 --only-binary=:all: pypdf python-docx
-pip install -q --target build/pkg -r orchestration/requirements.txt
+# Same platform pin as above: the Transform library pulls native wheels (pydantic-core, cffi, awscrt) and the API
+# Lambda imports it for /answer. Host-platform wheels (e.g. macOS) would fail to import in the Lambda runtime.
+pip install -q --target build/pkg --platform manylinux2014_x86_64 --python-version 3.12 --implementation cp --only-binary=:all: -r orchestration/requirements.txt
 cp orchestration/lambdas/*.py build/pkg/
 cp -R lzcore templates build/pkg/
 find build/pkg -name __pycache__ -type d -prune -exec rm -rf {} +
 (cd build/pkg && zip -qr ../orchestration.zip .)
 (cd buildspecs && zip -qr ../build/buildspecs.zip .)
-cp orchestration/statemachine.asl.json orchestration/deployment.asl.json build/
-for f in orchestration.zip buildspecs.zip statemachine.asl.json deployment.asl.json; do aws s3 cp "build/$f" "s3://$CODE_BUCKET/$f" --only-show-errors; done
+for f in orchestration.zip buildspecs.zip; do aws s3 cp "build/$f" "s3://$CODE_BUCKET/$f" --only-show-errors; done
+# State machine definitions go up under content-hashed keys: CloudFormation only updates a state machine when
+# DefinitionS3Location changes, so a fixed key would leave a stale definition running after every deploy.
+asl_key() { python3 -c 'import hashlib, sys; data = open(sys.argv[1], "rb").read(); print(sys.argv[2] + ".asl." + hashlib.sha256(data).hexdigest()[:16] + ".json")' "$1" "$2"; }
+RUN_SM_KEY=$(asl_key orchestration/statemachine.asl.json statemachine)
+DEPLOY_SM_KEY=$(asl_key orchestration/deployment.asl.json deployment)
+aws s3 cp orchestration/statemachine.asl.json "s3://$CODE_BUCKET/$RUN_SM_KEY" --only-show-errors
+aws s3 cp orchestration/deployment.asl.json "s3://$CODE_BUCKET/$DEPLOY_SM_KEY" --only-show-errors
+echo "State machine definitions: $RUN_SM_KEY, $DEPLOY_SM_KEY"
 
 IMAGE_URI=""
 if [ -n "$TAG" ]; then
@@ -37,8 +46,9 @@ if [ -z "$IMAGE_URI" ]; then
 fi
 
 : "${TRANSFORM_WORKSPACE_ID:?set TRANSFORM_WORKSPACE_ID (AWS Transform workspace UUID) before deploy}"
+: "${TRANSFORM_REGION:?set TRANSFORM_REGION (AWS Transform region of that workspace, e.g. ap-south-1) before deploy}"
 ENABLE_CF="${ENABLE_CLOUDFRONT:-true}"
-DEPLOY_PARAMS=(ProjectName="$PROJECT" CodeBucket="$CODE_BUCKET" CognitoDomainPrefix="$DOMAIN" ModelId="$MODEL" AgentImageUri="$IMAGE_URI" TransformWorkspaceId="$TRANSFORM_WORKSPACE_ID" EnableCloudFront="$ENABLE_CF")
+DEPLOY_PARAMS=(ProjectName="$PROJECT" CodeBucket="$CODE_BUCKET" CognitoDomainPrefix="$DOMAIN" ModelId="$MODEL" AgentImageUri="$IMAGE_URI" TransformWorkspaceId="$TRANSFORM_WORKSPACE_ID" TransformRegion="$TRANSFORM_REGION" EnableCloudFront="$ENABLE_CF" RunStateMachineKey="$RUN_SM_KEY" DeployStateMachineKey="$DEPLOY_SM_KEY")
 if [ -n "${AGENT_RUNTIME_ARN:-}" ]; then
   DEPLOY_PARAMS+=(AgentRuntimeArn="$AGENT_RUNTIME_ARN")
 fi

@@ -30,7 +30,7 @@ class DeploymentAgentTests(unittest.TestCase):
         keys = deployment_artifact_keys("abc123")
         self.assertEqual(len(keys), len(DEPLOYMENT_FILE_NAMES))
         self.assertTrue(any(k.endswith("iac-manifest.json") for k in keys))
-        self.assertTrue(keys[-1].endswith("transform-poll-deploy.json"))
+        self.assertTrue(keys[-1].endswith("transform-poll-analyze.json"))
 
     def test_deploy_sfn_has_separate_progress_and_hitl_budgets(self):
         asl_path = Path(__file__).resolve().parents[1] / "deployment.asl.json"

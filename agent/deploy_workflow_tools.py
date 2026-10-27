@@ -1,9 +1,16 @@
-"""Deploy-run steps: discover, Transform jobs, merge, render, finish.
+"""Deploy-run steps: discover, the Transform job and its conversation, merge, render, finish.
 
 Sequencing is deterministic: `run_deploy_invoke` drives every mechanical step in workflow
-order and invokes the model only for the judgment step (foundation assessment + IaC change
-plan). The judgment agent is given only the judgment tools (see tools.deploy_tools); the
-mechanical `@tool` wrappers below are kept for direct use in tests (`workflow_tools`) and
+order and invokes a model for two kinds of judgment:
+
+* the Transform conversation: one AWS Transform landing zone job plans and builds the landing
+  zone. Each question it asks while it runs goes to the conversation agent first
+  (agent/transform_conversation.py), which answers it from the approved design or hands it to a
+  person.
+* the judgment step after the job finishes: foundation assessment + IaC change plan. That agent
+  gets only the judgment tools (see tools.deploy_tools).
+
+The mechanical `@tool` wrappers below are kept for direct use in tests (`workflow_tools`) and
 share the same `_execute_*` implementation as the sequencer.
 """
 from __future__ import annotations
@@ -22,17 +29,18 @@ from lzcore.deploy_transform import (
     merge_transform_into_foundation,
     poll_transform_job,
     start_analyze_job,
-    start_deploy_job,
 )
 from lzcore.deploy_artifacts import deployment_artifact_keys
+from lzcore.transform_answers import existing_answer
 from lzcore.deploy_workflow import collect_snapshot_and_gaps, deployment_paths, run_foundation_assessment
 from lzcore.discovery import classify_foundation
 
 import tools as base
+import transform_conversation as conv
 
 
 # Checkpoint stages at which the sequencer returns `continue` to Step Functions.
-WAIT_STAGES = frozenset({"paused", "transform_analyze_waiting", "transform_deploy_waiting"})
+WAIT_STAGES = frozenset({"paused", "transform_analyze_waiting"})
 
 # Judgment artifacts the model alone may produce.
 _FOUNDATION_ASSESSMENT = "foundation-assessment.json"
@@ -44,6 +52,8 @@ MAX_JUDGMENT_ATTEMPTS = 3
 # Model yields with awaiting_hitl=true during judgment before the run fails. Each one costs a
 # full model turn on the next invoke, so they are bounded separately from incomplete attempts.
 MAX_JUDGMENT_HITL_YIELDS = 3
+# Longest conversation-turn error kept on the AGENTQ# item and in the final failure.
+_CONVERSE_ERROR_LIMIT = 1000
 
 # Superseded stage written by an earlier release that recorded pre-discover failures as a HITL
 # wait. Runs left at this stage cannot resume; the sequencer reports that explicitly.
@@ -326,30 +336,6 @@ def _execute_transform_poll_analyze_once() -> dict:
     return out
 
 
-def _execute_transform_poll_deploy_once() -> dict:
-    meta = _run_meta()
-    job_id = meta.get("transformDeployJobId") or base._state.get("transform_deploy_job_id")
-    if not job_id:
-        raise RuntimeError("no deploy job id")
-    out = poll_transform_job(
-        run_id=base._state["run"],
-        job_id=job_id,
-        workspace_id=meta.get("transformWorkspaceId"),
-        label="deploy",
-        put_json=_put_json,
-    )
-    if out["transformDone"]:
-        base.log_tool_event("tool.transform_poll_deploy_job", {"status": out.get("status"), "done": True})
-        _save_checkpoint("transform_deploy_done", jobId=job_id)
-    else:
-        waiting = _poll_result_checkpoint(out)
-        base.log_tool_event(
-            "tool.transform_poll_deploy_job",
-            {"status": out.get("status"), "done": False, "awaitingHitl": waiting["awaitingHitl"]},
-        )
-        _save_checkpoint("transform_deploy_waiting", jobId=job_id, **waiting)
-    return out
-
 
 def _execute_merge() -> None:
     merge_transform_into_foundation(
@@ -396,35 +382,6 @@ def _execute_render() -> dict:
     base.log_tool_event("tool.render_iac_bundles", {"delivered": out["delivered"]})
     return out
 
-
-def _execute_transform_start_deploy() -> dict:
-    step = "transform_start_deploy"
-    _require_run_running(step)
-    scope = _design_scope()
-    plan = _get_json(f"runs/{base._state['run']}/deployment/iac-change-plan.json")
-    started: dict[str, str] = {}
-
-    def persist(job_id: str) -> None:
-        # start_landing_zone_job creates the job in the configured workspace.
-        started.update(jobId=job_id, workspaceId=transform_ops.workspace_id())
-        _record_job_on_meta("SET transformDeployJobId = :j", {":j": job_id})
-        base._state["transform_deploy_job_id"] = job_id
-
-    try:
-        out = start_deploy_job(
-            run_id=base._state["run"],
-            scope=scope,
-            plan=plan,
-            put_json=_put_json,
-            persist_deploy_job=persist,
-        )
-        _save_checkpoint("transform_deploy_started", jobId=out["jobId"])
-        base.log_tool_event(f"tool.{step}", {"jobId": out["jobId"]})
-    except Exception as e:
-        if "jobId" not in started:
-            raise  # CreateJob/StartJob itself failed; no job of ours to stop
-        raise _stop_orphaned_job(step, "deploy", started["jobId"], started["workspaceId"], e) from e
-    return out
 
 
 def _execute_post_discover() -> dict:
@@ -473,7 +430,6 @@ def read_deploy_checkpoint() -> str:
         {
             "checkpoint": cp,
             "transformAnalyzeJobId": meta.get("transformAnalyzeJobId"),
-            "transformDeployJobId": meta.get("transformDeployJobId"),
             "transformWorkspaceId": meta.get("transformWorkspaceId"),
         },
         default=str,
@@ -581,37 +537,6 @@ def render_iac_bundles() -> str:
 
 
 @tool
-def transform_start_deploy() -> str:
-    """Start the Transform deploy job after iac-change-plan is saved."""
-    _require_deploy_mode()
-    out = _execute_transform_start_deploy()
-    return json.dumps(out, default=str)
-
-
-@tool
-def transform_poll_deploy_job() -> str:
-    """Poll the deploy Transform job once."""
-    _require_deploy_mode()
-    cap = _one_poll_per_invoke("deploy")
-    if cap:
-        return cap
-    meta = _run_meta()
-    job_id = meta.get("transformDeployJobId") or base._state.get("transform_deploy_job_id")
-    if not job_id:
-        return "REFUSED: no deploy job; call transform_start_deploy first"
-    out = _execute_transform_poll_deploy_once()
-    if out["transformDone"]:
-        return json.dumps(out, default=str)
-    return json.dumps(
-        {
-            **out,
-            "instruction": "Deploy job not finished. Stop now; orchestration will re-invoke this session.",
-        },
-        default=str,
-    )
-
-
-@tool
 def finish_deploy_workflow() -> str:
     """Call after post-discover when all required artifacts exist. Ends the deploy agent phase."""
     _require_deploy_mode()
@@ -629,11 +554,6 @@ def _poll_analyze_step() -> None:
     _execute_transform_poll_analyze_once()
 
 
-def _poll_deploy_step() -> None:
-    _one_poll_per_invoke("deploy")
-    _execute_transform_poll_deploy_once()
-
-
 # stage -> (step name, executor, is_poll). transform_merged (judgment) is handled inline.
 _STEPS: dict[str | None, tuple[str, Callable[[], object], bool]] = {
     None: ("run_pre_discover", _execute_pre_discover_step, False),
@@ -643,10 +563,8 @@ _STEPS: dict[str | None, tuple[str, Callable[[], object], bool]] = {
     "transform_analyze_waiting": ("transform_poll_analyze_job", _poll_analyze_step, True),
     "transform_analyze_done": ("transform_merge_discovery", _execute_merge, False),
     "judgment_done": ("render_iac_bundles", _execute_render, False),
-    "iac_render_done": ("transform_start_deploy", _execute_transform_start_deploy, False),
-    "transform_deploy_started": ("transform_poll_deploy_job", _poll_deploy_step, True),
-    "transform_deploy_waiting": ("transform_poll_deploy_job", _poll_deploy_step, True),
-    "transform_deploy_done": ("run_post_discover", _execute_post_discover, False),
+    # The Transform job has already applied the landing zone; check the org it left behind.
+    "iac_render_done": ("run_post_discover", _execute_post_discover, False),
     "post_discover_done": ("finish_deploy_workflow", _execute_finish, False),
 }
 
@@ -733,7 +651,7 @@ def _run_judgment(run_model: Callable[[], object], cp: dict) -> dict:
         _save_checkpoint("judgment_done", judgmentAttempts=attempts, judgmentHitlYields=hitl_yields)
         base.log_tool_event("tool.deploy_judgment", {"attempts": attempts})
         return _continue(
-            "deploy_judgment complete; render and start deploy run on the next invoke",
+            "deploy_judgment complete; render and post-deploy discover run on the next invoke",
             read_checkpoint() or {},
         )
 
@@ -774,15 +692,176 @@ def _run_judgment(run_model: Callable[[], object], cp: dict) -> dict:
     )
 
 
-def run_deploy_invoke(run_model: Callable[[], object]) -> dict:
-    """Drive the deploy workflow deterministically, invoking the model only for judgment.
+def _save_waiting(cp: dict, pending: dict) -> dict:
+    """Rewrite the waiting checkpoint with an updated pendingHumanInput; returns the new checkpoint."""
+    extra = {k: v for k, v in cp.items() if k not in ("stage", "updatedAt", "pendingHumanInput")}
+    _save_checkpoint(cp["stage"], pendingHumanInput=pending, **extra)
+    return read_checkpoint() or {}
+
+
+def _escalated(cp: dict, pending: dict, item: dict) -> dict:
+    """The question is the person's: show it with the agent's note (META via phase_invoke, C3)."""
+    note = conv.agent_note(item)
+    if pending.get("agentNote") != note:
+        cp = _save_waiting(cp, {**pending, "agentNote": note})
+    return _continue_from(cp)
+
+
+def _handle_connector_task(cp: dict, pending: dict, qkey: str, item: dict) -> dict | None:
+    """Transform's "connect the target account" task (CreateOrSelectConnectors), handled without a model.
+
+    The platform finds or creates the workspace connector of the type the task asks for, for the
+    deploy target account in the design's home Region. Approving a connector is a person's decision
+    (it grants Transform landing-zone permissions in that account): until the connector is ACTIVE
+    the question shows the AWS console approval link. Once ACTIVE, the platform submits the task
+    with that connector. Returns None when the task is some other kind of task.
+    """
+    job_id, task_id, ws = pending["jobId"], pending["taskId"], pending.get("workspaceId")
+    request = transform_ops.connector_task(job_id, task_id, ws)
+    if request is None:
+        return None
+    if item.get("connectorId"):
+        connector = {"connectorId": item["connectorId"],
+                     "status": transform_ops.connector_state(item["connectorId"], ws),
+                     "verificationLink": item.get("verificationLink"), "created": False}
+    else:
+        account = (_run_meta().get("deployTarget") or {}).get("accountId")
+        region = (_design_scope().get("regions") or {}).get("home")
+        if not account or not region:
+            raise RuntimeError(
+                f"connector task {task_id} needs the deploy target account ({account!r}) and the design's "
+                f"home Region ({region!r})"
+            )
+        connector = transform_ops.ensure_target_connector(
+            connector_type=request["connectorType"], account_id=account, region=region, workspace=ws
+        )
+        if connector["created"]:
+            base.log_tool_event("transform.connector_created", {
+                "connectorId": connector["connectorId"], "connectorType": request["connectorType"],
+                "accountId": account, "region": region})
+        item = {**item, "account": account, "region": region}
+    if connector["status"] == "ACTIVE":
+        out = transform_ops.submit_connector_task(
+            job_id=job_id, task_id=task_id, connector_id=connector["connectorId"],
+            connector_type=request["connectorType"], workspace=ws,
+        )
+        conv.put_question(qkey, status="answered", kind="task", title=pending.get("title"),
+                          connectorId=connector["connectorId"], taskStatus=out.get("status"))
+        base.log_tool_event("transform.connector_task_submitted", {
+            "jobId": job_id, "taskId": task_id, "connectorId": connector["connectorId"],
+            "connectorType": request["connectorType"], "taskStatus": out.get("status")})
+        return _continue_from(cp)
+    reason = (f"Approve the AWS Transform connector for account {item.get('account')} in "
+              f"{item.get('region')}. Open the approval link while signed in to that account and let it "
+              "create the connector role. The deploy continues on its own once the connector is active.")
+    stored = conv.put_question(qkey, status="awaiting_connector", kind="task", title=pending.get("title"),
+                               connectorId=connector["connectorId"], verificationLink=connector["verificationLink"],
+                               account=item.get("account"), region=item.get("region"), reason=reason,
+                               suggestion=None, link=connector["verificationLink"])
+    if item.get("status") != "awaiting_connector":
+        base.log_tool_event("transform.agent_escalated", {
+            "jobId": job_id, "kind": "task", "title": pending.get("title"), "reason": reason,
+            "suggestion": connector["verificationLink"]})
+    return _escalated(cp, pending, stored)
+
+
+def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
+    """Give the pending Transform question to the conversation agent once, then report the wait.
+
+    One decision per question (AGENTQ# item): answered and superseded questions are left for
+    Transform to move past, escalated ones carry the agent's note to the UI. A question a person
+    has already answered (ANSWER# sending/sent) is not given to the model. A model turn that raises
+    or ends without a decision is retried on the next invoke, up to conv.MAX_TURNS_PER_QUESTION,
+    then the run fails naming the question.
+    """
+    pending = cp["pendingHumanInput"]
+    qkey = conv.question_key(pending)
+    item = conv.get_question(qkey) or {}
+    status = item.get("status")
+    if pending["kind"] == "task" and status in (None, "deciding", "awaiting_connector"):
+        handled = _handle_connector_task(cp, pending, qkey, item)
+        if handled is not None:
+            return handled
+    if status == "escalated":
+        return _escalated(cp, pending, item)
+    if status in ("answered", "superseded"):
+        return _continue_from(cp)  # sent; Transform has not moved past this question yet
+    if pending["kind"] == "message" and existing_answer(base._ddb, base._state["run"], pending["messageId"]):
+        return _continue_from(cp)  # a person answered it from the UI
+
+    turns = int(item.get("turns") or 0)
+    if turns >= conv.MAX_TURNS_PER_QUESTION:
+        return _named_error(
+            "transform.agent_converse_failed",
+            f"transform_converse failed: the deploy agent made no decision on Transform {qkey} "
+            f"({pending.get('title')!r}) in {turns} model turns (limit {conv.MAX_TURNS_PER_QUESTION}); "
+            f"last error: {item.get('lastError')}",
+        )
+    turns += 1
+    conv.put_question(qkey, status="deciding", turns=turns, kind=pending["kind"], title=pending.get("title"),
+                      lastError=item.get("lastError"))
+    base.log_tool_event("deploy.sequencer.step", {"step": "transform_converse", "question": qkey, "turn": turns})
+
+    meta = _run_meta()
+    deployment = base._deployment_prefix()
+    context = conv.run_context(
+        meta=meta,
+        foundation=_get_json(f"{deployment}/foundation.json"),
+        gaps=_get_json(f"{deployment}/gap-analysis.json"),
+    )
+    scope = _design_scope()
+    prompt = conv.build_prompt(
+        pending=pending,
+        scope=scope,
+        context=context,
+        conversation=transform_ops.recent_conversation(
+            pending["jobId"], pending.get("workspaceId"), limit=conv.CONVERSATION_MESSAGES
+        ),
+        prior=item,
+    )
+    conv.begin_turn(qkey=qkey, pending=pending, scope=scope, context=context, turns=turns)
+    error = None
+    try:
+        converse(prompt)
+    except Exception as e:  # noqa: BLE001 - counted, recorded and audited; fails the run at the bound
+        error = f"{type(e).__name__}: {e}"[:_CONVERSE_ERROR_LIMIT]
+    finally:
+        decided = conv.end_turn()
+
+    item = conv.get_question(qkey) or {}
+    if error is None and decided and item.get("status") == decided:
+        if decided == "escalated":
+            return _escalated(cp, pending, item)
+        return _continue_from(cp)
+
+    error = error or "the model ended the turn without answering or escalating"
+    conv.put_question(qkey, status="deciding", turns=turns, kind=pending["kind"], title=pending.get("title"),
+                      lastError=error)
+    base.log_tool_event("transform.agent_turn_failed", {"question": qkey, "turn": turns,
+                                                         "limit": conv.MAX_TURNS_PER_QUESTION, "error": error[:500]})
+    if turns >= conv.MAX_TURNS_PER_QUESTION:
+        return _named_error(
+            "transform.agent_converse_failed",
+            f"transform_converse failed: the deploy agent made no decision on Transform {qkey} "
+            f"({pending.get('title')!r}) in {turns} model turns (limit {conv.MAX_TURNS_PER_QUESTION}); "
+            f"last error: {error}",
+        )
+    return _continue_from(cp)
+
+
+def run_deploy_invoke(run_model: Callable[[], object], converse: Callable[[str], object]) -> dict:
+    """Drive the deploy workflow deterministically, invoking a model only for judgment.
+
+    ``run_model`` runs one judgment turn (assessment + IaC plan); ``converse(prompt)`` runs one
+    Transform-conversation turn on the pending question.
 
     Reads the checkpoint strictly, runs every mechanical step in order, and returns:
       - ok       once all artifacts exist at agent_complete,
-      - continue (C3 payload) when a Transform job is still running or awaiting human input,
+      - continue (C3 payload) when the Transform job is still running or awaiting human input,
                  the poll budget is spent this invoke, or a judgment attempt ended,
       - error    naming the failing step, unreadable checkpoint key, refused job start (run not
-                 RUNNING), or incomplete judgment step and its missing artifact key.
+                 RUNNING), incomplete judgment step and its missing artifact key, or a Transform
+                 question the agent could not decide within its turn limit.
     """
     _require_deploy_mode()
     steps_run: list[str] = []
@@ -846,6 +925,11 @@ def run_deploy_invoke(run_model: Callable[[], object]) -> dict:
 
         cp = read_checkpoint()
         stage = cp.get("stage") if cp else None
+        if name == "transform_poll_analyze_job" and cp and cp.get("pendingHumanInput"):
+            try:
+                return _converse_on_pending(converse, cp)
+            except Exception as e:  # noqa: BLE001 - surfaced as a named step error
+                return _step_error("transform_converse", e)
         if cp and (stage in WAIT_STAGES or cp.get("awaitingHitl")):
             return _continue_from(cp)
 
@@ -870,7 +954,5 @@ def workflow_tools():
         transform_poll_analyze_job,
         transform_merge_discovery,
         render_iac_bundles,
-        transform_start_deploy,
-        transform_poll_deploy_job,
         finish_deploy_workflow,
     ]

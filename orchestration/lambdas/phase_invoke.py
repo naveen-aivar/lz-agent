@@ -3,7 +3,9 @@
 Deploy phase (orchestration/deployment.asl.json): the agent returns ok / continue / error. A continue payload
 follows contract C3:
     {"status": "continue", "reason": str, "awaitingHitl": bool, "jobId": str | None,
-     "pendingHumanInput": None | {source, jobId, workspaceId, kind, taskId, title, text, options, consoleUrl}}
+     "pendingHumanInput": None | {source, jobId, workspaceId, kind, taskId, title, text, options, consoleUrl,
+                                  agentNote?: {reason, suggestion}}}
+agentNote is set when the deploy agent handed the question to a person (agent/transform_conversation.py).
 This handler mirrors the pending question into META.pendingHumanInput (removed once a later result is not
 awaiting), audits it, and counts cycles for the state machine's two budgets: progressCount (awaitingHitl
 false) and hitlCount (awaitingHitl true). The state machine compares the counts with its limits.
@@ -78,6 +80,33 @@ def _validate_pending(pending, run_id: str) -> dict | None:
     task_id = pending.get("taskId")
     if task_id is not None and not isinstance(task_id, str):
         raise RuntimeError(f"agent continue payload for {run_id}: pendingHumanInput.taskId must be a string or null")
+    # messageId/choices let the UI answer a message question (POST /runs/{id}/answer). Agents built before
+    # they existed omit both; when present they must be well formed.
+    message_id = pending.get("messageId")
+    if message_id is not None and not isinstance(message_id, str):
+        raise RuntimeError(f"agent continue payload for {run_id}: pendingHumanInput.messageId must be a string or null")
+    choices = pending.get("choices")
+    if choices is not None and not (
+        isinstance(choices, list)
+        and all(
+            isinstance(c, dict) and isinstance(c.get("label"), str) and (c.get("value") is None or isinstance(c.get("value"), str))
+            for c in choices
+        )
+    ):
+        raise RuntimeError(
+            f"agent continue payload for {run_id}: pendingHumanInput.choices must be a list of {{label, value}} objects"
+        )
+    note = pending.get("agentNote")
+    if note is not None and not (
+        isinstance(note, dict)
+        and isinstance(note.get("reason"), str)
+        and (note.get("suggestion") is None or isinstance(note.get("suggestion"), str))
+        and (note.get("link") is None or (isinstance(note.get("link"), str) and note["link"].startswith("https://")))
+    ):
+        raise RuntimeError(
+            f"agent continue payload for {run_id}: pendingHumanInput.agentNote must be "
+            "{reason: str, suggestion: str | null, link?: https URL} or absent"
+        )
     return pending
 
 

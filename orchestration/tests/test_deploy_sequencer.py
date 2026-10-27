@@ -151,6 +151,7 @@ import agent.app as app  # noqa: E402
 
 tools = app.tools
 dwt = sys.modules["deploy_workflow_tools"]
+conv = sys.modules["transform_conversation"]
 transform_mcp_mod = sys.modules["transform_mcp"]
 from lzcore import deploy_transform  # noqa: E402
 from lzcore import transform_credentials as tcred  # noqa: E402
@@ -262,40 +263,83 @@ class FakeTable:
     """Serves one deploy META item (also returned for the design run META); records audit rows.
     Evaluates the sequencer's `#s = :running` condition like DynamoDB would."""
 
+    # The answer reservation condition (lzcore.transform_answers) is the only put condition modelled.
+    _ANSWER_CONDITION = "attribute_not_exists(PK) OR #st = :failed"
+
     def __init__(self, meta: dict):
         self.meta = dict(meta)
         self.audit: list[dict] = []
         self.updates: list[dict] = []
+        self.items: dict[tuple[str, str], dict] = {}  # non-META, non-AUDIT items (ANSWER#, AGENTQ#)
 
-    def get_item(self, Key):
+    def get_item(self, Key, ConsistentRead=False):
         if Key.get("SK") == "META":
             return {"Item": dict(self.meta)}
+        item = self.items.get((Key["PK"], Key["SK"]))
+        return {"Item": dict(item)} if item else {}
+
+    def put_item(self, Item, ConditionExpression=None, ExpressionAttributeNames=None, ExpressionAttributeValues=None):
+        sk = str(Item.get("SK", ""))
+        if sk.startswith("AUDIT#"):
+            self.audit.append(Item)
+            return {}
+        key = (Item["PK"], sk)
+        if ConditionExpression is not None:
+            if ConditionExpression != self._ANSWER_CONDITION:
+                raise AssertionError(f"FakeTable: unscripted put condition {ConditionExpression!r}")
+            current = self.items.get(key)
+            if current is not None and current.get("status") != ExpressionAttributeValues[":failed"]:
+                from botocore.exceptions import ClientError
+
+                raise ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": "x"}}, "PutItem")
+        self.items[key] = dict(Item)
         return {}
 
-    def put_item(self, Item):
-        if str(Item.get("SK", "")).startswith("AUDIT#"):
-            self.audit.append(Item)
-        return {}
+    def _apply(self, item: dict, expr: str, names: dict, vals: dict) -> None:
+        """Minimal SET/ADD evaluation for the expressions the agent writes."""
+        action, _, body = expr.partition(" ")
+        for clause in body.split(","):
+            if action == "SET":
+                attr, _, ref = (p.strip() for p in clause.partition("="))
+                item[names.get(attr, attr)] = vals[ref]
+            elif action == "ADD":
+                attr, ref = clause.split()
+                item[names.get(attr, attr)] = int(item.get(names.get(attr, attr)) or 0) + vals[ref]
+            else:
+                raise AssertionError(f"FakeTable: unscripted update {expr!r}")
 
     def update_item(self, Key, UpdateExpression="", ExpressionAttributeValues=None,
                     ExpressionAttributeNames=None, ConditionExpression=None):
         vals = dict(ExpressionAttributeValues or {})
+        names = dict(ExpressionAttributeNames or {})
+        if Key.get("SK") != "META":
+            item = self.items.setdefault((Key["PK"], Key["SK"]), {**Key})
+            self._apply(item, UpdateExpression, names, vals)
+            return {}
         if ConditionExpression is not None:
-            if ConditionExpression != "#s = :running" or (ExpressionAttributeNames or {}).get("#s") != "status":
+            if ConditionExpression != "#s = :running" or names.get("#s") != "status":
                 raise AssertionError(f"FakeTable: unscripted condition {ConditionExpression!r}")
             if self.meta.get("status") != vals[":running"]:
                 raise _ClientError("ConditionalCheckFailedException", "UpdateItem")
         self.updates.append({"expr": UpdateExpression, "vals": vals})
         if ":j" in vals and "transformAnalyzeJobId" in UpdateExpression:
             self.meta["transformAnalyzeJobId"] = vals[":j"]
-        if ":j" in vals and "transformDeployJobId" in UpdateExpression:
-            self.meta["transformDeployJobId"] = vals[":j"]
         if ":w" in vals:
             self.meta["transformWorkspaceId"] = vals[":w"]
+        if ":a" in vals and "pendingAnswer" in UpdateExpression:
+            self.meta["pendingAnswer"] = vals[":a"]
+        if UpdateExpression.startswith("ADD agentAnswerCount"):
+            self.meta["agentAnswerCount"] = int(self.meta.get("agentAnswerCount") or 0) + vals[":one"]
         return {}
+
+    def item(self, sk: str) -> dict | None:
+        return self.items.get((f"RUN#{DEPLOY_RUN}", sk))
 
     def actions(self):
         return [a.get("action") for a in self.audit]
+
+    def audit_of(self, action):
+        return [a for a in self.audit if a.get("action") == action]
 
 
 class FakeTransformOps:
@@ -311,15 +355,58 @@ class FakeTransformOps:
             super().__init__(f"HTTP {status_code}: {message}")
 
     _TERMINAL_OK = {"COMPLETED", "SUCCEEDED"}
+    QuestionChanged = real_transform_ops.QuestionChanged
 
-    def __init__(self, poll_script=None, create_error=None, on_create=None, stop_error=None):
+    def __init__(self, poll_script=None, create_error=None, on_create=None, stop_error=None, answer_error=None,
+                 connector_request=None, connector_states=None):
         self.poll_script = list(poll_script or [])
         self.create_error = create_error
         self.on_create = on_create
         self.stop_error = stop_error
+        self.answer_error = answer_error
         self.started: list[tuple[str, str]] = []
         self.stopped: list[tuple[str, str]] = []
+        self.answers: list[dict] = []
         self.polls = 0
+        self.connector_request = connector_request  # None: the task is not a connector task
+        self.connector_states = list(connector_states or [])  # successive GetConnector statuses
+        self.connectors_ensured: list[dict] = []
+        self.submitted: list[dict] = []
+
+    ConnectorRejected = real_transform_ops.ConnectorRejected
+
+    def connector_task(self, job_id, task_id, workspace=None):
+        return dict(self.connector_request, taskId=task_id) if self.connector_request else None
+
+    def ensure_target_connector(self, *, connector_type, account_id, region, workspace=None):
+        self.connectors_ensured.append({"type": connector_type, "account": account_id, "region": region})
+        status = self.connector_states.pop(0)
+        return {"connectorId": "conn-1", "status": status, "created": True,
+                "verificationLink": f"https://{region}.console.aws.amazon.com/transform/connector/conn-1/configure"}
+
+    def connector_state(self, connector_id, workspace=None):
+        status = self.connector_states.pop(0)
+        if status == "REJECTED":
+            raise self.ConnectorRejected(f"Transform connector {connector_id} was rejected in the AWS console")
+        return status
+
+    def submit_connector_task(self, *, job_id, task_id, connector_id, connector_type, workspace=None):
+        self.submitted.append({"task": task_id, "connector": connector_id, "type": connector_type})
+        return {"taskId": task_id, "status": "CLOSED"}
+
+    def transform_region(self):
+        return "ap-south-1"
+
+    def recent_conversation(self, job_id, workspace=None, limit=12):
+        return [{"messageId": "m-0", "origin": "SYSTEM", "createdAt": "1", "text": "Welcome", "options": []}]
+
+    def answer_message(self, job_id, message_id, *, idempotency_token, option=None, text=None, workspace=None):
+        self.answers.append({"job_id": job_id, "message_id": message_id, "option": option, "text": text,
+                             "workspace": workspace, "token": idempotency_token})
+        if self.answer_error is not None:
+            raise self.answer_error
+        return {"jobId": job_id, "answeredMessageId": message_id, "sentMessageId": f"sent-{len(self.answers)}",
+                "text": option or text}
 
     def workspace_id(self):
         return WORKSPACE
@@ -587,8 +674,10 @@ class _SequencerCaseBase(unittest.TestCase):
             (tools, "deploy_boto_session", _session),
             (deploy_transform, "transform_ops", self.fake_ops),
             (dwt, "transform_ops", self.fake_ops),
+            (conv, "transform_ops", self.fake_ops),
             (app, "transform_tools", _fake_transform_tools),
             (app, "_deploy_agent", self._model_not_scripted),
+            (app, "_converse_agent", self._converse_not_scripted),
         ):
             p = mock.patch.object(target, attr, value)
             p.start()
@@ -606,6 +695,25 @@ class _SequencerCaseBase(unittest.TestCase):
 
     def _model_not_scripted(self, prompt):
         raise AssertionError("judgment model invoked but the test did not script it")
+
+    def _converse_not_scripted(self, prompt):
+        raise AssertionError("conversation model invoked but the test did not script it")
+
+    def _set_converse(self, *turns):
+        """Each turn is a callable(prompt) run as one conversation-model turn, in order."""
+        script = list(turns)
+        prompts: list[str] = []
+
+        def converse(prompt):
+            prompts.append(prompt)
+            if not script:
+                raise AssertionError("conversation model invoked more times than scripted")
+            return script.pop(0)(prompt)
+
+        p = mock.patch.object(app, "_converse_agent", converse)
+        p.start()
+        self.addCleanup(p.stop)
+        return prompts
 
     def _set_model(self, steps):
         model = _ScriptedModel(steps)
@@ -741,39 +849,36 @@ class CaseC_MechanicalStages(_SequencerCaseBase):
         self._seed_foundation()
         self._seed_checkpoint(stage)
 
-    def test_judgment_done_renders_starts_deploy_and_waits(self):
-        self._env_at("judgment_done")
+    def _seed_pre_artifacts(self):
+        """What pre-discover, the Transform job polls and judgment leave behind before render."""
         self._seed_judgment()
+        self.s3.put_json(f"{DEPLOYMENT}/classification.json", {"classification": "brownfield"})
+        self.s3.put_json(f"{DEPLOYMENT}/transform-poll-analyze.json", {"status": "COMPLETED"})
+
+    def test_judgment_done_renders_post_discovers_and_finishes_without_a_second_job(self):
+        self._env_at("judgment_done")
+        self._seed_pre_artifacts()
 
         result = self._invoke()
 
-        self._assert_continue(result, job_id=DEPLOY_JOB)
-        self.assertEqual(self._stage(), "transform_deploy_waiting")
+        self.assertEqual(result, {"status": "ok", "summary": "deploy agent phase complete"})
+        self.assertEqual(self._stage(), "agent_complete")
         self.assertIn(f"{DEPLOYMENT}/iac-manifest.json", self.s3.store)
-        self.assertEqual(self.fake_ops.started, [("deploy", DEPLOY_JOB)])
+        self.assertEqual(self.fake_ops.started, [])  # the landing zone job is the only Transform job
+        self.assertEqual(self.session_calls, 1)
 
     def test_transform_merged_with_both_artifacts_renders_without_model(self):
         self._env_at("transform_merged")
-        self._seed_judgment()
+        self._seed_pre_artifacts()
 
         result = self._invoke()
 
-        self._assert_continue(result, job_id=DEPLOY_JOB)
-        self.assertEqual(self._stage(), "transform_deploy_waiting")
+        self.assertEqual(result.get("status"), "ok", msg=f"got {result!r}")
         self.assertIn(f"{DEPLOYMENT}/iac-manifest.json", self.s3.store)
+        self.assertEqual(self.fake_ops.started, [])
 
-    def test_start_deploy_from_iac_render_done(self):
+    def test_iac_render_done_runs_post_discover_and_finishes(self):
         self._env_at("iac_render_done")
-        self._seed_judgment()
-
-        result = self._invoke()
-
-        self._assert_continue(result, job_id=DEPLOY_JOB)
-        self.assertEqual(self._stage(), "transform_deploy_waiting")
-        self.assertEqual(self.table.meta["transformDeployJobId"], DEPLOY_JOB)
-
-    def test_deploy_done_runs_post_discover_and_finishes(self):
-        self._env_at("transform_deploy_done", transformDeployJobId=DEPLOY_JOB)
         post = {f"{DEPLOYMENT}/{n}" for n in ("foundation-post.json", "gap-analysis-post.json", "classification-post.json")}
         for key in deployment_artifact_keys(DEPLOY_RUN):
             if key not in post and key not in self.s3.store:
@@ -785,6 +890,13 @@ class CaseC_MechanicalStages(_SequencerCaseBase):
         self.assertEqual(self._stage(), "agent_complete")
         self.assertTrue(post <= set(self.s3.store))
         self.assertEqual(self.session_calls, 1)
+        self.assertEqual(self.fake_ops.started, [])
+
+    def test_retired_deploy_job_stages_are_unknown(self):
+        for stage in ("transform_deploy_started", "transform_deploy_waiting", "transform_deploy_done"):
+            with self.subTest(stage=stage):
+                self._env_at(stage)
+                self._assert_error(self._invoke(), f"unknown deploy checkpoint stage {stage!r}")
 
     def test_post_discover_done_with_missing_artifacts_names_them(self):
         self._env_at("post_discover_done")
@@ -1054,18 +1166,6 @@ class RunStatusGuard(_SequencerCaseBase):
         self.assertEqual(self.fake_ops.started, [])
         self.assertEqual(self._stage(), "transform_init_done")
 
-    def test_start_deploy_refused_when_run_failed(self):
-        self._make_env(meta_extra={"status": "FAILED"})
-        self._seed_foundation()
-        self._seed_judgment()
-        self._seed_checkpoint("iac_render_done")
-
-        result = self._invoke()
-
-        self.assertEqual(result, {"status": "error", "error": "transform_start_deploy refused: run is FAILED"})
-        self.assertEqual(self.fake_ops.started, [])
-        self.assertEqual(self._stage(), "iac_render_done")
-
     def test_run_stopped_during_create_job_stops_the_new_job(self):
         def stop_run(phase, job_id):
             self.table.meta["status"] = "FAILED"  # /stop lands between the guard and CreateJob
@@ -1100,19 +1200,17 @@ class OrphanedJobs(_SequencerCaseBase):
         self.assertIn("tool.transform_start_analyze.orphan_stop", self.table.actions())
         self.assertEqual(self._stage(), "transform_init_done")
 
-    def test_deploy_checkpoint_write_failure_reports_stop_failure(self):
+    def test_analyze_checkpoint_write_failure_reports_stop_failure(self):
         self._make_env(transform_ops=FakeTransformOps(stop_error=RuntimeError("StopJob throttled")))
         self._seed_foundation()
-        self._seed_judgment()
-        self._seed_checkpoint("iac_render_done")
+        self._seed_checkpoint("transform_init_done")
         self.s3.put_errors[CHECKPOINT_KEY] = "AccessDenied"
 
         result = self._invoke()
 
-        self._assert_error(result, "transform_start_deploy failed", DEPLOY_JOB,
-                           f"stop_job({DEPLOY_JOB}) failed: StopJob throttled")
-        self.assertEqual(self.fake_ops.stopped, [(DEPLOY_JOB, WORKSPACE)])
-        self.assertEqual(self._stage(), "iac_render_done")
+        self._assert_error(result, "transform_start_analyze failed", ANALYZE_JOB,
+                           f"stop_job({ANALYZE_JOB}) failed: StopJob throttled")
+        self.assertEqual(self.fake_ops.stopped, [(ANALYZE_JOB, WORKSPACE)])
 
     def test_create_job_failure_does_not_call_stop(self):
         self._make_env(transform_ops=FakeTransformOps(create_error=RuntimeError("CreateJob 500")))
@@ -1135,14 +1233,16 @@ class PendingHumanInputWiring(_SequencerCaseBase):
 
     def test_pending_input_on_executing_job_sets_awaiting_hitl(self):
         self._env([("EXECUTING", PENDING)])
+        self._set_converse(lambda prompt: conv.escalate_to_human("Connect the target account in the console."))
 
         result = self._invoke()
 
-        self._assert_continue(result, awaiting=True, pending=PENDING, job_id=ANALYZE_JOB)
+        expected = {**PENDING, "agentNote": {"reason": "Connect the target account in the console.", "suggestion": None}}
+        self._assert_continue(result, awaiting=True, pending=expected, job_id=ANALYZE_JOB)
         cp = self._checkpoint()
         self.assertEqual(cp["stage"], "transform_analyze_waiting")
         self.assertIs(cp["awaitingHitl"], True)
-        self.assertEqual(cp["pendingHumanInput"], PENDING)
+        self.assertEqual(cp["pendingHumanInput"], expected)
 
     def test_awaiting_status_without_task_has_null_pending(self):
         self._env(["AWAITING_HUMAN_INPUT"])
@@ -1154,8 +1254,9 @@ class PendingHumanInputWiring(_SequencerCaseBase):
 
     def test_answered_input_clears_pending_on_next_poll(self):
         self._env([("EXECUTING", PENDING), "EXECUTING"])
+        self._set_converse(lambda prompt: conv.escalate_to_human("Complete the task in AWS Transform."))
 
-        self._assert_continue(self._invoke(), awaiting=True, pending=PENDING)
+        self.assertIs(self._invoke()["awaitingHitl"], True)
         result = self._invoke()
 
         self._assert_continue(result, awaiting=False, pending=None)
@@ -1163,18 +1264,330 @@ class PendingHumanInputWiring(_SequencerCaseBase):
         self.assertIsNone(cp["pendingHumanInput"])
         self.assertIs(cp["awaitingHitl"], False)
 
-    def test_second_poll_in_one_invoke_is_deferred_with_c3_payload(self):
-        # Judgment artifacts already saved: analyze poll -> merge -> render -> start deploy, then
-        # the deploy poll is deferred to the next invoke (one Transform poll per invoke).
+    def test_completed_job_runs_to_the_end_with_one_poll(self):
+        # Judgment artifacts already saved: poll (COMPLETED) -> merge -> render -> post-discover ->
+        # finish in one invoke; there is no second Transform job to start or poll.
         self._env(["COMPLETED"])
         self._seed_judgment()
+        self.s3.put_json(f"{DEPLOYMENT}/classification.json", {"classification": "brownfield"})
 
         result = self._invoke()
 
-        self._assert_continue(result, awaiting=False, pending=None, job_id=DEPLOY_JOB)
-        self.assertEqual(result["reason"], "transform_poll_deploy_job already polled this invoke")
-        self.assertEqual(self._stage(), "transform_deploy_started")
+        self.assertEqual(result, {"status": "ok", "summary": "deploy agent phase complete"})
         self.assertEqual(self.fake_ops.polls, 1)
+        self.assertEqual(self.fake_ops.started, [])
+
+
+# --------------------------------------------------------------------------------------
+# The deploy agent's side of the Transform conversation (agent/transform_conversation.py)
+# --------------------------------------------------------------------------------------
+MESSAGE = {
+    "source": "transform",
+    "jobId": ANALYZE_JOB,
+    "workspaceId": WORKSPACE,
+    "kind": "message",
+    "taskId": None,
+    "messageId": "msg-0001",
+    "title": "Transform is asking for a decision",
+    "text": "What would you like to accomplish today?",
+    "options": ["Landing Zone", "End-to-End Migration"],
+    "choices": [{"label": "Landing Zone", "value": "Landing Zone"},
+                {"label": "End-to-End Migration", "value": "End-to-End Migration"}],
+    "consoleUrl": "https://transform.example.invalid/jobs/job-analyze",
+}
+
+
+def _answer(option="Landing Zone", category="workflow", basis=("context:runPurpose",), text="", expect="SENT"):
+    def turn(prompt):
+        out = conv.answer_transform_question(category=category, rationale="The run builds a landing zone only.",
+                                             basis=list(basis), option=option, text=text)
+        assert out.startswith(expect), out
+        return out
+    return turn
+
+
+def _escalate(reason="Needs a person.", suggestion=""):
+    def turn(prompt):
+        out = conv.escalate_to_human(reason, suggestion)
+        assert out.startswith("Handed"), out
+        return out
+    return turn
+
+
+def _no_decision(prompt):
+    return "thinking about it"
+
+
+class TransformConversation(_SequencerCaseBase):
+    def _env(self, script, **ops):
+        self._make_env(transform_ops=FakeTransformOps(poll_script=script, **ops),
+                       meta_extra={"transformAnalyzeJobId": ANALYZE_JOB,
+                                   "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}})
+        self._seed_foundation()
+        self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
+
+    def _q(self, qkey="message:msg-0001"):
+        return self.table.item(f"AGENTQ#{qkey}")
+
+    def test_agent_answers_from_context_through_the_shared_answer_path(self):
+        self._env([("EXECUTING", MESSAGE)])
+        prompts = self._set_converse(_answer())
+
+        result = self._invoke()
+
+        self._assert_continue(result, awaiting=True, pending=MESSAGE, job_id=ANALYZE_JOB)
+        (sent,) = self.fake_ops.answers
+        self.assertEqual((sent["message_id"], sent["option"], sent["text"], sent["workspace"]),
+                         ("msg-0001", "Landing Zone", None, WORKSPACE))
+        lock = self.table.item("ANSWER#msg-0001")
+        self.assertEqual((lock["status"], lock["by"], lock["sentMessageId"]), ("sent", "agent", "sent-1"))
+        self.assertEqual(self.table.meta["pendingAnswer"]["by"], "agent")
+        self.assertEqual(self.table.meta["agentAnswerCount"], 1)
+        self.assertEqual(self._q()["status"], "answered")
+        (row,) = self.table.audit_of("transform.answer_sent")
+        detail = json.loads(row["detail"])
+        self.assertEqual((row["actor"], detail["by"], detail["category"], detail["basis"]),
+                         ("agent", "agent", "workflow", ["context:runPurpose"]))
+        # The model saw the question, the design and the run context.
+        self.assertIn("What would you like to accomplish today?", prompts[0])
+        self.assertIn('"orgName": "Acme"', prompts[0])
+        self.assertIn(TARGET_ACCOUNT, prompts[0])
+
+    def test_answered_question_is_not_given_to_the_model_again(self):
+        self._env([("EXECUTING", MESSAGE), ("EXECUTING", MESSAGE)])
+        self._set_converse(_answer())
+        self._invoke()
+
+        result = self._invoke()  # Transform has not moved past the question yet
+
+        self._assert_continue(result, awaiting=True, pending=MESSAGE)
+        self.assertEqual(len(self.fake_ops.answers), 1)
+
+    def test_design_answer_cites_a_scope_pointer(self):
+        self._env([("EXECUTING", MESSAGE)])
+        self._set_converse(_answer(option="", text="Use the OU Workloads.", category="design", basis=("scope:/ous/0/name",)))
+
+        self._invoke()
+
+        self.assertEqual(self.fake_ops.answers[0]["text"], "Use the OU Workloads.")
+
+    def test_unresolvable_basis_and_approval_category_are_refused(self):
+        self._env([("EXECUTING", MESSAGE)])
+        self._set_converse(lambda prompt: (
+            _answer(basis=("scope:/ous/7/name",), expect="REFUSED")(prompt),
+            _answer(basis=("context:noSuchKey",), expect="REFUSED")(prompt),
+            _answer(basis=("the SOW says so",), expect="REFUSED")(prompt),
+            _answer(category="approval", expect="REFUSED")(prompt),
+            _answer(option="Deploy for me", expect="REFUSED")(prompt),
+            _escalate("Pick the workflow.", "Landing Zone")(prompt),
+        ))
+
+        result = self._invoke()
+
+        self.assertEqual(self.fake_ops.answers, [])
+        self.assertIsNone(self.table.item("ANSWER#msg-0001"))
+        self.assertEqual(result["pendingHumanInput"]["agentNote"],
+                         {"reason": "Pick the workflow.", "suggestion": "Landing Zone"})
+        self.assertIn("transform.agent_escalated", self.table.actions())
+
+    def test_one_decision_per_turn(self):
+        self._env([("EXECUTING", MESSAGE)])
+        self._set_converse(lambda prompt: (_escalate()(prompt), _answer(expect="REFUSED")(prompt)))
+
+        self._invoke()
+
+        self.assertEqual(self.fake_ops.answers, [])
+        self.assertEqual(self._q()["status"], "escalated")
+
+    def test_task_can_only_be_escalated(self):
+        self._env([("EXECUTING", PENDING)])
+        self._set_converse(lambda prompt: (_answer(option="Approve", expect="REFUSED")(prompt),
+                                           _escalate("Connect account 222222222222 in ap-south-1.")(prompt)))
+
+        result = self._invoke()
+
+        self.assertEqual(result["pendingHumanInput"]["agentNote"]["reason"], "Connect account 222222222222 in ap-south-1.")
+        self.assertEqual(self._q("task:task-0001")["status"], "escalated")
+
+    def test_escalated_question_keeps_its_note_without_another_model_turn(self):
+        self._env([("EXECUTING", MESSAGE), ("EXECUTING", MESSAGE)])
+        self._set_converse(_escalate("Needs the MAP id."))
+        self._invoke()
+
+        result = self._invoke()  # fresh poll rewrites pending without the note
+
+        self.assertEqual(result["pendingHumanInput"]["agentNote"], {"reason": "Needs the MAP id.", "suggestion": None})
+        self.assertEqual(self._checkpoint()["pendingHumanInput"]["agentNote"]["reason"], "Needs the MAP id.")
+
+    def test_question_a_person_already_answered_skips_the_model(self):
+        self._env([("EXECUTING", MESSAGE)])
+        self.table.items[(f"RUN#{DEPLOY_RUN}", "ANSWER#msg-0001")] = {"status": "sent", "by": "user-sub"}
+
+        result = self._invoke()  # _converse_not_scripted would fail the test if the model ran
+
+        self._assert_continue(result, awaiting=True, pending=MESSAGE)
+
+    def test_person_answering_first_supersedes_the_agent(self):
+        self._env([("EXECUTING", MESSAGE)])
+
+        def person_wins(prompt):
+            self.table.items[(f"RUN#{DEPLOY_RUN}", "ANSWER#msg-0001")] = {"status": "sending", "by": "user-sub"}
+            return _answer(expect="REFUSED")(prompt)
+
+        self._set_converse(person_wins)
+
+        result = self._invoke()
+
+        self.assertEqual(result["status"], "continue")
+        self.assertEqual(self.fake_ops.answers, [])
+        self.assertEqual(self._q()["status"], "superseded")
+
+    def test_question_changed_in_transform_is_superseded_and_released(self):
+        self._env([("EXECUTING", MESSAGE)],
+                  answer_error=real_transform_ops.QuestionChanged("now waits on message msg-0002"))
+        self._set_converse(_answer(expect="REFUSED"))
+
+        result = self._invoke()
+
+        self.assertEqual(result["status"], "continue")
+        self.assertEqual(self._q()["status"], "superseded")
+        self.assertEqual(self.table.item("ANSWER#msg-0001")["status"], "failed")
+        self.assertIn("transform.answer_failed", self.table.actions())
+
+    def test_send_failure_counts_as_a_failed_turn(self):
+        self._env([("EXECUTING", MESSAGE)], answer_error=RuntimeError("Transform 500"))
+        self._set_converse(_answer(expect="never"))  # the tool raises; the turn fails
+
+        result = self._invoke()
+
+        self.assertEqual(result["status"], "continue")
+        q = self._q()
+        self.assertEqual((q["status"], q["turns"]), ("deciding", 1))
+        self.assertIn("Transform 500", q["lastError"])
+        self.assertEqual(self.table.item("ANSWER#msg-0001")["status"], "failed")
+
+    def test_no_decision_fails_the_run_after_the_turn_limit(self):
+        self._env([("EXECUTING", MESSAGE)] * conv.MAX_TURNS_PER_QUESTION)
+        prompts = self._set_converse(*([_no_decision] * conv.MAX_TURNS_PER_QUESTION))
+
+        results = [self._invoke() for _ in range(conv.MAX_TURNS_PER_QUESTION)]
+
+        for r in results[:-1]:
+            self.assertEqual(r["status"], "continue")
+        self._assert_error(results[-1], "transform_converse failed", "message:msg-0001",
+                           f"in {conv.MAX_TURNS_PER_QUESTION} model turns", "without answering or escalating")
+        self.assertEqual(len(self.table.audit_of("transform.agent_turn_failed")), conv.MAX_TURNS_PER_QUESTION)
+        self.assertIn("did not finish", prompts[1])  # the retry is told what went wrong
+
+    def test_model_error_is_retried_on_the_next_invoke(self):
+        self._env([("EXECUTING", MESSAGE), ("EXECUTING", MESSAGE)])
+
+        def throttled(prompt):
+            raise RuntimeError("ThrottlingException")
+
+        self._set_converse(throttled, _answer())
+
+        self.assertEqual(self._invoke()["status"], "continue")
+        self.assertIn("ThrottlingException", self._q()["lastError"])
+        self._invoke()
+
+        self.assertEqual(self._q()["status"], "answered")
+        self.assertEqual(self._q()["turns"], 2)
+
+    def test_answer_limit_sends_everything_to_a_person(self):
+        self._env([("EXECUTING", MESSAGE)])
+        self.table.meta["agentAnswerCount"] = conv.MAX_AGENT_ANSWERS_PER_RUN
+        self._set_converse(lambda prompt: (_answer(expect="REFUSED")(prompt), _escalate("Answer limit reached.")(prompt)))
+
+        self._invoke()
+
+        self.assertEqual(self.fake_ops.answers, [])
+
+    def test_tools_refuse_outside_a_turn(self):
+        self._env([])
+        self.assertTrue(conv.escalate_to_human("x").startswith("REFUSED"))
+        self.assertTrue(conv.answer_transform_question("workflow", "r", ["context:runPurpose"], "Landing Zone").startswith("REFUSED"))
+
+    def test_converse_agent_gets_only_the_decision_tools(self):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, *, model, system_prompt, tools):
+                captured.update(system_prompt=system_prompt, tools=tools)
+
+            def __call__(self, prompt):
+                return "ok"
+
+        for target, attr, value in ((app, "Agent", FakeAgent), (app, "BedrockModel", lambda **k: "model")):
+            p = mock.patch.object(target, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+        self.assertEqual(_REAL_CONVERSE_AGENT("prompt"), "ok")
+        self.assertEqual({_tool_name(t) for t in captured["tools"]}, {"answer_transform_question", "escalate_to_human"})
+        self.assertEqual(captured["system_prompt"], app.CONVERSE_SYSTEM)
+        self.assertIn("Approval gates", app.CONVERSE_SYSTEM)
+
+
+class ConnectorTask(_SequencerCaseBase):
+    REQUEST = {"severity": "CRITICAL", "status": "AWAITING_HUMAN_INPUT",
+               "connectorType": "vmware_migration|infra_provisioning|5", "artifact": {}}
+
+    def _env(self, script, states):
+        self._make_env(transform_ops=FakeTransformOps(poll_script=script, connector_request=self.REQUEST,
+                                                      connector_states=states),
+                       meta_extra={"transformAnalyzeJobId": ANALYZE_JOB,
+                                   "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}})
+        self._seed_foundation()
+        self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
+
+    def test_pending_connector_shows_the_approval_link_then_submits_once_active(self):
+        self._env([("EXECUTING", PENDING), ("EXECUTING", PENDING), ("EXECUTING", PENDING)],
+                  ["PENDING", "PENDING", "ACTIVE"])
+
+        first = self._invoke()  # model is not scripted: the connector task never reaches it
+
+        note = first["pendingHumanInput"]["agentNote"]
+        self.assertIn(TARGET_ACCOUNT, note["reason"])
+        self.assertIn("eu-west-1", note["reason"])
+        self.assertTrue(note["link"].startswith("https://eu-west-1.console.aws.amazon.com/transform/connector/conn-1"))
+        self.assertEqual(self.fake_ops.connectors_ensured,
+                         [{"type": "vmware_migration|infra_provisioning|5", "account": TARGET_ACCOUNT, "region": "eu-west-1"}])
+        self.assertIn("transform.connector_created", self.table.actions())
+        self.assertEqual(len(self.table.audit_of("transform.agent_escalated")), 1)
+
+        self._invoke()  # still pending: same note, no second audit
+        self.assertEqual(self.fake_ops.submitted, [])
+        self.assertEqual(len(self.table.audit_of("transform.agent_escalated")), 1)
+
+        self._invoke()  # approved in the console
+        self.assertEqual(self.fake_ops.submitted,
+                         [{"task": "task-0001", "connector": "conn-1", "type": "vmware_migration|infra_provisioning|5"}])
+        self.assertEqual(self.table.item("AGENTQ#task:task-0001")["status"], "answered")
+        self.assertIn("transform.connector_task_submitted", self.table.actions())
+
+    def test_active_connector_is_used_straight_away(self):
+        self._env([("EXECUTING", PENDING)], ["ACTIVE"])
+
+        self._invoke()
+
+        self.assertEqual(len(self.fake_ops.submitted), 1)
+        self.assertNotIn("transform.agent_escalated", self.table.actions())
+
+    def test_rejected_connector_fails_the_run_naming_it(self):
+        self._env([("EXECUTING", PENDING), ("EXECUTING", PENDING)], ["PENDING", "REJECTED"])
+        self._invoke()
+
+        result = self._invoke()
+
+        self._assert_error(result, "transform_converse failed", "conn-1", "rejected")
+        self.assertEqual(self.fake_ops.submitted, [])
+
+    def test_missing_home_region_raises(self):
+        self._env([("EXECUTING", PENDING)], ["PENDING"])
+        self.s3.put_json(f"runs/{DESIGN_RUN}/intake/scope.json", {**SCOPE, "regions": {}})
+
+        self._assert_error(self._invoke(), "transform_converse failed", "home Region")
 
 
 # --------------------------------------------------------------------------------------
@@ -1237,6 +1650,7 @@ class JudgmentAgentTools(_SequencerCaseBase):
 
 
 _REAL_DEPLOY_AGENT = app._deploy_agent
+_REAL_CONVERSE_AGENT = app._converse_agent
 
 
 if __name__ == "__main__":

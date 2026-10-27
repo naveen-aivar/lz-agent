@@ -60,7 +60,7 @@ class FakeTransform:
         self.status = status
         self.tasks = list(tasks)
         self.messages = list(messages)
-        self.profiles = [{"profileName": "default", "applicationUrl": APP_URL}] if profiles is None else profiles
+        self.profiles = [{"ProfileName": "AWS-Transform", "applicationUrl": APP_URL}] if profiles is None else profiles
         self.errors = dict(errors or {})
         self.batch_errors = list(batch_errors)
         self.calls = []
@@ -94,7 +94,7 @@ class FakeTransform:
         if operation in self.errors:
             raise self.errors[operation]
         if operation == "ListProfiles":
-            return {"profiles": self.profiles}
+            return {"Profiles": self.profiles}
         raise AssertionError(f"unscripted TCP operation {operation}")
 
     def ops(self):
@@ -107,7 +107,7 @@ class _Case(unittest.TestCase):
         from awslabs.aws_transform_mcp_server.config_store import set_sigv4_fes_available, set_sigv4_region
 
         for patcher in (
-            mock.patch.dict(os.environ, {"TRANSFORM_WORKSPACE_ID": WS, "TRANSFORM_ROLE_ARN": ROLE}),
+            mock.patch.dict(os.environ, {"TRANSFORM_WORKSPACE_ID": WS, "TRANSFORM_ROLE_ARN": ROLE, "TRANSFORM_REGION": "us-east-1"}),
             mock.patch.object(transform_credentials, "_BASE_SESSION", _NoNetworkBase()),
             mock.patch.dict(transform_ops._application_urls, clear=True),
         ):
@@ -149,7 +149,7 @@ class PendingDetection(_Case):
         self.assertEqual(p["options"], [])
         self.assertEqual(p["consoleUrl"], CONSOLE)
         self.assertEqual((p["source"], p["jobId"], p["workspaceId"]), ("transform", JOB, WS))
-        self.assertEqual(set(p), {"source", "jobId", "workspaceId", "kind", "taskId", "title", "text", "options", "consoleUrl"})
+        self.assertEqual(set(p), {"source", "jobId", "workspaceId", "kind", "taskId", "messageId", "title", "text", "options", "choices", "consoleUrl"})
         body = dict(fake.calls)["ListHitlTasks"]
         self.assertEqual(body["taskType"], "NORMAL")
         self.assertEqual(body["taskFilter"]["taskStatuses"], list(transform_ops._ACTIONABLE_HITL_STATUSES))

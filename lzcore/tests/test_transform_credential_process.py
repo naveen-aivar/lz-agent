@@ -26,6 +26,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from lzcore import transform_credential_process as tcp  # noqa: E402
+from lzcore import transform_ops  # noqa: E402
 
 ROLE = "arn:aws:iam::111122223333:role/IngramLandingZoneTransform"
 STATIC = {"AWS_ACCESS_KEY_ID": "AKIAPLATFORM", "AWS_SECRET_ACCESS_KEY": "p", "AWS_SESSION_TOKEN": "pt"}
@@ -191,9 +192,10 @@ class AgentTransformMcpEnvTests(_Base):
         self.addCleanup(lambda: sys.modules.pop("transform_mcp", None))
         return importlib.import_module("transform_mcp")
 
+    @unittest.skipUnless(transform_ops.TRANSFORM_AVAILABLE, "aws-transform-mcp-server not installed")
     def test_server_env_uses_credential_process_profile(self):
         mod = self._import_agent_module()
-        os.environ.update({"TRANSFORM_WORKSPACE_ID": "ws-1", **STATIC, **CONTAINER})
+        os.environ.update({"TRANSFORM_WORKSPACE_ID": "ws-1", "TRANSFORM_REGION": "ap-south-1", **STATIC, **CONTAINER})
         params = mod.server_params(self.dir)
         env = params.env
         self.assertEqual(env["AWS_PROFILE"], tcp.PROFILE_NAME)
@@ -203,6 +205,11 @@ class AgentTransformMcpEnvTests(_Base):
         self.assertEqual(env["AWS_CONTAINER_CREDENTIALS_FULL_URI"], CONTAINER["AWS_CONTAINER_CREDENTIALS_FULL_URI"])
         self.assertEqual(env["TRANSFORM_WORKSPACE_ID"], "ws-1")
         self.assertEqual(params.args, ["-m", "awslabs.aws_transform_mcp_server.server"])
+        # Region pinned for the MCP server's own region discovery (multiple profiles per account).
+        self.assertEqual(env["TRANSFORM_REGION"], "ap-south-1")
+        self.assertEqual(env["AWS_REGION"], "ap-south-1")
+        self.assertEqual(env["AWS_TRANSFORM_API_ENDPOINT"], "https://api.transform.ap-south-1.on.aws/")
+        self.assertEqual(env["AWS_TRANSFORM_TCP_ENDPOINT"], "https://transform.ap-south-1.api.aws")
 
 
 if __name__ == "__main__":

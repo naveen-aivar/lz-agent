@@ -41,14 +41,15 @@ def handler(event, _ctx):
 
     plan = _get(f"{base}/iac-change-plan.json")
 
-    deploy_poll = _get(f"{base}/transform-poll-deploy.json")
-    deploy_status = deploy_poll.get("status")
+    # One Transform job plans and applies the landing zone; its final poll carries the outcome.
+    job_poll = _get(f"{base}/transform-poll-analyze.json")
+    job_status = job_poll.get("status")
 
     overall, reasons = evaluate_deployment_outcome(
         pre_gaps=pre_gaps,
         post_gaps=post_gaps,
         plan=plan,
-        transform_deploy_status=deploy_status,
+        transform_deploy_status=job_status,
     )
     iac_plan_summary = None
     if plan:
@@ -60,9 +61,8 @@ def handler(event, _ctx):
         }
     transform_block = {
         "workspaceId": run.get("transformWorkspaceId"),
-        "analyzeJobId": run.get("transformAnalyzeJobId"),
-        "deployJobId": run.get("transformDeployJobId"),
-        "deployJobStatus": deploy_status,
+        "jobId": run.get("transformAnalyzeJobId"),
+        "jobStatus": job_status,
     }
     report = build_deployment_report(
         run_id=run_id,

@@ -5,7 +5,11 @@
 let cfg, token = null, claims = {};
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-const S = { runs: [], runId: "", data: null, tab: "organization", steps: false, file: null, timer: null };
+const S = { runs: [], runId: "", data: null, tab: "organization", steps: false, file: null, timer: null,
+  answer: { key: "", selected: null, draft: "", sending: false, error: "", expanded: false, reply: false },
+  stale: false, feedSeen: 0, notified: new Set() };
+// Cognito group allowed to answer AWS Transform from this UI (platform.yaml TransformApproversGroup).
+const APPROVER_GROUP = "transform-approvers";
 
 /* ---------- auth ---------- */
 const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -109,8 +113,53 @@ function layout(nav, crumb, html) {
   ["dashboard", "runs"].forEach((n) => $("nav-" + n).classList.toggle("active", n === nav));
   $("crumb").textContent = crumb;
   document.title = `${crumb} · Landing Zone Agent`;
+  const active = document.activeElement, focusId = active && $("view").contains(active) ? active.id : "";
+  const caret = focusId && typeof active.selectionStart === "number" ? [active.selectionStart, active.selectionEnd] : null;
   $("view").innerHTML = html;
+  const again = focusId && $(focusId);
+  if (again) { again.focus({ preventScroll: true }); if (caret && again.setSelectionRange) again.setSelectionRange(...caret); }
 }
+
+/* ---------- safe markdown (Transform messages are untrusted: escape first, then a small fixed subset) ---------- */
+const mdInline = (escaped) => escaped
+  .replace(/`([^`]+)`/g, "<code>$1</code>")
+  .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+  .replace(/(^|[\s(])\*([^*\s][^*]*?)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>");
+function md(src) {
+  const lines = String(src || "").replace(/\r/g, "").split("\n"), out = [];
+  const cells = (row) => row.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+  const isSep = (row) => cells(row).every((c) => /^:?-{2,}:?$/.test(c));
+  let para = [];
+  const flush = () => { if (para.length) out.push(`<p>${para.map((l) => mdInline(esc(l))).join("<br>")}</p>`); para = []; };
+  for (let i = 0; i < lines.length;) {
+    const line = lines[i];
+    if (/^\s*\|/.test(line)) {
+      flush();
+      const rows = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) rows.push(lines[i++]);
+      const head = rows.length > 1 && isSep(rows[1]) ? cells(rows[0]) : null;
+      const body = rows.filter((r, k) => !isSep(r) && !(head && k === 0));
+      out.push(`<div class="tbl-wrap"><table>${head ? `<thead><tr>${head.map((c) => `<th>${mdInline(esc(c))}</th>`).join("")}</tr></thead>` : ""}<tbody>${body.map((r) => `<tr>${cells(r).map((c) => `<td>${mdInline(esc(c))}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`);
+      continue;
+    }
+    const ul = /^\s*[-*•]\s+(.*)$/, ol = /^\s*\d+[.)]\s+(.*)$/;
+    if (ul.test(line) || ol.test(line)) {
+      flush();
+      const re = ul.test(line) ? ul : ol, tag = re === ul ? "ul" : "ol", items = [];
+      while (i < lines.length && re.test(lines[i])) items.push(lines[i++].match(re)[1]);
+      out.push(`<${tag}>${items.map((t) => `<li>${mdInline(esc(t))}</li>`).join("")}</${tag}>`);
+      continue;
+    }
+    const h = line.match(/^\s*#{1,6}\s+(.*)$/);
+    if (h) { flush(); out.push(`<p class="md-h">${mdInline(esc(h[1]))}</p>`); i++; continue; }
+    if (!line.trim()) { flush(); i++; continue; }
+    para.push(line); i++;
+  }
+  flush();
+  return out.join("");
+}
+const userGroups = () => { const g = claims["cognito:groups"]; return Array.isArray(g) ? g : typeof g === "string" ? [g] : []; };
+const canAnswerTransform = () => userGroups().includes(APPROVER_GROUP);
 
 /* ---------- data ---------- */
 async function loadRuns() { S.runs = (await api("/runs")).runs; return S.runs; }
@@ -256,18 +305,26 @@ async function openRun(id, { silent = false } = {}) {
     const deploymentReport = isDeployRun(run) ? await loadDeploymentReport(id, run) : null;
     if (S.runId !== id) return;  // the user moved on while this was loading
     const first = !S.data || S.data.run.runId !== id, hadScope = S.data && S.data.scope;
+    if (first) S.feedSeen = 0;
     S.data = { run, audit, scope, diagram, report, deploymentReport };
     if (first || (!hadScope && scope)) {
       if (isDeployRun(run)) S.tab = deploymentReport ? "deployment" : scope ? "organization" : "activity";
       else S.tab = scope ? "organization" : "activity";
     }
+    S.stale = false;
     renderRun();
+    notifyHumanInput(run);
     clearTimeout(S.timer);
     if (!isDone(run)) S.timer = setTimeout(() => openRun(id, { silent: true }), 4000);
     else loadRuns().catch(() => {});
   } catch (e) {
     if (e.message === "session expired") return;
-    if (!silent) { toast(e.message === "not found" ? "That run isn't available to you." : e.message, "bad"); location.hash = "#/runs"; }
+    if (!silent) { toast(e.message === "not found" ? "That run isn't available to you." : e.message, "bad"); location.hash = "#/runs"; return; }
+    // A failed background refresh: say so and keep trying instead of freezing on old data.
+    if (S.runId === id && S.data) {
+      S.stale = true; renderRun();
+      clearTimeout(S.timer); S.timer = setTimeout(() => openRun(id, { silent: true }), 8000);
+    }
   }
 }
 
@@ -319,25 +376,29 @@ function deployCtaCard(run) {
 }
 
 function deployStepsHtml(run, audit) {
+  const waitingOnPerson = run.status === "RUNNING" && (run.awaitingHitl === true || !!run.pendingHumanInput);
   const has = (a) => audit.some((x) => x.action === a);
   const hasTool = (name) => audit.some((x) => x.action === name);
+  const jobDone = audit.some((x) => x.action === "tool.transform_poll_analyze_job" && parseAuditDetail(x).done === true);
   const done = [
     hasTool("tool.run_pre_discover") || hasTool("tool.run_pre_discover.failed"),
+    jobDone,
     hasTool("tool.save_iac_change_plan") || hasTool("tool.render_iac_bundles"),
-    hasTool("tool.transform_start_deploy"),
     has("deploy.attested") || (run.status === "DELIVERED" && has("phase.completed")),
   ];
   const steps = [
     ["Discover baseline", "Organizations snapshot and gap analysis"],
-    ["Analyze and plan", "Transform analyze, assessment, and IaC plan"],
-    ["Transform deploy", "Apply changes in the target org"],
+    ["Build with AWS Transform", "Transform plans and builds; the deploy agent answers from the design"],
+    ["Assess and plan", "Foundation assessment and IaC change plan"],
     ["Attest and deliver", "Foundation report and artifacts"],
   ];
   const next = done.indexOf(false), failed = run.status === "FAILED";
   return `<div class="steps">${steps.map(([name, sub], i) => {
     const state = done[i] ? "done" : i === next ? (failed ? "failed" : run.status === "AWAITING_INPUT" ? "" : "active") : "";
-    return `<div class="step ${state}"><div class="step-rail"><span class="step-node"></span><span class="step-line"></span></div>
-      <div class="step-body"><div class="step-name">${esc(name)}</div><div class="step-sub">${esc(done[i] ? "Done" : state === "failed" ? "Stopped here" : state === "active" ? "In progress" : sub)}</div></div>
+    const waiting = state === "active" && waitingOnPerson;
+    const subText = done[i] ? "Done" : state === "failed" ? "Stopped here" : waiting ? "Waiting for your answer" : state === "active" ? "In progress" : sub;
+    return `<div class="step ${state}${waiting ? " waiting" : ""}"><div class="step-rail"><span class="step-node"></span><span class="step-line"></span></div>
+      <div class="step-body"><div class="step-name">${esc(name)}</div><div class="step-sub">${esc(subText)}</div></div>
       <span class="step-check">${done[i] ? "✓" : state === "failed" ? "✕" : ""}</span></div>`;
   }).join("")}</div>`;
 }
@@ -348,6 +409,8 @@ function deployContinueNotice(audit, run) {
   const d = lastCont ? parseAuditDetail(lastCont) : {};
   const reason = String(d.reason || (lastYield ? parseAuditDetail(lastYield).reason : "") || "").trim();
   if (!lastCont && !reason) return "";
+  // Routine waits while the Transform job runs are shown by the progress steps and the question card, not as a pause.
+  if (/^transform_analyze_waiting$|already polled this invoke$|^deploy_judgment complete/.test(reason)) return "";
   const targetAcct = run && run.deployTarget && run.deployTarget.accountId;
   if (/^Pre-discover failed for deploy target account/i.test(reason)) {
     return `<div class="notice notice-warn" role="status"><strong>Deploy paused (target discover).</strong> ${esc(reason.length > 480 ? reason.slice(0, 480) + "…" : reason)}<br><span class="hint">Fix the issue in ${targetAcct ? `account ${esc(targetAcct)}` : "the target account"}, then start a new deploy run.</span></div>`;
@@ -370,26 +433,129 @@ function deployContinueNotice(audit, run) {
 }
 
 // META.pendingHumanInput (phase_invoke) mirrors the question an AWS Transform job is waiting on.
-// Everything from Transform is untrusted text: escape it, and only link https console URLs.
-function humanInputBanner(run) {
+// Everything from Transform is untrusted text: md() escapes it, and only https console URLs are linked.
+// Message questions can be answered here (POST /runs/{id}/answer, approver group); tasks need Transform's own form.
+const questionKey = (p) => (p ? `${p.jobId}:${p.messageId || p.taskId || p.title}` : "");
+function answerState(p) {
+  const key = questionKey(p);
+  if (S.answer.key !== key) S.answer = { key, selected: null, draft: "", sending: false, error: "", expanded: false, reply: false };
+  return S.answer;
+}
+function askedAt(audit, p) {
+  const row = [...audit].reverse().find((a) => a.action === "phase.awaiting_human" && parseAuditDetail(a).jobId === p.jobId);
+  return row ? row.ts : null;
+}
+function humanInputBanner(run, audit = []) {
   if (run.status !== "RUNNING") return "";
   const p = run.pendingHumanInput && typeof run.pendingHumanInput === "object" ? run.pendingHumanInput : null;
   if (!p && run.awaitingHitl !== true) return "";
   const url = p && typeof p.consoleUrl === "string" && /^https:\/\//i.test(p.consoleUrl) ? p.consoleUrl : "";
-  const options = p && Array.isArray(p.options) ? p.options.filter((o) => typeof o === "string" && o) : [];
-  const body = p
-    ? `${p.title ? `<p style="margin:6px 0 0"><strong>${esc(p.title)}</strong></p>` : ""}
-      ${p.text ? `<p style="margin:6px 0 0;white-space:pre-wrap">${esc(p.text)}</p>` : ""}
-      ${options.length ? `<p style="margin:8px 0 2px">Choices offered in Transform:</p><ul class="bullets">${options.map((o) => `<li>${esc(o)}</li>`).join("")}</ul>` : ""}
-      ${p.jobId ? `<p class="hint" style="margin:6px 0 0">Transform job <code>${esc(p.jobId)}</code>${p.kind ? ` · ${esc(p.kind === "task" ? "task" : "chat message")}` : ""}</p>` : ""}`
-    : `<p style="margin:6px 0 0">The Transform job is waiting for a person, but Transform did not return the question. Open the job in the Transform workspace to answer it.</p>`;
-  const link = url
-    ? `<p style="margin:8px 0 0"><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">Answer in AWS Transform<span class="sr-only"> (opens in a new tab)</span></a></p>`
+  const openLink = url ? `<a class="btn btn-sm" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open in AWS Transform ↗<span class="sr-only"> (opens in a new tab)</span></a>` : "";
+  if (!p) {
+    return `<section class="hitl" role="region" aria-labelledby="hitl-heading"><div class="hitl-head"><span class="pulse" aria-hidden="true"></span><h2 id="hitl-heading">AWS Transform is waiting for a person</h2></div>
+      <p>Transform did not return the question. Open the job in the Transform workspace to answer it.</p></section>`;
+  }
+  const a = answerState(p);
+  const options = Array.isArray(p.options) ? p.options.filter((o) => typeof o === "string" && o) : [];
+  const note = p.agentNote && typeof p.agentNote === "object" && p.agentNote.reason ? p.agentNote : null;
+  const answered = run.pendingAnswer && p.messageId && run.pendingAnswer.messageId === p.messageId ? run.pendingAnswer : null;
+  const asked = askedAt(audit, p);
+  const text = String(p.text || "");
+  const long = text.length > 700 || text.split("\n").length > 14;
+  const question = text
+    ? `<div class="hitl-q md ${long && !a.expanded ? "clamp" : ""}" id="hitl-text">${md(text)}</div>
+       ${long ? `<button class="btn-link" type="button" data-hitl-expand aria-expanded="${a.expanded}" aria-controls="hitl-text">${a.expanded ? "Show less" : "Show the full message"}</button>` : ""}`
     : "";
-  return `<section class="notice notice-warn" role="region" aria-labelledby="hitl-heading">
-    <h2 id="hitl-heading" style="font-size:14px;margin:0">AWS Transform needs your input</h2>${body}${link}
-    <p class="hint" style="margin:8px 0 0">Answer in Transform; this deploy run resumes on its own. It fails if no answer arrives within about 24 hours.</p></section>`;
+  let action;
+  if (answered) {
+    const byAgent = answered.by === "agent";
+    const what = answered.option ? `“${esc(answered.option)}”` : byAgent ? "a reply" : "your message";
+    const who = byAgent ? "(by the deploy agent) " : answered.by === claims.sub ? "" : "(by another user) ";
+    action = `<div class="hitl-sent" role="status"><span class="spin spin-green" aria-hidden="true"></span><div><strong>Sent ${what} to AWS Transform</strong> ${who}· ${esc(ago(answered.at))}
+      <div class="hint">Waiting for Transform to continue. This page updates on its own.</div>${answered.text ? `<blockquote class="quote">${esc(answered.text)}</blockquote>` : ""}</div></div>`;
+  } else if (p.kind === "message" && p.messageId && canAnswerTransform()) {
+    const busy = a.sending ? "disabled" : "";
+    const choices = options.length ? `<div class="choices" role="group" aria-label="Choose an answer">${options.map((o, k) =>
+      `<button class="choice" type="button" id="choice-${k}" data-answer-option="${k}" aria-pressed="${a.selected === o}" ${busy}>${esc(o)}</button>`).join("")}</div>` : "";
+    const confirm = !options.length ? "" : a.selected !== null
+      ? `<div class="confirm" role="group" aria-label="Confirm answer"><span>Send <strong>“${esc(a.selected)}”</strong> to AWS Transform?</span>
+          <span class="confirm-actions"><button class="btn btn-primary btn-sm" type="button" id="answer-send" data-answer-send ${busy}>${a.sending ? '<span class="spin"></span> Sending…' : "Send answer"}</button>
+          <button class="btn btn-sm" type="button" data-answer-cancel ${busy}>Cancel</button></span></div>`
+      : `<p class="hint">Pick an option, then confirm. You can also reply with your own message.</p>`;
+    const n = a.draft.trim().length;
+    const reply = a.reply || !options.length
+      ? `<div class="reply"><label class="lbl" for="answer-text">Your reply to Transform</label>
+          <textarea class="textarea" id="answer-text" maxlength="4000" rows="3" placeholder="For example: add eu-west-1 as a second governed region" ${busy}>${esc(a.draft)}</textarea>
+          <div class="reply-foot"><span class="hint" id="answer-count">${n}/4000 · Ctrl+Enter to send</span>
+          <span>${options.length ? `<button class="btn btn-sm" type="button" data-answer-reply-close ${busy}>Close</button>` : ""}
+          <button class="btn btn-primary btn-sm" type="button" id="answer-text-send" data-answer-text ${n && !a.sending ? "" : "disabled"}>${a.sending && a.selected === null ? '<span class="spin"></span> Sending…' : "Send reply"}</button></span></div></div>`
+      : `<button class="btn-link" type="button" id="answer-reply-open" data-answer-reply-open ${busy}>Reply with a message instead</button>`;
+    action = `${choices}${confirm}${reply}${a.error ? `<p class="errtext" role="alert" style="margin:10px 0 0">${esc(a.error)}</p>` : ""}`;
+  } else if (p.kind === "message") {
+    action = `${options.length ? `<div class="choices">${options.map((o) => `<span class="choice choice-ro">${esc(o)}</span>`).join("")}</div>` : ""}
+      <p class="hint">${p.messageId ? `Only members of the <code>${APPROVER_GROUP}</code> group can answer from here. Ask an administrator to add you, or answer in AWS Transform.` : "Answer in AWS Transform."}</p>`;
+  } else {
+    action = `<p class="hint">${p.kind === "task" ? "This is a Transform task with its own form. Open it in AWS Transform to complete it." : "Answer in AWS Transform."}</p>`;
+  }
+  return `<section class="hitl" role="region" aria-labelledby="hitl-heading">
+    <div class="hitl-head"><span class="pulse" aria-hidden="true"></span><h2 id="hitl-heading">${answered ? "Answer sent to AWS Transform" : "AWS Transform needs your input"}</h2>
+      ${asked ? `<span class="hint" style="margin:0">asked ${esc(ago(asked))}</span>` : ""}<span class="hitl-link">${openLink}</span></div>
+    ${p.title && p.kind === "task" ? `<p style="margin:0 0 8px"><strong>${esc(p.title)}</strong></p>` : ""}
+    ${question}${note && !answered ? `<div class="agent-note" role="note"><strong>Deploy agent:</strong> ${esc(note.reason)}${note.suggestion ? `<div class="hint">Suggested: ${esc(note.suggestion)}</div>` : ""}${typeof note.link === "string" && /^https:\/\//i.test(note.link) ? `<div style="margin-top:8px"><a class="btn btn-sm btn-primary" href="${esc(note.link)}" target="_blank" rel="noopener noreferrer">Approve in the AWS console ↗<span class="sr-only"> (opens in a new tab)</span></a></div>` : ""}</div>` : ""}${action}
+    <p class="hint" style="margin-top:12px">Transform job <code>${esc(p.jobId || "")}</code>. The deploy resumes on its own once Transform has your answer. It fails if no answer arrives within about 24 hours.</p></section>`;
 }
+
+async function sendAnswer(payload) {
+  const run = S.data && S.data.run, p = run && run.pendingHumanInput;
+  if (!p || S.answer.sending) return;
+  S.answer.sending = true; S.answer.error = ""; renderRun();
+  try {
+    const r = await api(`/runs/${run.runId}/answer`, { method: "POST", body: JSON.stringify({ jobId: p.jobId, messageId: p.messageId, ...payload }) });
+    if (S.data && S.data.run.runId === run.runId) S.data.run.pendingAnswer = r.pendingAnswer;
+    toast("Answer sent to AWS Transform");
+  } catch (e) {
+    if (e.message === "session expired") return;
+    S.answer.error = e.message;
+  } finally {
+    S.answer.sending = false;
+    if (S.data && S.data.run.runId === run.runId) { renderRun(); openRun(run.runId, { silent: true }); }
+  }
+}
+
+// Toast when a question arrives while the page is open (not for one already waiting when the run was opened).
+function notifyHumanInput(run) {
+  const p = run.status === "RUNNING" && run.pendingHumanInput;
+  const key = p ? questionKey(p) : "";
+  if (S.notifyRun !== run.runId) { S.notifyRun = run.runId; if (key) S.notified.add(key); return; }
+  if (!key || S.notified.has(key)) return;
+  S.notified.add(key);
+  toast("AWS Transform needs your input");
+}
+const needsAnswer = (run) => {
+  const p = run.status === "RUNNING" && run.pendingHumanInput;
+  return !!p && !(run.pendingAnswer && p.messageId && run.pendingAnswer.messageId === p.messageId);
+};
+
+const FEED_SKIP = new Set(["deploy.sequencer.step", "phase.continue", "phase.started", "tool.transform_poll_analyze_job",
+  "tool.read_deploy_checkpoint", "tool.read_deploy_context", "tool.read_approved_scope", "tool.yield_for_orchestrator"]);
+function feedText(a) {
+  const d = parseAuditDetail(a);
+  if (a.action === "transform.answer_sent") return `${a.actor === "agent" ? "Deploy agent" : a.actor === claims.sub ? "You" : "A user"} answered ${d.option ? `“${d.option}”` : "with a message"}`;
+  if (a.action === "transform.agent_escalated") return `Deploy agent handed you: ${d.title || "a Transform question"}`;
+  if (a.action === "phase.awaiting_human" && d.title) return `Transform asked: ${d.title}`;
+  if (a.action.endsWith(".failed") && d.error) return `${ACTIONS[a.action] || a.action}: ${String(d.error).slice(0, 140)}`;
+  return ACTIONS[a.action] || a.action;
+}
+function activityFeed(audit) {
+  const rows = audit.filter((a) => !FEED_SKIP.has(a.action)).slice(-7).reverse();
+  const seen = S.feedSeen; S.feedSeen = Math.max(seen, ...audit.map((a) => a.ts || 0));
+  if (!rows.length) return "";
+  return `<div class="card"><div class="card-head"><h2>Latest activity</h2><button class="btn-link" type="button" data-tab="activity">All events</button></div>
+    <ol class="feed" aria-live="polite">${rows.map((a) => `<li class="${seen && a.ts > seen ? "new" : ""} ${/failed/.test(a.action) ? "bad" : ""}"><time datetime="${new Date(a.ts * 1000).toISOString()}" title="${esc(new Date(a.ts * 1000).toLocaleString())}">${esc(ago(a.ts))}</time><span>${esc(feedText(a))}</span></li>`).join("")}</ol></div>`;
+}
+const liveBadge = (run) => (isDone(run) ? "" : S.stale
+  ? '<span class="live stale" role="status"><i aria-hidden="true"></i>Reconnecting…</span>'
+  : '<span class="live" title="This page refreshes every few seconds"><i aria-hidden="true"></i>Live</span>');
 
 function credentialsCleanupNotice(run) {
   if (!run.credentialsCleanupError) return "";
@@ -421,11 +587,12 @@ function renderDeployRun() {
       <div role="tabpanel" id="panel-${S.tab}" aria-labelledby="tab-${S.tab}">${panel(S.tab)}</div></div>`
     : waiting;
   layout("runs", `${name} deploy`, `<div class="crumbs"><a href="#/runs">← Runs</a></div>
-    <div class="page-title" style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">${esc(name)} ${runTypeBadge(run)} ${stateBadge(run)} ${stopRunButton(run)}</div>
+    <div class="page-title" style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">${esc(name)} ${runTypeBadge(run)} ${stateBadge(run)} ${liveBadge(run)} ${stopRunButton(run)}</div>
     <p class="page-sub" style="margin-bottom:18px">Started ${esc(when(run.createdAt))} · Deploy run <code>${esc(run.runId.slice(0, 8))}</code>${designLink}</p>
-    ${failure}${credentialsCleanupNotice(run)}${humanInputBanner(run) || deployContinueNotice(audit, run)}
-    <div class="grid-3"><div class="card"><div class="card-head"><h2>Progress</h2></div>${deployStepsHtml(run, audit)}</div>${deployDeliverables(run)}</div>
+    ${failure}${credentialsCleanupNotice(run)}${humanInputBanner(run, audit) || deployContinueNotice(audit, run)}
+    <div class="grid-3"><div class="card"><div class="card-head"><h2>Progress</h2></div>${deployStepsHtml(run, audit)}</div>${activityFeed(audit)}${deployDeliverables(run)}</div>
     ${body}`);
+  if (needsAnswer(run)) document.title = `● Input needed · ${document.title}`;
   if (S.tab === "organization" && diagram) drawDiagram(diagram);
 }
 
@@ -621,14 +788,20 @@ const ACTIONS = {
   "tool.save_foundation_assessment": "Saved foundation assessment",
   "tool.save_iac_change_plan": "Saved IaC change plan",
   "tool.render_iac_bundles": "Rendered IaC bundles",
-  "tool.transform_start_deploy": "Transform deploy started",
-  "tool.transform_poll_deploy_job": "Transform deploy polled",
   "tool.finish_deploy_workflow": "Deploy workflow finished",
   "tool.yield_for_orchestrator": "Yielded for orchestrator",
   "run.stopped": "Run stopped",
   "tool.read_deploy_checkpoint": "Read deploy checkpoint",
   "tool.read_deploy_context": "Read deploy context",
   "tool.read_approved_scope": "Read approved scope",
+  "transform.answer_sent": "Answer sent to AWS Transform",
+  "transform.answer_failed": "Sending an answer to AWS Transform failed",
+  "transform.agent_escalated": "Deploy agent handed a Transform question to you",
+  "transform.agent_turn_failed": "Deploy agent could not decide on a Transform question",
+  "transform.agent_converse_failed": "Deploy agent gave up on a Transform question",
+  "deploy.sequencer.step": "Deploy step",
+  "tool.transform_start_analyze.failed": "Transform analyze failed",
+  "tool.transform_poll_analyze_job.failed": "Transform analyze poll failed",
 };
 function activityPanel(audit) {
   const rows = audit.filter((a) => S.steps || !a.action.startsWith("tool."));
@@ -758,6 +931,19 @@ function onView(e) {
   if (deployBtn) { openDeployDialog(deployBtn.dataset.deploy); return; }
   const stopBtn = e.target.closest("[data-stop-run]");
   if (stopBtn) { stopRun(stopBtn.dataset.stopRun); return; }
+  const opt = e.target.closest("[data-answer-option]");
+  if (opt) {
+    const p = S.data.run.pendingHumanInput, o = p && p.options[+opt.dataset.answerOption];
+    S.answer.selected = S.answer.selected === o ? null : o; S.answer.error = ""; renderRun();
+    const send = $("answer-send"); if (send) send.focus();
+    return;
+  }
+  if (e.target.closest("[data-answer-send]")) { if (S.answer.selected !== null) sendAnswer({ option: S.answer.selected }); return; }
+  if (e.target.closest("[data-answer-cancel]")) { S.answer.selected = null; renderRun(); return; }
+  if (e.target.closest("[data-answer-reply-open]")) { S.answer.reply = true; S.answer.selected = null; renderRun(); const t = $("answer-text"); if (t) t.focus(); return; }
+  if (e.target.closest("[data-answer-reply-close]")) { S.answer.reply = false; renderRun(); return; }
+  if (e.target.closest("[data-answer-text]")) { const t = S.answer.draft.trim(); if (t) { S.answer.selected = null; sendAnswer({ text: t }); } return; }
+  if (e.target.closest("[data-hitl-expand]")) { S.answer.expanded = !S.answer.expanded; renderRun(); return; }
   const t = e.target.closest("[data-tab],[data-dl],[data-copy],[data-full]");
   if (!t) return;
   if (t.dataset.full) { const svg = diagramCache.get(S.data.diagram); if (svg) { $("fullBody").innerHTML = svg; $("full").showModal(); } }
@@ -769,6 +955,10 @@ function onView(e) {
   }
 }
 function onKeys(e) {
+  if (e.target.id === "answer-text" && e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault(); const t = S.answer.draft.trim(); if (t && !S.answer.sending) sendAnswer({ text: t }); return;
+  }
+  if (e.target.id === "answer-text" && e.key === "Escape") { S.answer.reply = false; renderRun(); return; }
   if (!e.target.matches || !e.target.matches('[role="tab"]') || !["ArrowRight", "ArrowLeft"].includes(e.key)) return;
   const tabs = [...document.querySelectorAll('[role="tab"]')], i = tabs.indexOf(e.target);
   S.tab = tabs[(i + (e.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length].dataset.tab; renderRun(); $("tab-" + S.tab).focus(); e.preventDefault();
@@ -808,6 +998,14 @@ async function start() {
   $("view").addEventListener("click", onView);
   $("view").addEventListener("keydown", onKeys);
   $("view").addEventListener("change", (e) => { if (e.target.id === "steps") { S.steps = e.target.checked; renderRun(); } });
+  // Keep the reply draft in state (the page re-renders every few seconds) and update its counter in place.
+  $("view").addEventListener("input", (e) => {
+    if (e.target.id !== "answer-text") return;
+    S.answer.draft = e.target.value;
+    const n = S.answer.draft.trim().length, c = $("answer-count"), b = $("answer-text-send");
+    if (c) c.textContent = `${n}/4000 · Ctrl+Enter to send`;
+    if (b) b.disabled = !n || S.answer.sending;
+  });
   window.addEventListener("hashchange", route);
   try { await loadRuns(); } catch (e) { if (e.message === "session expired") return; }
   route();

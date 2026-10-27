@@ -10,6 +10,7 @@ from typing import Iterator
 from mcp.client.stdio import StdioServerParameters, get_default_environment, stdio_client
 from strands.tools.mcp import MCPClient
 
+from lzcore import transform_ops
 from lzcore.transform_credential_process import mcp_credential_env
 
 
@@ -31,6 +32,15 @@ def _stdio_env(config_dir: str) -> dict[str, str]:
     # keys are dropped; container-credential variables stay so the helper can reach the
     # platform role (an explicit profile takes precedence over the container provider).
     env = mcp_credential_env(env, config_dir)
+    # The MCP server discovers its region by probing ListWorkspaces in every Transform region and refuses
+    # to pick one when the account has profiles in several. Pinning both endpoints to TRANSFORM_REGION makes
+    # every probe hit that region's endpoint; only the probe signed for that region succeeds, so the server
+    # auto-selects it (the library's documented AWS_TRANSFORM_*_ENDPOINT overrides).
+    region = transform_ops.transform_region()
+    env["TRANSFORM_REGION"] = region
+    env["AWS_REGION"] = region
+    env["AWS_TRANSFORM_API_ENDPOINT"] = f"https://api.transform.{region}.on.aws/"
+    env["AWS_TRANSFORM_TCP_ENDPOINT"] = f"https://transform.{region}.api.aws"
     env["TRANSFORM_WORKSPACE_ID"] = _require_workspace_id()
     orch = os.environ.get("TRANSFORM_ORCHESTRATOR_AGENT", "").strip()
     if orch:

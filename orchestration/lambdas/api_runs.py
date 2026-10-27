@@ -1,9 +1,12 @@
-"""POST /runs, POST /deploy-target/verify, POST /runs/{id}/start, POST /runs/{id}/stop, POST /runs/{id}/deploy, GET /runs/{id}, GET /runs/{id}/audit, GET /runs/{id}/scope
+"""POST /runs, POST /deploy-target/verify, POST /runs/{id}/start, POST /runs/{id}/stop, POST /runs/{id}/deploy,
+POST /runs/{id}/answer, GET /runs/{id}, GET /runs/{id}/audit, GET /runs/{id}/scope
 
 Create returns an S3 presigned POST for the SOW (pdf/docx/txt/md, <= 10 MB). The workflow only starts on /start,
 after the upload has landed, so the pipeline never races the upload.
 
 /deploy starts a deploy run (AWS Transform required) against a DELIVERED design run.
+
+/answer sends the run owner's reply to the AWS Transform question the deploy run is waiting on (approver group only).
 
 Operator attribution: API Gateway events carry requestContext.http and the Cognito JWT. A direct Lambda invoke
 (IAM-gated by lambda:InvokeFunction, used by scripts/run_deploy.py) has no requestContext.http and MUST carry
@@ -319,6 +322,99 @@ def _stop(run_id, sub, invoked_by):
     return _resp(200, {"runId": run_id, "status": "FAILED"})
 
 
+def _groups(event) -> set[str]:
+    """cognito:groups from the JWT. The HTTP API authorizer passes array claims as "[a b]"; tests pass lists."""
+    raw = event["requestContext"]["authorizer"]["jwt"]["claims"].get("cognito:groups")
+    if raw is None:
+        return set()
+    if isinstance(raw, list):
+        return {str(g) for g in raw}
+    return {g for g in re.split(r"[\s,]+", str(raw).strip().strip("[]")) if g}
+
+
+def _approver_group() -> str:
+    group = os.environ.get("TRANSFORM_APPROVER_GROUP", "").strip()
+    if not group:
+        raise RuntimeError("TRANSFORM_APPROVER_GROUP is not set on the API function (platform.yaml ApiRunsFn)")
+    return group
+
+
+def _send_transform_answer(**kwargs) -> dict:
+    """Seam for tests. Imported lazily: only this route loads the Transform library."""
+    from lzcore import transform_ops
+
+    return transform_ops.answer_message(**kwargs)
+
+
+def _answer(run_id, sub, event, invoked_by):
+    """Answer the Transform message question a deploy run is waiting on (contract C1 kind=message).
+
+    Only the run owner, signed in through the UI and in the approver group, may answer. The question
+    answered must be the one in META.pendingHumanInput (jobId + messageId), and transform_ops re-checks it
+    against the live job before sending. One answer per question: an ANSWER#<messageId> item is reserved
+    with a conditional put before anything is sent (a failed send releases it for a retry).
+    """
+    if invoked_by is not None:
+        return _resp(400, {"error": "answers are accepted only from signed-in users in the UI"})
+    run = get_run(run_id)
+    if not run or not _can_view(run, sub):
+        return _resp(404, {"error": "not found"})
+    group = _approver_group()
+    if not os.environ.get("TRANSFORM_ROLE_ARN", "").strip():
+        return _resp(501, {"error": "answering AWS Transform from the UI needs the platform's TransformRoleArn; "
+                                    "answer in AWS Transform instead"})
+    if group not in _groups(event):
+        return _resp(403, {"error": f"only members of the {group!r} group can answer AWS Transform from here"})
+    if run.get("runKind") != "deploy" or run.get("status") != "RUNNING":
+        return _resp(409, {"error": f"run is {run.get('status')}; only RUNNING deploy runs take answers"})
+    pending = run.get("pendingHumanInput")
+    if not isinstance(pending, dict):
+        return _resp(409, {"error": "AWS Transform is not waiting on a question for this run"})
+    if pending.get("kind") != "message" or not pending.get("messageId"):
+        return _resp(409, {"error": "this question has to be answered in AWS Transform (open it from the link)"})
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "body must be JSON"})
+    if not isinstance(body, dict):
+        return _resp(400, {"error": "body must be a JSON object"})
+    if body.get("jobId") != pending.get("jobId") or body.get("messageId") != pending["messageId"]:
+        return _resp(409, {"error": "the question has changed since this page loaded; review the new question"})
+    option, text = body.get("option"), body.get("text")
+    if (option is None) == (text is None):
+        return _resp(400, {"error": "send exactly one of option or text"})
+    if option is not None and option not in (pending.get("options") or []):
+        return _resp(400, {"error": f"option must be one of {pending.get('options')}"})
+    if text is not None and (not isinstance(text, str) or not 0 < len(text.strip()) <= 4000):
+        return _resp(400, {"error": "text must be 1-4000 characters"})
+
+    from lzcore.transform_answers import AnswerExists, send_answer
+    from lzcore.transform_ops import QuestionChanged, TransformAccessDenied  # lazy: Transform library
+
+    # Same reservation and record path as the deploy agent (lzcore.transform_answers).
+    try:
+        sent_answer = send_answer(
+            table=table(),
+            audit=lambda action, detail: audit(run_id, sub, action, detail),
+            run_id=run_id,
+            pending=pending,
+            option=option,
+            text=text,
+            by=sub,
+            at=now(),
+            send=_send_transform_answer,
+        )
+    except AnswerExists:
+        return _resp(409, {"error": "this question already has an answer"})
+    except QuestionChanged as e:
+        return _resp(409, {"error": f"AWS Transform has moved on: {e}"})
+    except TransformAccessDenied as e:
+        return _resp(502, {"error": str(e)})
+    except Exception as e:  # noqa: BLE001 - recorded and released by send_answer, returned here
+        return _resp(502, {"error": f"sending the answer to AWS Transform failed: {type(e).__name__}: {str(e)[:300]}"})
+    return _resp(200, {"pendingAnswer": sent_answer})
+
+
 def handler(event, _ctx):
     sub = _claims(event)
     try:
@@ -339,6 +435,8 @@ def handler(event, _ctx):
         return _deploy(run_id, sub, event, invoked_by)
     if route.endswith("/stop"):
         return _stop(run_id, sub, invoked_by)
+    if route.endswith("/answer"):
+        return _answer(run_id, sub, event, invoked_by)
     if route.endswith("/audit"):
         return _audit(run_id, sub)
     if route.endswith("/scope"):

@@ -120,7 +120,7 @@ class SigningSeamTests(unittest.TestCase):
 
         class _Resp:
             def json(self):
-                return {"profiles": []}
+                return {"Profiles": []}
 
         async def fake_request(client, method, url, headers, payload, timeout_seconds):
             captured["auth"] = headers.get("Authorization")
@@ -131,7 +131,7 @@ class SigningSeamTests(unittest.TestCase):
         self.addCleanup(set_sigv4_region, None)
         with mock.patch.object(self.tcp, "request_with_retry", fake_request):
             out = transform_ops._run(transform_ops._call_control_plane("ListProfiles", {}))
-        self.assertEqual(out, {"profiles": []})
+        self.assertEqual(out, {"Profiles": []})
         self.assertIn("Credential=ASIATRANSFORM/", captured["auth"])
         self.assertEqual(captured["env"], before)
 

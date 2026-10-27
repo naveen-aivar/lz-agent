@@ -31,14 +31,52 @@ def _translate_403(operation: str, exc: Exception) -> Exception:
     return exc
 
 
+# transform_ops._send truncates the first message at 7000 characters; keep the brief under it.
+DESIGN_BRIEF_LIMIT = 6500
+
+
+def _names(items, fmt) -> str:
+    return "; ".join(fmt(i) for i in items if isinstance(i, dict)) or "none"
+
+
 def scope_summary_from_scope(scope: dict) -> str:
+    """Opening message of the Transform job: the approved design itself, not just its counts.
+
+    Transform plans the landing zone from this message, and the deploy agent answers Transform's
+    follow-up questions from the same design, so both work from one structure. Deterministic
+    rendering of the validated scope.json (lzcore.scope); nothing is inferred here.
+    """
     customer = (scope.get("customer") or {}).get("orgName", "customer")
-    summary = scope.get("summary") or {}
-    return (
-        f"Customer: {customer}. Approved design summary: {json.dumps(summary, default=str)[:1500]}. "
-        "Perform foundation discovery, gap analysis, and landing-zone scoped recommendations. "
-        "Identify greenfield vs brownfield, missing OUs/accounts/governance, and deployment steps with human approval where required."
+    regions = scope.get("regions") or {}
+    ous = _names(scope.get("ous") or [], lambda o: f"{o.get('name')} (parent {o.get('parent') or 'Root'})")
+    accounts = _names(
+        scope.get("accounts") or [],
+        lambda a: f"{a.get('name')} [{a.get('kind')}, OU {a.get('ou')}, {a.get('provisioning')}]",
     )
+    scps = _names((scope.get("scps") or []) + (scope.get("customScps") or []),
+                  lambda p: f"{p.get('id')} -> {', '.join(p.get('targets') or [])}")
+    controls = _names(scope.get("controls") or [], lambda c: f"{c.get('id')} -> {', '.join(c.get('targets') or [])}")
+    unsupported = len(scope.get("unsupported") or [])
+    open_questions = len(scope.get("openQuestions") or [])
+    brief = (
+        f"Customer: {customer}. Build an AWS landing zone that matches this approved design. "
+        "Scope is the landing zone only: no migration planning, network migration or server migration.\n"
+        f"Home Region: {regions.get('home')}. Governed Regions: {', '.join(regions.get('governed') or []) or 'none'}.\n"
+        f"Organizational units: {ous}.\n"
+        f"Accounts: {accounts}.\n"
+        f"Service control policies: {scps}.\n"
+        f"Controls: {controls}.\n"
+        f"The design also lists {unsupported} unsupported item(s) and {open_questions} open question(s); "
+        "do not act on those.\n"
+        "A deploy agent answers your questions from this design. Any step that creates, changes or deletes "
+        "resources or accounts is approved by a person."
+    )
+    if len(brief) > DESIGN_BRIEF_LIMIT:
+        raise RuntimeError(
+            f"design brief for the Transform job is {len(brief)} characters (limit {DESIGN_BRIEF_LIMIT}); "
+            "the approved design is too large to send in one message"
+        )
+    return brief
 
 
 def put_transform_artifact(put_json: Callable[[str, dict], None], run_id: str, name: str, body: dict) -> str:
@@ -75,32 +113,6 @@ def start_analyze_job(
     persist_job(job_id, ws)
     put_transform_artifact(put_json, run_id, "analyze-started", result)
     return {"jobId": job_id, "workspaceId": ws}
-
-
-def start_deploy_job(
-    *,
-    run_id: str,
-    scope: dict,
-    plan: dict | None,
-    put_json: Callable[[str, dict], None],
-    persist_deploy_job: Callable[[str], None],
-) -> dict[str, Any]:
-    plan_hint = ""
-    if plan:
-        plan_hint = f" IaC change plan strategy={plan.get('strategy')}; changes={len(plan.get('changes') or [])}."
-    prompt = (
-        scope_summary_from_scope(scope)
-        + plan_hint
-        + " Proceed with landing zone deployment per Transform workflow. Request human approval before destructive changes."
-    )
-    try:
-        result = transform_ops.start_landing_zone_job(run_id=run_id, phase="deploy", prompt=prompt)
-    except Exception as exc:
-        raise _translate_403("CreateJob", exc) from exc
-    job_id = result["jobId"]
-    persist_deploy_job(job_id)
-    put_transform_artifact(put_json, run_id, "deploy-started", result)
-    return {"jobId": job_id}
 
 
 def poll_transform_job(
@@ -154,7 +166,6 @@ def merge_transform_into_foundation(
         "transform": {
             "workspaceId": meta.get("transformWorkspaceId"),
             "analyzeJobId": meta.get("transformAnalyzeJobId"),
-            "deployJobId": meta.get("transformDeployJobId"),
             "lastPoll": transform_insights,
         },
     }
