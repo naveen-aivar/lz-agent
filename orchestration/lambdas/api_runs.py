@@ -199,6 +199,10 @@ def _deploy(design_run_id, sub, event, invoked_by):
     target_region = body.get("targetRegion")
     if target_region is not None and target_region not in ALL_REGIONS:
         return _resp(400, {"error": f"targetRegion must be one of the AWS Regions, got {target_region!r}"})
+    if target_region is not None and invoked_by is None and _approver_group() not in _groups(event):
+        # The override can move the landing zone out of the approved design's Region: operators (direct Lambda
+        # invoke, recorded by IAM ARN) and approver-group members only.
+        return _resp(403, {"error": f"only members of the {_approver_group()!r} group or an operator can set targetRegion"})
 
     try:
         deploy_target = parse_deploy_target_from_request(
@@ -251,7 +255,8 @@ def _deploy(design_run_id, sub, event, invoked_by):
         {"designRunId": design_run_id, "deployTarget": public_deploy_target(deploy_target), "invokedBy": invoked_by,
          "targetRegion": target_region},
     )
-    audit(design_run_id, sub, "design.deploy_requested", {"deployRunId": deploy_id, "invokedBy": invoked_by})
+    audit(design_run_id, sub, "design.deploy_requested",
+          {"deployRunId": deploy_id, "invokedBy": invoked_by, "targetRegion": target_region})
     return _resp(202, {"runId": deploy_id, "designRunId": design_run_id})
 
 

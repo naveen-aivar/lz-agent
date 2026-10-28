@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import boto3
 from botocore.config import Config
@@ -46,6 +47,8 @@ _DEPLOY_ARTIFACTS_AFTER_ATTEST = (
     ("deployment-report", "runs/{run_id}/deployment/deployment-report.json"),
 )
 
+# The only host an agent note may link to: the AWS console (connector approval).
+_CONSOLE_LINK = re.compile(r"^https://[a-z0-9-]+\.console\.aws\.amazon\.com/")
 _PENDING_STR_FIELDS = ("source", "jobId", "workspaceId", "kind", "title", "text", "consoleUrl")
 
 
@@ -101,7 +104,7 @@ def _validate_pending(pending, run_id: str) -> dict | None:
         isinstance(note, dict)
         and isinstance(note.get("reason"), str)
         and (note.get("suggestion") is None or isinstance(note.get("suggestion"), str))
-        and (note.get("link") is None or (isinstance(note.get("link"), str) and note["link"].startswith("https://")))
+        and (note.get("link") is None or (isinstance(note.get("link"), str) and _CONSOLE_LINK.match(note["link"])))
     ):
         raise RuntimeError(
             f"agent continue payload for {run_id}: pendingHumanInput.agentNote must be "

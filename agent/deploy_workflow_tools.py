@@ -58,6 +58,8 @@ _CONVERSE_ERROR_LIMIT = 1000
 # Superseded stage written by an earlier release that recorded pre-discover failures as a HITL
 # wait. Runs left at this stage cannot resume; the sequencer reports that explicitly.
 _SUPERSEDED_PRE_DISCOVER_BLOCKED = "pre_discover_blocked"
+# Stages of the removed second Transform "deploy" job. A run parked here predates the single-job flow.
+_SUPERSEDED_DEPLOY_JOB_STAGES = frozenset({"transform_deploy_started", "transform_deploy_waiting", "transform_deploy_done"})
 
 # Same not-found rule as tools.py (S3 absence is the only non-error read outcome).
 _is_absent = base._is_absent
@@ -717,20 +719,20 @@ def _escalated(cp: dict, pending: dict, item: dict) -> dict:
 def _handle_connector_task(cp: dict, pending: dict, qkey: str, item: dict) -> dict | None:
     """Transform's "connect the target account" task (CreateOrSelectConnectors), handled without a model.
 
-    The platform finds or creates the workspace connector of the type the task asks for, for the
-    deploy target account in the design's home Region. Approving a connector is a person's decision
-    (it grants Transform landing-zone permissions in that account): until the connector is ACTIVE
-    the question shows the AWS console approval link. Once ACTIVE, the platform submits the task
-    with that connector. Returns None when the task is some other kind of task.
+    The platform creates a connector for this run (never reusing one from an earlier run or person) for the
+    deploy target account in the effective Region, and records its id before anything else. Approving a
+    connector is a person's decision (it grants Transform landing-zone permissions in that account): until it
+    is ACTIVE the question shows the AWS console approval link. Once ACTIVE the platform submits the task with
+    that connector. The id and a "submitting" mark are written before the submit, and the submit token is
+    stable, so a crash between submit and the final record resumes cleanly. Returns None for any other task.
     """
     job_id, task_id, ws = pending["jobId"], pending["taskId"], pending.get("workspaceId")
     request = transform_ops.connector_task(job_id, task_id, ws)
     if request is None:
         return None
     if item.get("connectorId"):
-        connector = {"connectorId": item["connectorId"],
-                     "status": transform_ops.connector_state(item["connectorId"], ws),
-                     "verificationLink": item.get("verificationLink"), "created": False}
+        connector_id = item["connectorId"]
+        status = transform_ops.connector_state(connector_id, ws)  # raises ConnectorRejected for REJECTED
     else:
         meta = _run_meta()
         account = (meta.get("deployTarget") or {}).get("accountId")
@@ -740,36 +742,56 @@ def _handle_connector_task(cp: dict, pending: dict, qkey: str, item: dict) -> di
                 f"connector task {task_id} needs the deploy target account ({account!r}) and the design's "
                 f"home Region or the run's targetRegion ({region!r})"
             )
-        connector = transform_ops.ensure_target_connector(
-            connector_type=request["connectorType"], account_id=account, region=region, workspace=ws
+        created = transform_ops.create_target_connector(
+            run_id=base._state["run"], connector_type=request["connectorType"], account_id=account,
+            region=region, workspace=ws,
         )
-        if connector["created"]:
-            base.log_tool_event("transform.connector_created", {
-                "connectorId": connector["connectorId"], "connectorType": request["connectorType"],
-                "accountId": account, "region": region})
-        item = {**item, "account": account, "region": region}
-    if connector["status"] == "ACTIVE":
-        out = transform_ops.submit_connector_task(
-            job_id=job_id, task_id=task_id, connector_id=connector["connectorId"],
-            connector_type=request["connectorType"], workspace=ws,
+        connector_id, status = created["connectorId"], created["status"]
+        item = conv.put_question(
+            qkey, status="awaiting_connector", kind="task", title=pending.get("title"), connectorId=connector_id,
+            connectorType=request["connectorType"], verificationLink=created["verificationLink"],
+            account=account, region=region,
         )
+        base.log_tool_event("transform.connector_created", {
+            "connectorId": connector_id, "connectorType": request["connectorType"],
+            "accountId": account, "region": region})
+    if status == "ACTIVE":
+        resuming = item.get("status") == "submitting"  # an earlier invoke marked it and may have submitted
+        item = conv.put_question(
+            qkey, **{**{k: v for k, v in item.items() if k not in ("PK", "SK", "updatedAt")}, "status": "submitting"})
+        try:
+            out = transform_ops.submit_connector_task(
+                job_id=job_id, task_id=task_id, connector_id=connector_id,
+                connector_type=request["connectorType"], workspace=ws,
+            )
+        except transform_ops.QuestionChanged:
+            if not resuming:
+                raise  # the task is not open and we never started submitting: a real change in Transform
+            out = {"status": "closed by the earlier submit"}
+        stale = transform_ops.newest_system_message_id(job_id, ws)
+        if stale and not conv.get_question(f"message:{stale}"):
+            # Whatever Transform said before this task is not a new question (it would otherwise read as a
+            # FINAL_RESPONSE waiting for a reply once the task is gone).
+            conv.put_question(f"message:{stale}", status="superseded", kind="message",
+                              reason="written before the connector task, which the platform has now completed")
         conv.put_question(qkey, status="answered", kind="task", title=pending.get("title"),
-                          connectorId=connector["connectorId"], taskStatus=out.get("status"))
+                          connectorId=connector_id, taskStatus=out.get("status"))
         base.log_tool_event("transform.connector_task_submitted", {
-            "jobId": job_id, "taskId": task_id, "connectorId": connector["connectorId"],
+            "jobId": job_id, "taskId": task_id, "connectorId": connector_id,
             "connectorType": request["connectorType"], "taskStatus": out.get("status")})
         return _continue_from(cp)
     reason = (f"Approve the AWS Transform connector for account {item.get('account')} in "
               f"{item.get('region')}. Open the approval link while signed in to that account and let it "
               "create the connector role. The deploy continues on its own once the connector is active.")
     stored = conv.put_question(qkey, status="awaiting_connector", kind="task", title=pending.get("title"),
-                               connectorId=connector["connectorId"], verificationLink=connector["verificationLink"],
-                               account=item.get("account"), region=item.get("region"), reason=reason,
-                               suggestion=None, link=connector["verificationLink"])
-    if item.get("status") != "awaiting_connector":
+                               connectorId=connector_id, connectorType=request["connectorType"],
+                               verificationLink=item.get("verificationLink"), account=item.get("account"),
+                               region=item.get("region"), reason=reason, suggestion=None,
+                               link=item.get("verificationLink"))
+    if item.get("reason") != reason:
         base.log_tool_event("transform.agent_escalated", {
             "jobId": job_id, "kind": "task", "title": pending.get("title"), "reason": reason,
-            "suggestion": connector["verificationLink"]})
+            "suggestion": item.get("verificationLink")})
     return _escalated(cp, pending, stored)
 
 
@@ -786,7 +808,7 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
     qkey = conv.question_key(pending)
     item = conv.get_question(qkey) or {}
     status = item.get("status")
-    if pending["kind"] == "task" and status in (None, "deciding", "awaiting_connector"):
+    if pending["kind"] == "task" and status in (None, "deciding", "awaiting_connector", "submitting"):
         handled = _handle_connector_task(cp, pending, qkey, item)
         if handled is not None:
             return handled
@@ -796,7 +818,9 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
         return _escalated(cp, pending, item)
     if status in ("answered", "superseded"):
         return _continue_from(cp)  # sent; Transform has not moved past this question yet
-    if pending["kind"] == "message" and existing_answer(base._ddb, base._state["run"], pending["messageId"]):
+    if pending["kind"] == "message" and existing_answer(
+        base._ddb, base._state["run"], pending["messageId"], int(time.time())
+    ):
         return _continue_from(cp)  # a person answered it from the UI
 
     turns = int(item.get("turns") or 0)
@@ -887,6 +911,13 @@ def run_deploy_invoke(run_model: Callable[[], object], converse: Callable[[str],
             f"checkpoint stage {stage!r} was written by an earlier release that recorded a "
             f"pre-discover failure as a HITL wait (recorded cause: {cp.get('reason')}); this run "
             "cannot resume. Fix the deploy target credentials and start a new deploy run.",
+        )
+    if stage in _SUPERSEDED_DEPLOY_JOB_STAGES or (stage == "paused" and cp.get("resumeStage") in _SUPERSEDED_DEPLOY_JOB_STAGES):
+        return _named_error(
+            "deploy.sequencer.superseded_stage",
+            f"checkpoint stage {cp.get('resumeStage') if stage == 'paused' else stage!r} belongs to the removed "
+            "second Transform deploy job; this run predates the single-job flow and cannot resume. "
+            "Start a new deploy run (and stop its old Transform jobs in the Transform console).",
         )
     if stage == "paused":
         resume = cp.get("resumeStage")

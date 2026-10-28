@@ -602,6 +602,9 @@ async def _pending_human_input(ws: str, job_id: str, free_text: bool = False) ->
         "text": (newest.get("text") or "")[:PENDING_TEXT_LIMIT],
         "options": [c["label"] for c in choices],
         "choices": choices,
+        # True when the job itself reports AWAITING_HUMAN_INPUT: Transform is blocked on a reply, so the
+        # message is never "just progress".
+        "jobAwaitingInput": bool(free_text),
         "consoleUrl": console_url(await _application_url(), ws, job_id),
     }
 
@@ -637,7 +640,10 @@ def answer_message(
     _ensure_connected()
 
     async def _go():
-        live = await _pending_human_input(ws, job_id, free_text=True)
+        # Same predicate as poll_job: a reply to a question without options is accepted only while the job
+        # reports AWAITING_HUMAN_INPUT or the message ended Transform's turn (FINAL_RESPONSE).
+        job = await _get_job(ws, job_id)
+        live = await _pending_human_input(ws, job_id, free_text=job_status(job, job_id) == "AWAITING_HUMAN_INPUT")
         if live is None or live["kind"] != "message" or live["messageId"] != message_id:
             now_waiting = (
                 "nothing is pending" if live is None
@@ -672,6 +678,18 @@ def answer_message(
 # the AWS console (verification link); the platform then submits the task with its id.
 # --------------------------------------------------------------------------------------
 CONNECTOR_TASK_COMPONENT = "CreateOrSelectConnectors"
+# Connector types the platform will create. The type comes from Transform's task artifact (untrusted text);
+# an unknown type is a contract change to review, not something to create blindly.
+SUPPORTED_CONNECTOR_TYPES = frozenset({"vmware_migration|infra_provisioning|5"})
+
+
+def check_connector_type(connector_type: str) -> str:
+    if connector_type not in SUPPORTED_CONNECTOR_TYPES:
+        raise RuntimeError(
+            f"Transform asks for connector type {connector_type!r}; the platform only creates "
+            f"{sorted(SUPPORTED_CONNECTOR_TYPES)}. Review the type and add it to SUPPORTED_CONNECTOR_TYPES."
+        )
+    return connector_type
 
 
 class ConnectorRejected(RuntimeError):
@@ -720,7 +738,7 @@ def connector_task(job_id: str, task_id: str, workspace: Optional[str] = None) -
                 "(min 1, max 1) is supported"
             )
         return {"taskId": task_id, "severity": task.get("severity"), "status": task.get("status"),
-                "connectorType": wanted[0]["connectorType"], "artifact": artifact}
+                "connectorType": check_connector_type(wanted[0]["connectorType"]), "artifact": artifact}
 
     return _run(_go())
 
@@ -730,53 +748,42 @@ def _connector_status(connector: dict) -> tuple[Optional[str], Optional[str]]:
     return conn.get("accountId"), conn.get("status")
 
 
-def ensure_target_connector(*, connector_type: str, account_id: str, region: str,
+def create_target_connector(*, run_id: str, connector_type: str, account_id: str, region: str,
                             workspace: Optional[str] = None) -> dict[str, Any]:
-    """The workspace connector of ``connector_type`` for ``account_id`` in ``region``.
+    """Create the workspace connector for this deploy run (PENDING until a person approves it in the AWS console).
 
-    Reuses an ACTIVE one, else a PENDING one, else creates one (PENDING until a person approves it
-    in the AWS console). A REJECTED connector is skipped. Returns {connectorId, status, created,
-    verificationLink}.
+    Every run creates its own connector: a connector some earlier run or person approved is never reused,
+    because approving one grants Transform landing-zone permissions in the account and that approval belongs
+    to the run that asks for it. The idempotency token is derived from the run and target, so a retry after a
+    crash returns the same connector. Returns {connectorId, status, verificationLink}.
     """
+    check_connector_type(connector_type)
     ws = workspace or workspace_id()
     _ensure_connected()
+    token = str(uuid.uuid5(uuid.NAMESPACE_URL, f"lz-agent:{run_id}:{account_id}:{region}:{connector_type}"))
 
     async def _go():
-        summaries = await _list_pages(
-            "ListConnectors",
-            lambda token: {"workspaceId": ws, **({"nextToken": token} if token else {})},
-            "connectors",
-        )
-        found: dict[str, dict] = {}
-        for s in summaries:
-            if s.get("connectorType") != connector_type or region not in (s.get("targetRegions") or []):
-                continue
-            full = await _call("GetConnector", GetConnectorRequest(workspaceId=ws, connectorId=s["connectorId"]))
-            acct, status = _connector_status(full)
-            if acct == account_id and status in ("ACTIVE", "PENDING") and status not in found:
-                found[status] = full
-        chosen = found.get("ACTIVE") or found.get("PENDING")
-        created = False
-        if chosen is None:
-            resp = await _call("CreateConnector", CreateConnectorRequest(
-                workspaceId=ws,
-                connectorName=f"lz-agent-target-{account_id}-{region}",
-                connectorType=connector_type,
-                configuration={},
-                accountConnectionRequest=AccountConnectionRequest(
-                    awsAccountConnectionRequest=AwsAccountConnectionRequest(awsAccountId=account_id)),
-                idempotencyToken=str(uuid.uuid4()),
-                targetRegions=[region],
-                description="Landing zone target account (created by the lz-agent deploy run)",
-            ))
-            if not isinstance(resp, dict) or not resp.get("connectorId"):
-                raise RuntimeError(f"Transform CreateConnector returned no connectorId: {resp!r}")
-            chosen = await _call("GetConnector", GetConnectorRequest(workspaceId=ws, connectorId=resp["connectorId"]))
-            created = True
-        _, status = _connector_status(chosen)
-        if status not in ("ACTIVE", "PENDING"):
-            raise RuntimeError(f"Transform connector {chosen.get('connectorId')} has status {status!r}")
-        return {"connectorId": chosen["connectorId"], "status": status, "created": created,
+        resp = await _call("CreateConnector", CreateConnectorRequest(
+            workspaceId=ws,
+            connectorName=f"lz-agent-{run_id[:8]}-{account_id}-{region}",
+            connectorType=connector_type,
+            configuration={},
+            accountConnectionRequest=AccountConnectionRequest(
+                awsAccountConnectionRequest=AwsAccountConnectionRequest(awsAccountId=account_id)),
+            idempotencyToken=token,
+            targetRegions=[region],
+            description=f"Landing zone target account (created by lz-agent deploy run {run_id[:8]})",
+        ))
+        if not isinstance(resp, dict) or not resp.get("connectorId"):
+            raise RuntimeError(f"Transform CreateConnector returned no connectorId: {resp!r}")
+        chosen = await _call("GetConnector", GetConnectorRequest(workspaceId=ws, connectorId=resp["connectorId"]))
+        acct, status = _connector_status(chosen)
+        if acct != account_id or status not in ("ACTIVE", "PENDING"):
+            raise RuntimeError(
+                f"Transform connector {resp['connectorId']} is for account {acct!r} with status {status!r}; "
+                f"expected account {account_id} and ACTIVE or PENDING"
+            )
+        return {"connectorId": chosen["connectorId"], "status": status,
                 "verificationLink": connector_verification_link(chosen["connectorId"], transform_region())}
 
     return _run(_go())
@@ -817,13 +824,41 @@ def submit_connector_task(*, job_id: str, task_id: str, connector_id: str, conne
             raise RuntimeError(f"connector task response failed the {CONNECTOR_TASK_COMPONENT} schema: {fmt.error}")
         response_id = await upload_json_artifact(workspace_id=ws, job_id=job_id, content=fmt.content)
         request_cls = SubmitCriticalHitlTaskRequest if task.get("severity") == "CRITICAL" else SubmitStandardHitlTaskRequest
+        # Stable per task and connector: a resubmission after a crash is a duplicate Transform ignores.
+        token = str(uuid.uuid5(uuid.NAMESPACE_URL, f"lz-agent-submit:{task_id}:{connector_id}"))
         await _call(
             "SubmitCriticalHitlTask" if task.get("severity") == "CRITICAL" else "SubmitStandardHitlTask",
             request_cls(workspaceId=ws, jobId=job_id, taskId=task_id, action="APPROVE",
-                        humanArtifact=HitlTaskArtifact(artifactId=response_id), idempotencyToken=str(uuid.uuid4())),
+                        humanArtifact=HitlTaskArtifact(artifactId=response_id), idempotencyToken=token),
         )
         after = await _get_task(ws, job_id, task_id)
+        if after.get("status") in _ACTIONABLE_HITL_STATUSES:
+            raise RuntimeError(
+                f"Transform task {task_id} is still {after.get('status')} after the submit; the connector "
+                f"{connector_id} was not accepted"
+            )
         return {"taskId": task_id, "status": after.get("status"), "responseArtifactId": response_id}
+
+    return _run(_go())
+
+
+def newest_system_message_id(job_id: str, workspace: Optional[str] = None) -> Optional[str]:
+    """Id of the newest chat message when Transform wrote it (not a USER message); None otherwise.
+
+    Used right after the platform completes a task: a message Transform wrote before the task must not be
+    mistaken for a new question afterwards."""
+    ws = workspace or workspace_id()
+    _ensure_connected()
+
+    async def _go():
+        messages = await _job_messages(ws, job_id)
+        if not messages:
+            return None
+        newest = _by_created(messages, "messageId", "message")[-1]
+        origin = newest.get("messageOrigin")
+        if not origin:
+            raise RuntimeError(f"Transform message {newest.get('messageId')!r} for job {job_id} has no messageOrigin")
+        return None if origin == "USER" else newest.get("messageId")
 
     return _run(_go())
 

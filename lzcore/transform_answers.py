@@ -21,6 +21,12 @@ from botocore.exceptions import ClientError
 
 ANSWER_TEXT_LIMIT = 4000
 AUDIT_TEXT_LIMIT = 500
+# A reservation in "sending" older than this is treated as abandoned (the sender died before it finished) and
+# may be taken over. The takeover reuses the stored idempotency token, so Transform drops a duplicate send.
+SENDING_LEASE_SECONDS = 120
+RESERVATION_CONDITION = (
+    "attribute_not_exists(PK) OR #st = :failed OR (#st = :sending AND leaseUntil < :now)"
+)
 
 
 class AnswerExists(RuntimeError):
@@ -31,10 +37,18 @@ def answer_key(run_id: str, message_id: str) -> dict:
     return {"PK": f"RUN#{run_id}", "SK": f"ANSWER#{message_id}"}
 
 
-def existing_answer(table, run_id: str, message_id: str) -> Optional[dict]:
-    """The ANSWER# item for this question when one is sending or sent; None when absent or failed."""
+def _is_stale_sending(item: Optional[dict], now: int) -> bool:
+    return bool(item) and item.get("status") == "sending" and int(item.get("leaseUntil") or 0) < now
+
+
+def existing_answer(table, run_id: str, message_id: str, now: int) -> Optional[dict]:
+    """The ANSWER# item when the question has been answered or an answer is being sent right now.
+
+    None when absent, failed, or stuck in "sending" past its lease (abandoned: it may be retried)."""
     item = table.get_item(Key=answer_key(run_id, message_id), ConsistentRead=True).get("Item")
-    if item and item.get("status") in ("sending", "sent"):
+    if item and item.get("status") == "sent":
+        return item
+    if item and item.get("status") == "sending" and not _is_stale_sending(item, now):
         return item
     return None
 
@@ -76,14 +90,18 @@ def send_answer(
     reply_text = validate_reply(pending, option, text)
     message_id, job_id = pending["messageId"], pending["jobId"]
     key = answer_key(run_id, message_id)
-    token = str(uuid.uuid4())
+    previous = table.get_item(Key=key, ConsistentRead=True).get("Item")
+    # Taking over an abandoned reservation reuses its token: if the first send did reach Transform, the
+    # retry is a duplicate Transform ignores, not a second message.
+    token = previous["idempotencyToken"] if _is_stale_sending(previous, at) else str(uuid.uuid4())
     answer = {"jobId": job_id, "messageId": message_id, "option": option, "text": reply_text, "by": by, "at": at}
     try:
         table.put_item(
-            Item={**key, **answer, "status": "sending", "idempotencyToken": token},
-            ConditionExpression="attribute_not_exists(PK) OR #st = :failed",
+            Item={**key, **answer, "status": "sending", "idempotencyToken": token,
+                  "leaseUntil": at + SENDING_LEASE_SECONDS},
+            ConditionExpression=RESERVATION_CONDITION,
             ExpressionAttributeNames={"#st": "status"},
-            ExpressionAttributeValues={":failed": "failed"},
+            ExpressionAttributeValues={":failed": "failed", ":sending": "sending", ":now": at},
         )
     except ClientError as e:
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":

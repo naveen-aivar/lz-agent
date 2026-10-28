@@ -162,5 +162,41 @@ class RecentConversation(_Case):
             transform_ops.recent_conversation(JOB, WS)
 
 
+class QuestionPredicate(_Case):
+    """poll_job and answer_message agree on what counts as a question without options."""
+
+    def msgs(self, final):
+        m = [message("m1", "USER", 1, "Customer: Acme"), message("m2", "SYSTEM", 2, "Working on it...")]
+        if final:
+            m[-1]["processingInfo"] = {"messageType": "FINAL_RESPONSE"}
+        return m
+
+    def answer(self, fake):
+        self.install(fake)
+        return transform_ops.answer_message(JOB, "m2", idempotency_token=TOKEN, text="Region is us-east-1.", workspace=WS)
+
+    def test_pending_message_records_whether_the_job_itself_is_waiting(self):
+        waiting = self.poll(FakeTransform(status="AWAITING_HUMAN_INPUT", messages=self.msgs(False)))["pendingHumanInput"]
+        self.assertIs(waiting["jobAwaitingInput"], True)
+        ended = self.poll(FakeTransform(status="EXECUTING", messages=self.msgs(True)))["pendingHumanInput"]
+        self.assertIs(ended["jobAwaitingInput"], False)
+
+    def test_reply_to_a_plain_message_is_refused_while_the_job_runs(self):
+        with self.assertRaisesRegex(transform_ops.QuestionChanged, "nothing is pending"):
+            self.answer(FakeTransform(status="EXECUTING", messages=self.msgs(False)))
+
+    def test_reply_is_accepted_when_the_job_waits_or_the_turn_ended(self):
+        self.assertEqual(self.answer(FakeTransform(status="AWAITING_HUMAN_INPUT", messages=self.msgs(False)))["answeredMessageId"], "m2")
+        self.assertEqual(self.answer(FakeTransform(status="EXECUTING", messages=self.msgs(True)))["answeredMessageId"], "m2")
+
+    def test_newest_system_message_id(self):
+        self.install(FakeTransform(messages=self.msgs(True)))
+        self.assertEqual(transform_ops.newest_system_message_id(JOB, WS), "m2")
+        self.install(FakeTransform(messages=self.msgs(True) + [message("m3", "USER", 3, "ok")]))
+        self.assertIsNone(transform_ops.newest_system_message_id(JOB, WS))
+        self.install(FakeTransform(messages=[]))
+        self.assertIsNone(transform_ops.newest_system_message_id(JOB, WS))
+
+
 if __name__ == "__main__":
     unittest.main()

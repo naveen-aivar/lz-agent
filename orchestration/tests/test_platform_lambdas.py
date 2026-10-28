@@ -43,16 +43,20 @@ class FakeTable:
     def _k(self, key):
         return key["PK"], key["SK"]
 
-    def get_item(self, Key):
+    def get_item(self, Key, ConsistentRead=False):
         item = self.items.get(self._k(Key))
         return {"Item": copy.deepcopy(item)} if item is not None else {}
 
     def put_item(self, Item, ConditionExpression=None, ExpressionAttributeNames=None, ExpressionAttributeValues=None):
         if ConditionExpression is not None:
-            # Only the /answer reservation condition is modelled.
-            assert ConditionExpression == "attribute_not_exists(PK) OR #st = :failed", ConditionExpression
+            # Only the /answer reservation condition is modelled (lzcore.transform_answers.RESERVATION_CONDITION).
+            from lzcore.transform_answers import RESERVATION_CONDITION
+            assert ConditionExpression == RESERVATION_CONDITION, ConditionExpression
             current = self.items.get((Item["PK"], Item["SK"]))
-            if current is not None and current.get(ExpressionAttributeNames["#st"]) != ExpressionAttributeValues[":failed"]:
+            v = ExpressionAttributeValues
+            free = (current is None or current.get("status") == v[":failed"]
+                    or (current.get("status") == v[":sending"] and int(current.get("leaseUntil") or 0) < v[":now"]))
+            if not free:
                 raise ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": "x"}}, "PutItem")
         self.items[(Item["PK"], Item["SK"])] = copy.deepcopy(Item)
 
@@ -231,16 +235,28 @@ class ApiRunsTests(_Base):
 
     def test_target_region_override_is_validated_stored_and_audited(self):
         target = {"accountId": ACCOUNT, "accessKeyId": "AKIAEXAMPLE", "secretAccessKey": "secret"}
-        code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "targetRegion": "us-east-1"},
-                             run_id=DESIGN_ID)
-        self.assertEqual(code, 202)
-        self.assertEqual(self.table.meta(res["runId"])["targetRegion"], "us-east-1")
-        started = json.loads(self.table.audit(res["runId"], "deploy.started")[0]["detail"])
-        self.assertEqual(started["targetRegion"], "us-east-1")
-        code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "targetRegion": "mars-east-1"},
-                             run_id=DESIGN_ID)
-        self.assertEqual(code, 400)
-        self.assertIn("targetRegion", res["error"])
+        with mock.patch.dict(os.environ, {"TRANSFORM_APPROVER_GROUP": "transform-approvers"}):
+            # An approver-group member through the API ...
+            code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "targetRegion": "us-east-1"},
+                                 run_id=DESIGN_ID, groups=["transform-approvers"])
+            self.assertEqual(code, 202)
+            self.assertEqual(self.table.meta(res["runId"])["targetRegion"], "us-east-1")
+            started = json.loads(self.table.audit(res["runId"], "deploy.started")[0]["detail"])
+            self.assertEqual(started["targetRegion"], "us-east-1")
+            req = json.loads(self.table.audit(DESIGN_ID, "design.deploy_requested")[-1]["detail"])
+            self.assertEqual(req["targetRegion"], "us-east-1")
+            # ... or an operator (direct Lambda invoke, recorded by IAM ARN) may set it; anyone else may not.
+            code, _ = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "targetRegion": "us-east-1"},
+                               run_id=DESIGN_ID, direct=True, invoked_by=OPERATOR)
+            self.assertEqual(code, 202)
+            code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "targetRegion": "us-east-1"},
+                                 run_id=DESIGN_ID, groups=["someone-else"])
+            self.assertEqual(code, 403)
+            self.assertIn("transform-approvers", res["error"])
+            code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "targetRegion": "mars-east-1"},
+                                 run_id=DESIGN_ID, groups=["transform-approvers"])
+            self.assertEqual(code, 400)
+            self.assertIn("targetRegion", res["error"])
         code, res = self.deploy_keys()
         self.assertNotIn("targetRegion", self.table.meta(res["runId"]))
 
@@ -271,7 +287,7 @@ class ApiRunsTests(_Base):
         self.assertEqual(self.table.meta(run_id)["invokedBy"], OPERATOR)
         self.assertEqual(json.loads(self.table.audit(run_id, "deploy.started")[0]["detail"])["invokedBy"], OPERATOR)
         req = json.loads(self.table.audit(DESIGN_ID, "design.deploy_requested")[0]["detail"])
-        self.assertEqual(req, {"deployRunId": run_id, "invokedBy": OPERATOR})
+        self.assertEqual(req, {"deployRunId": run_id, "invokedBy": OPERATOR, "targetRegion": None})
 
     def test_failed_start_deletes_stored_keys(self):
         self.sfn.fail_start = True
@@ -496,6 +512,15 @@ class PhaseInvokeTests(_Base):
         self.assertEqual(out["pendingSummary"], "none")
         self.assertNotIn("pendingHumanInput", self.table.meta(self.RUN))
         self.assertEqual(len(self.table.audit(self.RUN, "phase.human_input_resolved")), 1)
+
+    def test_agent_note_link_must_be_an_aws_console_url(self):
+        ok = {"reason": "Approve it.", "suggestion": None,
+              "link": "https://ap-south-1.console.aws.amazon.com/transform/connector/c-1/configure?region=ap-south-1"}
+        self.invoke([cont(True, {**pending(), "agentNote": ok})])
+        for link in ("https://evil.example.com/transform/connector/c-1", "http://ap-south-1.console.aws.amazon.com/x",
+                     "https://console.aws.amazon.com.evil.example.com/x", "https://x.console.aws.amazon.com.evil.com/"):
+            with self.subTest(link=link), self.assertRaisesRegex(RuntimeError, "agentNote must be"):
+                self.invoke([cont(True, {**pending(title=link), "agentNote": {**ok, "link": link}})])
 
     def test_message_choices_are_validated(self):
         self.invoke([cont(True, {**pending(), "kind": "message", "taskId": None, "messageId": "m-1",

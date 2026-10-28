@@ -26,9 +26,11 @@ Per-question state lives in DynamoDB at RUN#<runId> / AGENTQ#<questionKey>:
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any, Optional
 
+from botocore.exceptions import ClientError
 from strands import tool
 
 from lzcore import transform_ops
@@ -50,7 +52,21 @@ RUN_PURPOSE = (
     "no network migration, no server migration."
 )
 
-# The question the current model turn is deciding (set by begin_turn, cleared by end_turn).
+# Options the agent may select. Everything else (Proceed, Continue, Deploy for me, Approve proposal, any new
+# label Transform introduces) is handed to a person: the list fails closed. Compared case-insensitively.
+AGENT_ANSWERABLE_OPTIONS = frozenset({"landing zone", "custom structure"})
+# Outgoing free-text guardrail: a reply the agent sends must not carry approval or go-ahead wording. This is a
+# policy on what the platform will send on a person's behalf, not a classification of the question.
+APPROVAL_WORDING = re.compile(
+    r"\b(proceed|continue|deploy|deployment|approve|approval|go\s*a?head|start\s+(the\s+)?(execution|build)|execute|apply)\b",
+    re.IGNORECASE,
+)
+# Atomic per-run cap on agent answers: the slot is taken before sending and given back if the send fails.
+SLOT_CONDITION = "#s = :running AND (attribute_not_exists(agentAnswerCount) OR agentAnswerCount < :max)"
+
+# The question the current model turn is deciding (set by begin_turn, cleared by end_turn). Module-level state is
+# safe because one AgentCore session runs one invoke at a time; a second concurrent invoke in the same process
+# would corrupt it, so do not call these tools from threads.
 _turn: dict[str, Any] = {}
 
 
@@ -84,21 +100,34 @@ def agent_note(item: dict) -> dict:
     return note
 
 
-def _answer_count() -> int:
-    meta = base._ddb.get_item(Key={"PK": f"RUN#{base._state['run']}", "SK": "META"}, ConsistentRead=True).get("Item")
-    if not meta:
-        raise RuntimeError(f"run META item RUN#{base._state['run']} not found in {base.TABLE}")
-    return int(meta.get("agentAnswerCount") or 0)
+def _reserve_answer_slot() -> bool:
+    """Take one of the run's agent-answer slots atomically. False when the cap is reached or the run is not RUNNING."""
+    try:
+        base._ddb.update_item(
+            Key={"PK": f"RUN#{base._state['run']}", "SK": "META"},
+            UpdateExpression="ADD agentAnswerCount :one",
+            ConditionExpression=SLOT_CONDITION,
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":one": 1, ":running": "RUNNING", ":max": MAX_AGENT_ANSWERS_PER_RUN},
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+        return False
 
 
-def _count_answer() -> None:
+def _release_answer_slot() -> None:
     base._ddb.update_item(
         Key={"PK": f"RUN#{base._state['run']}", "SK": "META"},
-        UpdateExpression="ADD agentAnswerCount :one",
-        ConditionExpression="#s = :running",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":one": 1, ":running": "RUNNING"},
+        UpdateExpression="ADD agentAnswerCount :minus",
+        ExpressionAttributeValues={":minus": -1},
     )
+
+
+def _json_for_prompt(obj: Any, **kw) -> str:
+    """JSON that cannot close or open the prompt's XML-style blocks: Transform text is untrusted."""
+    return json.dumps(obj, default=str, **kw).replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
 
 
 def effective_region(meta: dict, scope: dict) -> Optional[str]:
@@ -134,7 +163,7 @@ def run_context(*, meta: dict, foundation: dict, gaps: dict, scope: Optional[dic
 
 def build_prompt(*, pending: dict, scope: dict, context: dict, conversation: list[dict], prior: Optional[dict]) -> str:
     question = {k: pending.get(k) for k in ("kind", "title", "text", "options", "messageId", "taskId")}
-    scope_json = json.dumps(scope, default=str, sort_keys=True)
+    scope_json = _json_for_prompt(scope, sort_keys=True)
     if len(scope_json) > SCOPE_PROMPT_LIMIT:
         raise RuntimeError(
             f"approved design is {len(scope_json)} characters (limit {SCOPE_PROMPT_LIMIT} for the Transform conversation turn)"
@@ -142,9 +171,9 @@ def build_prompt(*, pending: dict, scope: dict, context: dict, conversation: lis
     parts = [
         "Decide the pending AWS Transform question below with exactly one tool call: "
         "answer_transform_question or escalate_to_human.",
-        f"<pending_question>\n{json.dumps(question, default=str, indent=1)}\n</pending_question>",
-        f"<recent_transform_conversation>\n{json.dumps(conversation, default=str, indent=1)}\n</recent_transform_conversation>",
-        f"<run_context>\n{json.dumps(context, default=str, indent=1)}\n</run_context>",
+        f"<pending_question>\n{_json_for_prompt(question, indent=1)}\n</pending_question>",
+        f"<recent_transform_conversation>\n{_json_for_prompt(conversation, indent=1)}\n</recent_transform_conversation>",
+        f"<run_context>\n{_json_for_prompt(context, indent=1)}\n</run_context>",
         f"<approved_design>\n{scope_json}\n</approved_design>",
     ]
     if prior and prior.get("lastError"):
@@ -215,8 +244,10 @@ def answer_transform_question(category: str, rationale: str, basis: list[str], o
       that follows from the run purpose and context. Approval gates have no category: escalate them.
     rationale: why this is the answer, in one or two sentences.
     basis: entries "scope:<JSON pointer into the approved design>" or "context:<run_context key>".
-    option: one of the offered option labels, exactly as given. Or text: a free-text reply
-      (1-4000 characters). Give exactly one of option or text.
+    option: one of the offered option labels, exactly as given, and only if it names a workflow choice
+      ("Landing Zone", "Custom structure"). Anything that approves, continues or starts execution is escalated.
+      Or text: a free-text reply (1-4000 characters) that states facts from the design or context and contains no
+      approval wording (proceed, continue, deploy, approve, execute, apply). Give exactly one of option or text.
     """
     refused = _refuse_unless_open()
     if refused:
@@ -236,10 +267,17 @@ def answer_transform_question(category: str, rationale: str, basis: list[str], o
         return (f"REFUSED: these basis entries do not resolve in the approved design or run context: {bad}. "
                 f"Context keys: {sorted(_turn['context'])}.")
     opt, txt = (option or None), (text or None)
-    if _answer_count() >= MAX_AGENT_ANSWERS_PER_RUN:
-        return (f"REFUSED: the agent has sent {MAX_AGENT_ANSWERS_PER_RUN} answers in this run, the limit. "
-                "Call escalate_to_human.")
+    if opt is not None and opt.strip().lower() not in AGENT_ANSWERABLE_OPTIONS:
+        return (f"REFUSED: {opt!r} is not an option the agent may select. Anything that approves, continues or "
+                "starts execution, and any option not on the agent's list, goes to escalate_to_human.")
+    if txt is not None and APPROVAL_WORDING.search(txt):
+        return ("REFUSED: the reply contains approval or go-ahead wording (proceed, continue, deploy, approve, "
+                "execute, apply, start execution). The agent never approves. State only facts from the design or "
+                "context, or call escalate_to_human.")
     qkey = _turn["qkey"]
+    if not _reserve_answer_slot():
+        return (f"REFUSED: the agent has used its {MAX_AGENT_ANSWERS_PER_RUN} answers for this run, or the run is "
+                "no longer RUNNING. Call escalate_to_human.")
     try:
         sent = send_answer(
             table=base._ddb,
@@ -255,18 +293,23 @@ def answer_transform_question(category: str, rationale: str, basis: list[str], o
                          "basis": basis[:20], "question": pending.get("title")},
         )
     except ValueError as e:
+        _release_answer_slot()
         return f"REFUSED: {e}"
     except AnswerExists:
+        _release_answer_slot()
         put_question(qkey, status="superseded", kind=pending["kind"], title=pending.get("title"),
                      turns=_turn.get("turns"), reason="the question already had an answer (a person answered it)")
         _turn["decided"] = "superseded"
         return "REFUSED: this question already has an answer from a person. Stop now."
     except transform_ops.QuestionChanged as e:
+        _release_answer_slot()
         put_question(qkey, status="superseded", kind=pending["kind"], title=pending.get("title"),
                      turns=_turn.get("turns"), reason=str(e)[:NOTE_LIMIT])
         _turn["decided"] = "superseded"
         return f"REFUSED: AWS Transform moved on ({e}). Stop now; the next question comes on a later poll."
-    _count_answer()
+    except Exception:
+        _release_answer_slot()
+        raise
     put_question(qkey, status="answered", kind=pending["kind"], title=pending.get("title"), turns=_turn.get("turns"),
                  category=category, rationale=rationale.strip(), basis=basis, option=opt, text=sent.get("text"))
     _turn["decided"] = "answered"
@@ -314,6 +357,9 @@ def no_reply_needed(reason: str) -> str:
     pending = _turn["pending"]
     if pending.get("kind") != "message" or pending.get("options"):
         return "REFUSED: only a message without options can be informational. Answer it or escalate it."
+    if pending.get("jobAwaitingInput"):
+        return ("REFUSED: the Transform job reports AWAITING_HUMAN_INPUT, so it is blocked on a reply and this "
+                "message is not just progress. Answer it or escalate it.")
     if not isinstance(reason, str) or not reason.strip() or len(reason) > NOTE_LIMIT:
         return f"REFUSED: reason must be 1-{NOTE_LIMIT} characters."
     put_question(_turn["qkey"], status="informational", kind=pending["kind"], title=pending.get("title"),
