@@ -27,6 +27,7 @@ from botocore.exceptions import ClientError
 
 from common import ARTIFACT_BUCKET, audit, delete_run_credentials, get_run, now, s3, table
 from lzcore.aws_target_session import public_deploy_target
+from lzcore.regions import ALL_REGIONS
 from lzcore.deploy_target_api import (
     delete_deploy_target_credentials,
     parse_deploy_target_from_request,
@@ -193,6 +194,12 @@ def _deploy(design_run_id, sub, event, invoked_by):
             SSEKMSKeyId=os.environ["DATA_KEY_ARN"],  # the stack CMK, never aws/s3 (bucket policy enforces it)
         )
 
+    # Optional operator override of the Control Tower home / connector Region for this run only (the approved
+    # design is not changed). Needed when the target account's IAM Identity Center is in another Region.
+    target_region = body.get("targetRegion")
+    if target_region is not None and target_region not in ALL_REGIONS:
+        return _resp(400, {"error": f"targetRegion must be one of the AWS Regions, got {target_region!r}"})
+
     try:
         deploy_target = parse_deploy_target_from_request(
             body, deploy_id=deploy_id, put_credentials=_put_credentials
@@ -216,6 +223,8 @@ def _deploy(design_run_id, sub, event, invoked_by):
     }
     if deploy_target:
         item["deployTarget"] = deploy_target
+    if target_region:
+        item["targetRegion"] = target_region
     if invoked_by:
         item["invokedBy"] = invoked_by
     try:
@@ -239,7 +248,8 @@ def _deploy(design_run_id, sub, event, invoked_by):
         deploy_id,
         sub,
         "deploy.started",
-        {"designRunId": design_run_id, "deployTarget": public_deploy_target(deploy_target), "invokedBy": invoked_by},
+        {"designRunId": design_run_id, "deployTarget": public_deploy_target(deploy_target), "invokedBy": invoked_by,
+         "targetRegion": target_region},
     )
     audit(design_run_id, sub, "design.deploy_requested", {"deployRunId": deploy_id, "invokedBy": invoked_by})
     return _resp(202, {"runId": deploy_id, "designRunId": design_run_id})

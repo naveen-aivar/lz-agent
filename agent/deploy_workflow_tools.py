@@ -699,6 +699,13 @@ def _save_waiting(cp: dict, pending: dict) -> dict:
     return read_checkpoint() or {}
 
 
+def _clear_pending(cp: dict) -> dict:
+    """The pending item needs nobody (progress message): drop it from the waiting checkpoint and keep polling."""
+    extra = {k: v for k, v in cp.items() if k not in ("stage", "updatedAt", "pendingHumanInput", "awaitingHitl")}
+    _save_checkpoint(cp["stage"], pendingHumanInput=None, awaitingHitl=False, **extra)
+    return _continue_from(read_checkpoint() or {})
+
+
 def _escalated(cp: dict, pending: dict, item: dict) -> dict:
     """The question is the person's: show it with the agent's note (META via phase_invoke, C3)."""
     note = conv.agent_note(item)
@@ -725,12 +732,13 @@ def _handle_connector_task(cp: dict, pending: dict, qkey: str, item: dict) -> di
                      "status": transform_ops.connector_state(item["connectorId"], ws),
                      "verificationLink": item.get("verificationLink"), "created": False}
     else:
-        account = (_run_meta().get("deployTarget") or {}).get("accountId")
-        region = (_design_scope().get("regions") or {}).get("home")
+        meta = _run_meta()
+        account = (meta.get("deployTarget") or {}).get("accountId")
+        region = conv.effective_region(meta, _design_scope())
         if not account or not region:
             raise RuntimeError(
                 f"connector task {task_id} needs the deploy target account ({account!r}) and the design's "
-                f"home Region ({region!r})"
+                f"home Region or the run's targetRegion ({region!r})"
             )
         connector = transform_ops.ensure_target_connector(
             connector_type=request["connectorType"], account_id=account, region=region, workspace=ws
@@ -782,6 +790,8 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
         handled = _handle_connector_task(cp, pending, qkey, item)
         if handled is not None:
             return handled
+    if status == "informational":
+        return _clear_pending(cp)
     if status == "escalated":
         return _escalated(cp, pending, item)
     if status in ("answered", "superseded"):
@@ -804,12 +814,13 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
 
     meta = _run_meta()
     deployment = base._deployment_prefix()
+    scope = _design_scope()
     context = conv.run_context(
         meta=meta,
         foundation=_get_json(f"{deployment}/foundation.json"),
         gaps=_get_json(f"{deployment}/gap-analysis.json"),
+        scope=scope,
     )
-    scope = _design_scope()
     prompt = conv.build_prompt(
         pending=pending,
         scope=scope,
@@ -832,6 +843,8 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
     if error is None and decided and item.get("status") == decided:
         if decided == "escalated":
             return _escalated(cp, pending, item)
+        if decided == "informational":
+            return _clear_pending(cp)
         return _continue_from(cp)
 
     error = error or "the model ended the turn without answering or escalating"

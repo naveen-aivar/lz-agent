@@ -122,6 +122,8 @@ def main() -> None:
     ap.add_argument("--region", help="platform region (default: AWS_REGION / AWS_DEFAULT_REGION)")
     ap.add_argument("--ui-url", help="UI base URL (default: the stack's UiUrl output)")
     ap.add_argument("--timeout-min", type=int, default=120, help="stop following after N minutes (run keeps going)")
+    ap.add_argument("--target-region", help="Control Tower home / connector Region for this run, overriding the design's "
+                    "home Region (use when IAM Identity Center in the target account is in another Region)")
     ap.add_argument("--no-follow", action="store_true", help="start the run and exit")
     args = ap.parse_args()
 
@@ -158,7 +160,10 @@ def main() -> None:
         _fail(f"target account Organizations status is {org!r}: {res.get('warnings')}")
 
     # 2. Start the deploy run.
-    code, res = _invoke_api(lam, fn, "POST /runs/{runId}/deploy", sub, invoked_by, {"deployTarget": target},
+    start_body = {"deployTarget": target}
+    if args.target_region:
+        start_body["targetRegion"] = args.target_region
+    code, res = _invoke_api(lam, fn, "POST /runs/{runId}/deploy", sub, invoked_by, start_body,
                             run_id=args.design_run)
     if code not in (200, 201, 202):
         _fail(f"deploy start returned HTTP {code}: {res}")

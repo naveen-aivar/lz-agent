@@ -229,6 +229,21 @@ class ApiRunsTests(_Base):
         self.assertNotIn("credentialsKey", json.dumps(out))
         self.assertNotIn("target-credentials", json.dumps(out))
 
+    def test_target_region_override_is_validated_stored_and_audited(self):
+        target = {"accountId": ACCOUNT, "accessKeyId": "AKIAEXAMPLE", "secretAccessKey": "secret"}
+        code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "targetRegion": "us-east-1"},
+                             run_id=DESIGN_ID)
+        self.assertEqual(code, 202)
+        self.assertEqual(self.table.meta(res["runId"])["targetRegion"], "us-east-1")
+        started = json.loads(self.table.audit(res["runId"], "deploy.started")[0]["detail"])
+        self.assertEqual(started["targetRegion"], "us-east-1")
+        code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "targetRegion": "mars-east-1"},
+                             run_id=DESIGN_ID)
+        self.assertEqual(code, 400)
+        self.assertIn("targetRegion", res["error"])
+        code, res = self.deploy_keys()
+        self.assertNotIn("targetRegion", self.table.meta(res["runId"]))
+
     def test_role_mode_requires_external_id(self):
         code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": {"accountId": ACCOUNT, "roleArn": ROLE}},
                              run_id=DESIGN_ID)

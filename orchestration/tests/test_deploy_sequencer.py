@@ -1314,6 +1314,14 @@ def _escalate(reason="Needs a person.", suggestion=""):
     return turn
 
 
+def _no_reply(reason="Only a progress update."):
+    def turn(prompt):
+        out = conv.no_reply_needed(reason)
+        assert out.startswith("Recorded"), out
+        return out
+    return turn
+
+
 def _no_decision(prompt):
     return "thinking about it"
 
@@ -1389,6 +1397,39 @@ class TransformConversation(_SequencerCaseBase):
         self.assertEqual(result["pendingHumanInput"]["agentNote"],
                          {"reason": "Pick the workflow.", "suggestion": "Landing Zone"})
         self.assertIn("transform.agent_escalated", self.table.actions())
+
+    PROGRESS = {**MESSAGE, "messageId": "msg-progress", "text": "Working on build landing zone...",
+                "options": [], "choices": [], "title": "Transform is asking for a reply"}
+
+    def test_progress_message_needs_no_reply_and_clears_the_waiting_card(self):
+        self._env([("EXECUTING", self.PROGRESS), ("EXECUTING", self.PROGRESS)])
+        self._set_converse(_no_reply())
+
+        result = self._invoke()
+
+        self._assert_continue(result, awaiting=False, pending=None)
+        self.assertEqual(self.fake_ops.answers, [])
+        self.assertIsNone(self.table.item("ANSWER#msg-progress"))
+        self.assertEqual(self._q("message:msg-progress")["status"], "informational")
+        self.assertIn("transform.no_reply_needed", self.table.actions())
+        cp = self._checkpoint()
+        self.assertEqual((cp["stage"], cp["awaitingHitl"], cp["pendingHumanInput"]), ("transform_analyze_waiting", False, None))
+        # The same message is still the newest on the next poll: no second model turn, still no card.
+        again = self._invoke()
+        self._assert_continue(again, awaiting=False, pending=None)
+
+    def test_no_reply_needed_is_refused_for_questions_with_options_and_for_tasks(self):
+        self._env([("EXECUTING", MESSAGE)])
+        self._set_converse(lambda prompt: (
+            self.assertTrue(conv.no_reply_needed("looks like status").startswith("REFUSED")),
+            _escalate("Pick the workflow.")(prompt)))
+        self._invoke()
+        self.assertEqual(self._q()["status"], "escalated")
+        self._env([("EXECUTING", PENDING)])
+        self._set_converse(lambda prompt: (
+            self.assertTrue(conv.no_reply_needed("task").startswith("REFUSED")), _escalate("Do it in the console.")(prompt)))
+        self._invoke()
+        self.assertEqual(self._q("task:task-0001")["status"], "escalated")
 
     def test_one_decision_per_turn(self):
         self._env([("EXECUTING", MESSAGE)])
@@ -1524,20 +1565,23 @@ class TransformConversation(_SequencerCaseBase):
             self.addCleanup(p.stop)
 
         self.assertEqual(_REAL_CONVERSE_AGENT("prompt"), "ok")
-        self.assertEqual({_tool_name(t) for t in captured["tools"]}, {"answer_transform_question", "escalate_to_human"})
+        self.assertEqual({_tool_name(t) for t in captured["tools"]},
+                         {"answer_transform_question", "no_reply_needed", "escalate_to_human"})
         self.assertEqual(captured["system_prompt"], app.CONVERSE_SYSTEM)
         self.assertIn("Approval gates", app.CONVERSE_SYSTEM)
+        # Starting execution ("Proceed") is an approval gate the agent must always hand to a person.
+        self.assertIn('("Proceed", "Continue", "Deploy for me"', app.CONVERSE_SYSTEM)
 
 
 class ConnectorTask(_SequencerCaseBase):
     REQUEST = {"severity": "CRITICAL", "status": "AWAITING_HUMAN_INPUT",
                "connectorType": "vmware_migration|infra_provisioning|5", "artifact": {}}
 
-    def _env(self, script, states):
+    def _env(self, script, states, **meta):
         self._make_env(transform_ops=FakeTransformOps(poll_script=script, connector_request=self.REQUEST,
                                                       connector_states=states),
                        meta_extra={"transformAnalyzeJobId": ANALYZE_JOB,
-                                   "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}})
+                                   "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}, **meta})
         self._seed_foundation()
         self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
 
@@ -1565,6 +1609,21 @@ class ConnectorTask(_SequencerCaseBase):
                          [{"task": "task-0001", "connector": "conn-1", "type": "vmware_migration|infra_provisioning|5"}])
         self.assertEqual(self.table.item("AGENTQ#task:task-0001")["status"], "answered")
         self.assertIn("transform.connector_task_submitted", self.table.actions())
+
+    def test_target_region_override_replaces_the_design_home_region(self):
+        self._env([("EXECUTING", PENDING)], ["PENDING"], targetRegion="us-east-1")
+
+        first = self._invoke()
+
+        self.assertEqual(self.fake_ops.connectors_ensured[0]["region"], "us-east-1")
+        self.assertIn("us-east-1", first["pendingHumanInput"]["agentNote"]["reason"])
+        self.assertTrue(first["pendingHumanInput"]["agentNote"]["link"].startswith("https://us-east-1.console"))
+
+    def test_conversation_context_carries_the_effective_region(self):
+        ctx = conv.run_context(meta={"targetRegion": "us-east-1"}, foundation={}, gaps={}, scope=SCOPE)
+        self.assertEqual((ctx["targetRegion"], ctx["targetRegionIsOverride"]), ("us-east-1", True))
+        ctx = conv.run_context(meta={}, foundation={}, gaps={}, scope=SCOPE)
+        self.assertEqual((ctx["targetRegion"], ctx["targetRegionIsOverride"]), ("eu-west-1", False))
 
     def test_active_connector_is_used_straight_away(self):
         self._env([("EXECUTING", PENDING)], ["ACTIVE"])

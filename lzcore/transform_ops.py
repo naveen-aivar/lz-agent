@@ -679,7 +679,11 @@ class ConnectorRejected(RuntimeError):
 
 
 def connector_verification_link(connector_id: str, region: str) -> str:
-    """Same link the library's create_connector returns (AWS console approval page)."""
+    """Same link the library's create_connector returns (AWS console approval page).
+
+    ``region`` is the AWS Transform Region (where the connector is registered), NOT the connector's target
+    Region: the console page reads the connector from the Transform service of the Region in its URL, and
+    answers "not authorized" in any Region where Transform is not enabled."""
     return f"https://{region}.console.aws.amazon.com/transform/connector/{connector_id}/configure?region={region}"
 
 
@@ -773,7 +777,7 @@ def ensure_target_connector(*, connector_type: str, account_id: str, region: str
         if status not in ("ACTIVE", "PENDING"):
             raise RuntimeError(f"Transform connector {chosen.get('connectorId')} has status {status!r}")
         return {"connectorId": chosen["connectorId"], "status": status, "created": created,
-                "verificationLink": connector_verification_link(chosen["connectorId"], region)}
+                "verificationLink": connector_verification_link(chosen["connectorId"], transform_region())}
 
     return _run(_go())
 

@@ -1,12 +1,15 @@
 """The deploy agent's side of the AWS Transform conversation.
 
 While the Transform landing zone job runs, each question it asks goes to the deploy agent first.
-In one model turn the agent makes exactly one decision with one of two tools:
+In one model turn the agent makes exactly one decision with one of three tools:
 
 * answer_transform_question: the approved design (scope.json) or the run context answers it. The
   reply goes through lzcore.transform_answers.send_answer, the same reservation and record path the
   UI approver uses, so a question is never answered twice and every answer is audited with the
   agent's category, rationale and design basis.
+* no_reply_needed: the message only reports progress or status and asks nothing (no options, no
+  question). Nothing is sent to Transform and the person is not asked; the model, not a text rule,
+  decides this.
 * escalate_to_human: anything else. Approval gates (deploying, creating or deleting resources),
   facts the design does not hold (emails, MAP ids), Transform tasks with their own form, and
   anything the model is unsure about. The reason and an optional suggestion are shown to the
@@ -17,7 +20,7 @@ no approval category, so an approval can only be escalated), every basis entry m
 design or the run context, and option answers must be an offered label.
 
 Per-question state lives in DynamoDB at RUN#<runId> / AGENTQ#<questionKey>:
-    {status: deciding | answered | escalated | superseded, turns, kind, title, reason, suggestion,
+    {status: deciding | answered | escalated | informational | superseded, turns, kind, title, reason, suggestion,
      category, rationale, basis, option, text, lastError, updatedAt}
 """
 from __future__ import annotations
@@ -98,7 +101,12 @@ def _count_answer() -> None:
     )
 
 
-def run_context(*, meta: dict, foundation: dict, gaps: dict) -> dict:
+def effective_region(meta: dict, scope: dict) -> Optional[str]:
+    """Control Tower home / connector Region: the run's targetRegion override, else the design's home Region."""
+    return meta.get("targetRegion") or (scope.get("regions") or {}).get("home")
+
+
+def run_context(*, meta: dict, foundation: dict, gaps: dict, scope: Optional[dict] = None) -> dict:
     """Facts the agent may cite as context:<key>, built from the run META and pre-discover output."""
     target = meta.get("deployTarget") or {}
     org = foundation.get("organization") or {}
@@ -106,6 +114,8 @@ def run_context(*, meta: dict, foundation: dict, gaps: dict) -> dict:
         "runPurpose": RUN_PURPOSE,
         "deployTargetAccountId": target.get("accountId") or org.get("callerAccountId"),
         "transformRegion": transform_ops.transform_region(),
+        "targetRegion": effective_region(meta, scope or {}),
+        "targetRegionIsOverride": bool(meta.get("targetRegion")),
         "organization": {
             "id": org.get("id"),
             "managementAccountId": org.get("masterAccountId"),
@@ -289,6 +299,31 @@ def escalate_to_human(reason: str, suggestion: str = "") -> str:
     return "Handed to a person. Reply with one sentence and stop."
 
 
+@tool
+def no_reply_needed(reason: str) -> str:
+    """Record that the pending Transform message only reports progress and needs no reply.
+
+    Use it only for a message without options that asks nothing (for example a status update such as
+    "Working on ..."). Nothing is sent to Transform. If the message asks anything, even in plain text,
+    answer it or escalate it instead.
+    reason: one sentence saying why no reply is needed.
+    """
+    refused = _refuse_unless_open()
+    if refused:
+        return refused
+    pending = _turn["pending"]
+    if pending.get("kind") != "message" or pending.get("options"):
+        return "REFUSED: only a message without options can be informational. Answer it or escalate it."
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > NOTE_LIMIT:
+        return f"REFUSED: reason must be 1-{NOTE_LIMIT} characters."
+    put_question(_turn["qkey"], status="informational", kind=pending["kind"], title=pending.get("title"),
+                 turns=_turn.get("turns"), reason=reason.strip())
+    base.log_tool_event("transform.no_reply_needed", {"jobId": pending.get("jobId"), "messageId": pending.get("messageId"),
+                                                      "reason": reason.strip()[:300]})
+    _turn["decided"] = "informational"
+    return "Recorded. Reply with one sentence and stop."
+
+
 def converse_tools() -> list:
-    return [answer_transform_question, escalate_to_human]
+    return [answer_transform_question, no_reply_needed, escalate_to_human]
 
