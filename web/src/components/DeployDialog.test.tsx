@@ -2,13 +2,13 @@ import { describe, expect, it } from "vitest";
 import { buildDeployRequest } from "./DeployDialog";
 
 const base = { method: "role" as const, accountId: "710507380209", roleArn: "arn:aws:iam::710507380209:role/R", externalId: "ext",
-  accessKeyId: "", secretAccessKey: "", sessionToken: "", accountEmail: "", mapAgreement: "", targetRegion: "" };
+  accessKeyId: "", secretAccessKey: "", sessionToken: "", accountEmail: "", mapAgreement: "", targetRegion: "", applyScps: true };
 
 describe("buildDeployRequest", () => {
   it("builds a role request with the optional email and Region", () => {
     expect(buildDeployRequest({ ...base, accountEmail: " billu.naveen@aivar.tech ", targetRegion: "us-east-1" })).toEqual({
       deployTarget: { accountId: "710507380209", roleArn: "arn:aws:iam::710507380209:role/R", externalId: "ext" },
-      accountEmail: "billu.naveen@aivar.tech", targetRegion: "us-east-1",
+      accountEmail: "billu.naveen@aivar.tech", targetRegion: "us-east-1", applyScps: true,
     });
   });
   it("builds a keys request and only includes a session token when given", () => {
@@ -25,7 +25,11 @@ describe("buildDeployRequest", () => {
     }
   });
   it("sends no target for the platform account", () => {
-    expect(buildDeployRequest({ ...base, method: "platform", accountId: "" })).toEqual({});
+    expect(buildDeployRequest({ ...base, method: "platform", accountId: "" })).toEqual({ applyScps: true });
+  });
+  it("sends the SCP choice either way, so an unticked box means skip, not unknown", () => {
+    expect(buildDeployRequest({ ...base, applyScps: true }).applyScps).toBe(true);
+    expect(buildDeployRequest({ ...base, applyScps: false }).applyScps).toBe(false);
   });
   it("names what is wrong", () => {
     expect(() => buildDeployRequest({ ...base, accountId: "123" })).toThrow("12 digits");

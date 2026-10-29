@@ -493,6 +493,9 @@ class FakeOrgSession:
         self.ct_regions: list = []
         self.account_status = "ACTIVE"
         self.extra_ous: list[str] = []
+        self.stack_status = None  # AtxLzBootstrapStack status, or None when the stack does not exist
+        self.sso_instances = 1
+        self.denied: set[str] = set()  # services whose preflight call is AccessDenied
 
     def client(self, name, **kw):
         self.clients.append(name)
@@ -505,6 +508,20 @@ class FakeOrgSession:
             )
         if name == "organizations":
             return _FakeOrganizations(self)
+        if name in ("cloudformation", "sso-admin"):
+            from botocore.exceptions import ClientError
+            if name in self.denied:
+                def deny(*a, **k):
+                    raise ClientError({"Error": {"Code": "AccessDenied", "Message": "denied"}}, "Call")
+                return types.SimpleNamespace(describe_stacks=deny, list_instances=deny)
+
+            def describe_stacks(StackName, **k):
+                if self.stack_status is None:
+                    raise ClientError({"Error": {"Code": "ValidationError", "Message": f"Stack with id {StackName} does not exist"}}, "DescribeStacks")
+                return {"Stacks": [{"StackName": StackName, "StackStatus": self.stack_status}]}
+
+            return types.SimpleNamespace(describe_stacks=describe_stacks,
+                                         list_instances=lambda **k: {"Instances": [{"InstanceArn": "arn"}] * self.sso_instances})
         if name == "controltower":
             self.ct_regions.append(kw.get("region_name"))
             by_arn = {z["arn"]: z for z in self.landing_zones}
@@ -1726,7 +1743,9 @@ class ConnectorTask(_SequencerCaseBase):
         self._env([("EXECUTING", PENDING)], ["PENDING"])
         self.s3.put_json(f"runs/{DESIGN_RUN}/intake/scope.json", {**SCOPE, "regions": {}})
 
-        self._assert_error(self._invoke(), "transform_converse failed", "home Region")
+        # Caught by the pre-flight now, before any Transform job exists (it used to surface at the connector task).
+        self._assert_error(self._invoke(), "run_pre_discover failed", "no Control Tower Region")
+        self.assertEqual(self.fake_ops.started, [])
 
     def test_crash_after_submit_resumes_without_failing_or_resubmitting(self):
         # An earlier invoke marked the item "submitting" (and the submit reached Transform); the task is now closed.
@@ -2400,7 +2419,8 @@ class TypedReplies(_SequencerCaseBase):
 
         self.assertEqual({_tool_name(t) for t in captured["tools"]}, {"report_reply_review"})
         self.assertEqual(captured["system_prompt"], app.REVIEW_SYSTEM)
-        self.assertIn("If you are unsure, answer true", app.REVIEW_SYSTEM)
+        self.assertIn("If you cannot tell whether the next step executes changes, answer true", app.REVIEW_SYSTEM)
+        self.assertIn("design content", app.REVIEW_SYSTEM.lower())
 
 
 class AllowedOptions(_SequencerCaseBase):
@@ -2431,9 +2451,11 @@ class AllowedOptions(_SequencerCaseBase):
         note = result["pendingHumanInput"]["agentNote"]
         self.assertEqual((note["suggestion"], note["suggestionType"]), ("Deploy for me", "approval"))
 
-    def test_every_allowed_option_is_named_in_the_conversation_prompt(self):
-        for label in conv.AGENT_ANSWERABLE_OPTIONS:
-            self.assertIn(label.lower(), app.CONVERSE_SYSTEM.lower(), label)
+    def test_the_prompt_names_the_gates_the_tool_always_refuses(self):
+        for label in ("Proceed", "Deploy for me", "Approve"):
+            self.assertIn(label, app.CONVERSE_SYSTEM)
+            self.assertIn(label.lower(), conv.EXECUTION_GATE_OPTIONS)
+        self.assertIn("independent reviewer", app.CONVERSE_SYSTEM)
 
 
 class SuggestionTypes(_SequencerCaseBase):
@@ -2764,3 +2786,191 @@ class ResumeRelooksAtProgressMessages(_SequencerCaseBase):
         self.assertEqual(self.table.item("AGENTQ#message:msg-final")["epoch"], 1)
         self._invoke()  # a second model turn would fail: _set_converse has only one
         self.assertEqual(self.table.item("AGENTQ#message:msg-final")["status"], "informational")
+
+
+# --------------------------------------------------------------------------------------
+# Options are judged, gates are refused in code
+# --------------------------------------------------------------------------------------
+class OptionJudgment(_SequencerCaseBase):
+    def _env(self, options, **meta):
+        pending = {**MESSAGE, "options": options, "choices": [{"label": o, "value": o} for o in options]}
+        self._make_env(transform_ops=FakeTransformOps(poll_script=[("EXECUTING", pending)]),
+                       meta_extra={"transformAnalyzeJobId": ANALYZE_JOB,
+                                   "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}, **meta})
+        self._seed_foundation()
+        self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
+
+    def _reviewer(self, approves):
+        calls = []
+
+        def review(prompt):
+            calls.append(prompt)
+            conv.report_reply_review(approves, "judged")
+
+        p = mock.patch.object(app, "_review_agent", review)
+        p.start()
+        self.addCleanup(p.stop)
+        return calls
+
+    def test_execution_gates_are_refused_in_code_and_never_reach_the_reviewer(self):
+        self._env(["Proceed", "Deploy for me", "Approve", "Approve proposal"])
+        calls = self._reviewer(False)  # even a reviewer that said "fine" could not let these through
+        self._set_converse(lambda prompt: (*[_answer(option=o, expect="REFUSED: " + repr(o))(prompt)
+                                             for o in ("Proceed", "deploy for me", "APPROVE", "Approve proposal")],
+                                           _escalate("Starts execution.", "Proceed", "approval")(prompt)))
+        self._invoke()
+        self.assertEqual((self.fake_ops.answers, calls), ([], []))
+
+    def test_an_unlisted_option_is_sent_when_the_reviewer_says_it_starts_nothing(self):
+        self._env(["Continue with plus addressing", "Change structure"])
+        calls = self._reviewer(False)
+        self._set_converse(_answer(option="Continue with plus addressing", category="design", basis=("scope:/ous",)))
+        self._invoke()
+        self.assertEqual([a["option"] for a in self.fake_ops.answers], ["Continue with plus addressing"])
+        self.assertIn('Select the option \\"Continue with plus addressing\\".', calls[0])
+        self.assertIn("approved_design", calls[0])  # the reviewer sees the design
+
+    def test_an_unlisted_option_the_reviewer_says_starts_execution_goes_to_a_person(self):
+        self._env(["Continue", "Change structure"])
+        self._reviewer(True)
+        self._set_converse(lambda prompt: (_answer(option="Continue", expect="REFUSED: the independent reviewer")(prompt),
+                                           _escalate("Next step deploys.", "Continue", "approval")(prompt)))
+        result = self._invoke()
+        self.assertEqual(self.fake_ops.answers, [])
+        self.assertEqual(result["pendingHumanInput"]["agentNote"]["suggestionType"], "approval")
+
+    def test_a_broken_reviewer_means_an_unlisted_option_is_not_sent(self):
+        self._env(["Continue", "Change structure"])
+        p = mock.patch.object(app, "_review_agent", lambda prompt: (_ for _ in ()).throw(RuntimeError("Bedrock down")))
+        p.start()
+        self.addCleanup(p.stop)
+        self._set_converse(lambda prompt: (_answer(option="Continue", expect="REFUSED: the independent reply review")(prompt),
+                                           _escalate("Reviewer unavailable.", "Continue", "option")(prompt)))
+        self._invoke()
+        self.assertEqual(self.fake_ops.answers, [])
+
+    def test_listed_options_skip_the_reviewer(self):
+        self._env(["Stage all five on Workloads", "Skip for now"])
+        calls = self._reviewer(True)  # would refuse if asked
+        self._set_converse(_answer(option="Stage all five on Workloads", category="workflow", basis=("context:runPurpose",)))
+        self._invoke()
+        self.assertEqual(([a["option"] for a in self.fake_ops.answers], calls), (["Stage all five on Workloads"], []))
+
+
+class ScpChoice(_SequencerCaseBase):
+    def test_the_run_input_reaches_the_agent_only_when_the_operator_chose(self):
+        self._make_env()
+        self.assertNotIn("applyScps", conv.run_context(meta={}, foundation={}, gaps={}, scope=SCOPE))
+        for value in (True, False):
+            ctx = conv.run_context(meta={"applyScps": value}, foundation={}, gaps={}, scope=SCOPE)
+            self.assertIs(ctx["applyScps"], value)
+        self.assertNotIn("applyScps", conv.run_context(meta={"applyScps": "yes"}, foundation={}, gaps={}, scope=SCOPE))
+
+    def test_the_prompt_tells_the_agent_what_each_choice_means(self):
+        self.assertIn("context:applyScps", app.CONVERSE_SYSTEM)
+        self.assertIn("Stage all five on Workloads", app.CONVERSE_SYSTEM)
+        self.assertIn("when it is not in the context, escalate", app.CONVERSE_SYSTEM)
+
+
+class FirstMessage(_SequencerCaseBase):
+    def test_the_job_starts_with_the_decisions_from_the_run_inputs(self):
+        self._make_env(transform_ops=FakeTransformOps(),
+                       meta_extra={"targetRegion": "us-east-1", "accountEmailBase": "billu.naveen@aivar.tech",
+                                   "mapAgreement": "none", "applyScps": True})
+        prompts = []
+        real = self.fake_ops.start_landing_zone_job
+        self.fake_ops.start_landing_zone_job = lambda **kw: (prompts.append(kw["prompt"]), real(**kw))[1]
+        self._seed_foundation()
+        self._seed_checkpoint("transform_init_done")
+
+        self._invoke()
+
+        (prompt,) = prompts
+        self.assertIn("Decisions already made", prompt)
+        self.assertIn("home Region us-east-1", prompt)  # the run's override, not the design's eu-west-1
+        self.assertIn("plus addressing on billu.naveen@aivar.tech", prompt)
+        self.assertIn("MAP agreement: none.", prompt)
+        self.assertIn("stage the Service Control Policies", prompt)
+        self.assertIn("approved by a person", prompt)
+
+    def test_only_what_is_known_is_stated(self):
+        from lzcore.deploy_transform import decisions_section
+        text = decisions_section({"regions": {"home": "eu-west-1"}}, {"region": "eu-west-1"})
+        for absent in ("Account emails", "MAP agreement", "SCPs and controls"):
+            self.assertNotIn(absent, text)
+        self.assertIn("skip the optional ones", decisions_section({}, {"applyScps": False}))
+        self.assertNotIn("Control Tower: create", decisions_section({}, {}))
+
+    def test_a_design_too_large_for_the_message_still_fails_loudly(self):
+        from lzcore.deploy_transform import DESIGN_BRIEF_LIMIT, scope_summary_from_scope
+        big = {"customer": {"orgName": "x"}, "ous": [{"name": f"OU{i}" * 20} for i in range(400)]}
+        with self.assertRaisesRegex(RuntimeError, str(DESIGN_BRIEF_LIMIT)):
+            scope_summary_from_scope(big, {})
+
+
+class Preflight(_SequencerCaseBase):
+    def _start(self, org, **meta):
+        self._make_env(transform_ops=FakeTransformOps(poll_script=["EXECUTING"]),
+                       meta_extra={"targetRegion": "us-east-1", "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}, **meta},
+                       org_session=org)
+        return self._invoke()
+
+    def test_a_clean_account_passes_and_is_audited(self):
+        org = FakeOrgSession()
+        result = self._start(org)
+        self.assertNotEqual(result.get("status"), "error", result)
+        (row,) = self.table.audit_of("tool.preflight")
+        detail = json.loads(row["detail"])
+        self.assertEqual((detail["blockers"], detail["unverified"]), ([], []))
+        self.assertEqual(set(detail["checked"]), {"controlTower", "bootstrapStack", "identityCenter"})
+
+    def test_a_security_ou_without_a_landing_zone_stops_the_run_before_any_transform_job(self):
+        org = FakeOrgSession()
+        org.extra_ous = ["Security"]
+        result = self._start(org)
+        self._assert_error(result, "pre-flight found a problem", "no Transform job was started", "'Security' OU", "Control Tower landing zone")
+        self.assertEqual(self.fake_ops.started, [])
+        self.assertIsNone(self._checkpoint())
+
+    def test_the_same_ou_with_a_landing_zone_is_fine(self):
+        org = FakeOrgSession()
+        org.extra_ous = ["Security"]
+        org.landing_zones = [{"arn": LZ_ARN, "status": "ACTIVE"}]
+        self.assertNotEqual(self._start(org).get("status"), "error")
+
+    def test_a_failed_bootstrap_stack_and_a_missing_identity_center_are_both_named(self):
+        org = FakeOrgSession()
+        org.stack_status = "ROLLBACK_COMPLETE"
+        org.sso_instances = 0
+        result = self._start(org)
+        self._assert_error(result, "2 problems", "AtxLzBootstrapStack in us-east-1 is ROLLBACK_COMPLETE", "IAM Identity Center is not enabled in us-east-1")
+        self.assertEqual(self.fake_ops.started, [])
+
+    def test_a_healthy_bootstrap_stack_is_not_a_problem(self):
+        org = FakeOrgSession()
+        org.stack_status = "CREATE_COMPLETE"
+        self.assertNotEqual(self._start(org).get("status"), "error")
+
+    def test_a_check_the_account_does_not_allow_is_reported_unverified_never_passed(self):
+        org = FakeOrgSession()
+        org.denied = {"cloudformation", "sso-admin"}
+        result = self._start(org)
+        self.assertNotEqual(result.get("status"), "error", result)
+        detail = json.loads(self.table.audit_of("tool.preflight")[0]["detail"])
+        self.assertEqual(len(detail["unverified"]), 2)
+        self.assertNotIn("bootstrapStack", detail["checked"])
+        self.assertNotIn("identityCenter", detail["checked"])
+
+    def test_an_email_a_live_account_already_uses_is_a_problem(self):
+        from lzcore.preflight import planned_emails, preflight_findings
+        scope = {"accounts": [{"name": "Staging"}, {"name": "Log Archive"}, {"name": "acme-prod"}]}
+        snapshot = {"accounts": [{"name": "acme-prod", "id": "333", "status": "ACTIVE", "email": "x@y.com"},
+                                 {"name": "Old Audit", "id": "444", "status": "SUSPENDED", "email": "Billu.Naveen+log-archive@aivar.tech"}],
+                    "organizationalUnits": [], "controlTower": {"landingZones": [{"arn": "a"}]}}
+        self.assertEqual(planned_emails(scope, snapshot, "billu.naveen@aivar.tech"),
+                         {"Staging": "billu.naveen+staging@aivar.tech", "Log Archive": "billu.naveen+log-archive@aivar.tech"})
+        out = preflight_findings(scope=scope, snapshot=snapshot, session=FakeOrgSession(), region="us-east-1",
+                                 email_base="billu.naveen@aivar.tech")
+        self.assertEqual(len(out["blockers"]), 1)
+        self.assertIn("already used by account 'Old Audit' (444, SUSPENDED)", out["blockers"][0])
+        self.assertEqual(preflight_findings(scope=scope, snapshot=snapshot, session=FakeOrgSession(), region="us-east-1")["blockers"], [])

@@ -66,10 +66,14 @@ RUN_PURPOSE = (
 # nothing in AWS: Transform deploys only after "Proceed" / "Deploy for me" and the deployment approval task.
 # Everything else (Proceed, Continue, Deploy for me, Approve proposal, any new label Transform introduces) is
 # handed to a person: the list fails closed. Widen it only for labels that cannot start a change in AWS.
+# Options that start execution in Transform's guided flow. Refused in code whatever a model says: a person gives these.
+# (Everything not on either list is judged by the independent reviewer, which fails closed.)
+EXECUTION_GATE_OPTIONS = frozenset({"proceed", "deploy for me", "approve", "approve proposal", "approve and deploy"})
 AGENT_ANSWERABLE_OPTIONS = frozenset({
     "landing zone", "custom structure", "my own structure", "get started",
     "create a control tower landing zone (recommended)", "create a control tower landing zone",
     "recommend additional scps", "none (skip)", "skip for now",
+    "stage all five on workloads", "all five", "stage all recommended",
 })
 # Atomic per-run cap on agent answers: the slot is taken before sending and given back if the send fails.
 SLOT_CONDITION = "#s = :running AND (attribute_not_exists(agentAnswerCount) OR agentAnswerCount < :max)"
@@ -168,8 +172,10 @@ def run_context(*, meta: dict, foundation: dict, gaps: dict, scope: Optional[dic
     org = foundation.get("organization") or {}
     email = {"accountEmailBase": meta["accountEmailBase"]} if meta.get("accountEmailBase") else {}
     map_agreement = {"mapAgreement": meta["mapAgreement"]} if meta.get("mapAgreement") else {}
+    scps = {"applyScps": meta["applyScps"]} if isinstance(meta.get("applyScps"), bool) else {}
     return {
         **email,  # present only when the operator supplied it: "prefix@domain", Transform adds "+account-name"
+        **scps,  # present only when the operator chose: true = stage Transform's recommended SCPs, false = skip them
         **map_agreement,  # present only when supplied: "none" (no MAP agreement) or the full MAP tag value
         "runPurpose": RUN_PURPOSE,
         "deployTargetAccountId": target.get("accountId") or org.get("callerAccountId"),
@@ -314,11 +320,10 @@ def answer_transform_question(category: str, rationale: str, basis: list[str], o
             return refusal
         opt, txt = None, text.strip()
     else:
-        if option.strip().lower() not in AGENT_ANSWERABLE_OPTIONS:
-            return (f"REFUSED: {option!r} is not an option the agent may select (allowed: "
-                    f"{sorted(AGENT_ANSWERABLE_OPTIONS)}). Call escalate_to_human with the option you would choose "
-                    "in suggestion (suggestion_type 'option', or 'approval' if it starts or approves something).")
         wanted = option.strip().lower()
+        if wanted in EXECUTION_GATE_OPTIONS:
+            return (f"REFUSED: {option!r} starts execution, which only a person gives. Call escalate_to_human with it as "
+                    "the suggestion (suggestion_type 'approval').")
         offered = [c for c in pending.get("choices") or [] if str(c.get("label", "")).strip().lower() == wanted]
         if len(offered) != 1:
             return (f"REFUSED: Transform offers {len(offered)} options named {option!r}. Call escalate_to_human.")
@@ -328,6 +333,11 @@ def answer_transform_question(category: str, rationale: str, basis: list[str], o
             return (f"REFUSED: the option {offered[0]['label']!r} would send {offered[0].get('value')!r} to "
                     "Transform, which is not the same as its label. Call escalate_to_human.")
         opt, txt = offered[0]["label"], None  # the exact label as offered
+        if wanted not in AGENT_ANSWERABLE_OPTIONS:
+            # Not a known-safe label: the independent reviewer decides whether this choice starts execution.
+            refusal = review_reply(pending, f'Select the option "{opt}".')
+            if refusal:
+                return refusal
     qkey = _turn["qkey"]
     if not _reserve_answer_slot():
         return (f"REFUSED: the agent has used its {MAX_AGENT_ANSWERS_PER_RUN} answers for this run, or the run is "
@@ -557,6 +567,7 @@ def review_reply(pending: dict, text: str) -> Optional[str]:
         "Review the proposed reply to the pending AWS Transform message. Call report_reply_review once.",
         f"<pending_question>\n{_json_for_prompt({k: pending.get(k) for k in ('title', 'text', 'options')}, indent=1)}\n</pending_question>",
         f"<recent_transform_conversation>\n{_json_for_prompt(_turn.get('conversation') or [], indent=1)}\n</recent_transform_conversation>",
+        f"<approved_design>\n{_json_for_prompt(_turn.get('scope') or {})}\n</approved_design>",
         f"<proposed_reply>\n{_json_for_prompt(text)}\n</proposed_reply>",
     ])
     _review_state.update(open=True, verdict=None)

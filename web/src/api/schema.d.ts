@@ -105,7 +105,6 @@ export interface paths {
          *     Only the task in `pendingHumanInput` with category TOOL_APPROVAL can be decided. The deploy agent has no
          *     path to this route.
          */
-        
         post: operations["decideTask"];
         delete?: never;
         options?: never;
@@ -331,6 +330,7 @@ export interface components {
             targetRegion?: string;
             accountEmailBase?: string;
             mapAgreement?: string;
+            applyScps?: boolean;
             /** @description FAILED deploy runs only: the run has a checkpoint and can be resumed. */
             resumable?: boolean;
             resumeCount?: number;
@@ -376,6 +376,8 @@ export interface components {
             targetRegion?: string;
             /** @description prefix@domain for the new accounts; Transform adds +account-name. No "+". */
             accountEmail?: string;
+            /** @description true: stage the Service Control Policies and controls AWS Transform recommends for the Workloads OUs (the agent selects them). false: skip them. Absent: the question goes to a person. */
+            applyScps?: boolean;
             /** @description none, or the full AWS MAP tag with its prefix (for example mig12345). The agent answers Transform's MAP question from it. */
             mapAgreement?: string;
         };

@@ -277,6 +277,8 @@ dialog.deploy .hint { font-size:12px; color:var(--faint); font-weight:400; line-
       <label>Session token (optional)<input name="sessionToken" autocomplete="off" /></label>
     </div>
     <label data-deploy-only>Account email (optional)<span class="hint">prefix@domain for the new accounts, without a +. Transform adds +account-name. The agent answers its email question from this.</span><input name="accountEmail" type="email" autocomplete="off" placeholder="aws-admin@example.com" /></label>
+    <label data-deploy-only class="check" style="display:flex;align-items:center;gap:8px;font-weight:600"><input name="applyScps" type="checkbox" checked style="width:auto" /> Apply SCPs</label>
+    <span class="hint" data-deploy-only>Ticked: the agent stages the Service Control Policies and controls AWS Transform recommends for the Workloads OUs. Unticked: it skips them.</span>
     <label data-deploy-only>MAP agreement (optional)<span class="hint">Type none, or the full MAP tag such as mig12345. The agent answers Transform's MAP question from this.</span><input name="mapAgreement" autocomplete="off" placeholder="none" /></label>
     <div id="deployVerifyBox" class="deploy-verify" hidden role="status" aria-live="polite"></div>
     <div class="actions">

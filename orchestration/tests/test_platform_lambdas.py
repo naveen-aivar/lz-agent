@@ -286,6 +286,19 @@ class ApiRunsTests(_Base):
         code, res = self.deploy_keys()
         self.assertNotIn("mapAgreement", self.table.meta(res["runId"]))
 
+    def test_apply_scps_is_a_boolean_stored_when_given(self):
+        target = {"accountId": ACCOUNT, "accessKeyId": "AKIAEXAMPLE", "secretAccessKey": "secret"}
+        for value in (True, False):
+            code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "applyScps": value}, run_id=DESIGN_ID)
+            self.assertEqual(code, 202, value)
+            self.assertIs(self.table.meta(res["runId"])["applyScps"], value)
+        for bad in ("true", 1, 0, "yes", [], {}):
+            code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "applyScps": bad}, run_id=DESIGN_ID)
+            self.assertEqual(code, 400, bad)
+            self.assertIn("applyScps", res["error"])
+        code, res = self.deploy_keys()
+        self.assertNotIn("applyScps", self.table.meta(res["runId"]))  # not chosen: the question goes to a person
+
     def test_account_email_is_validated_and_stored_on_the_run(self):
         target = {"accountId": ACCOUNT, "accessKeyId": "AKIAEXAMPLE", "secretAccessKey": "secret"}
         code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "accountEmail": "billu.naveen@aivar.tech"},

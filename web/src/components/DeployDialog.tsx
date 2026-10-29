@@ -9,8 +9,9 @@ const EMAIL = /^[A-Za-z0-9._-]{1,64}@([A-Za-z0-9-]+\.)+[A-Za-z]{2,63}$/;
 export function buildDeployRequest(f: {
   method: Method; accountId: string; roleArn: string; externalId: string; accessKeyId: string;
   secretAccessKey: string; sessionToken: string; accountEmail: string; mapAgreement: string; targetRegion: string;
+  applyScps: boolean;
 }): DeployRequest {
-  const body: DeployRequest = {};
+  const body: DeployRequest = { applyScps: f.applyScps };
   if (f.method !== "platform") {
     if (!/^\d{12}$/.test(f.accountId.trim())) throw new Error("Target account ID must be 12 digits");
     if (f.method === "role") {
@@ -44,7 +45,7 @@ export function DeployDialog({ designRunId, api, onStarted, onCancel }: {
   onCancel: () => void;
 }) {
   const [f, setF] = useState({ method: "role" as Method, accountId: "", roleArn: "", externalId: "", accessKeyId: "",
-    secretAccessKey: "", sessionToken: "", accountEmail: "", mapAgreement: "", targetRegion: "" });
+    secretAccessKey: "", sessionToken: "", accountEmail: "", mapAgreement: "", targetRegion: "", applyScps: true });
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const set = (k: keyof typeof f) => (e: { target: { value: string } }) => setF({ ...f, [k]: e.target.value });
@@ -93,6 +94,11 @@ export function DeployDialog({ designRunId, api, onStarted, onCancel }: {
         <span className="hint">prefix@domain for the new accounts, without a +. Transform adds +account-name.</span>
         <input type="email" value={f.accountEmail} onChange={set("accountEmail")} />
       </label>
+      <label className="check">
+        <input type="checkbox" checked={f.applyScps} onChange={(e) => setF({ ...f, applyScps: e.target.checked })} />
+        Apply SCPs
+      </label>
+      <span className="hint">Ticked: the agent stages the Service Control Policies and controls AWS Transform recommends for the Workloads OUs. Unticked: it skips them.</span>
       <label>MAP agreement (optional)
         <span className="hint">none, or the full MAP tag such as mig12345. The agent answers Transform's MAP question from it.</span>
         <input value={f.mapAgreement} onChange={set("mapAgreement")} placeholder="none" />

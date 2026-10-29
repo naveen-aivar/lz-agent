@@ -149,6 +149,7 @@ components:
         targetRegion: {type: string}
         accountEmailBase: {type: string}
         mapAgreement: {type: string}
+        applyScps: {type: boolean}
         resumable: {type: boolean, description: "FAILED deploy runs only: the run has a checkpoint and can be resumed."}
         resumeCount: {type: integer}
         deployTarget: {type: object, additionalProperties: true}
@@ -190,6 +191,9 @@ components:
           type: string
           description: prefix@domain for the new accounts; Transform adds +account-name. No "+".
           pattern: "^[A-Za-z0-9._-]{1,64}@([A-Za-z0-9-]+\\.)+[A-Za-z]{2,63}$"
+        applyScps:
+          type: boolean
+          description: 'true: stage the Service Control Policies and controls AWS Transform recommends for the Workloads OUs (the agent selects them). false: skip them. Absent: the question goes to a person.'
         mapAgreement:
           type: string
           description: 'none, or the full AWS MAP tag with its prefix (for example mig12345). The agent answers Transform''s MAP question from it.'

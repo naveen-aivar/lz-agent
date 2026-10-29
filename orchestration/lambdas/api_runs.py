@@ -236,6 +236,10 @@ def _deploy(design_run_id, sub, event, invoked_by):
         return _resp(400, {"error": "accountEmail must look like prefix@domain, without a '+' (Transform adds "
                                     "'+account-name' for each new account)"})
 
+    apply_scps = body.get("applyScps")
+    if apply_scps is not None and not isinstance(apply_scps, bool):
+        return _resp(400, {"error": "applyScps must be true or false"})
+
     map_agreement = body.get("mapAgreement")
     if map_agreement is not None and (not isinstance(map_agreement, str) or not _MAP_AGREEMENT.fullmatch(map_agreement)):
         return _resp(400, {"error": "mapAgreement must be 'none' or the full MAP tag with its prefix "
@@ -270,6 +274,8 @@ def _deploy(design_run_id, sub, event, invoked_by):
         item["accountEmailBase"] = account_email
     if map_agreement:
         item["mapAgreement"] = map_agreement
+    if apply_scps is not None:
+        item["applyScps"] = apply_scps
     if invoked_by:
         item["invokedBy"] = invoked_by
     try:

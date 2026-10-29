@@ -25,6 +25,7 @@ from strands import tool
 from lzcore import transform_ops
 from lzcore.deploy_render import render_deploy_iac
 from lzcore.deploy_workflow import verify_landing_zone
+from lzcore.preflight import preflight_findings
 from lzcore.deploy_transform import (
     init_transform,
     merge_transform_into_foundation,
@@ -204,10 +205,29 @@ def _stop_orphaned_job(step: str, label: str, job_id: str, workspace_id: str, ca
 # Mechanical step implementations (_execute_*). Shared by the @tool wrappers and the
 # sequencer, so artifacts, checkpoint stages, and audit events are identical either way.
 # ------------------------------------------------------------------------------------
+def _preflight(scope: dict, snapshot: dict, session) -> None:
+    """Refuse the run, before any Transform job exists, when the target account holds leftovers that make Control
+    Tower's setup fail. Checks the account could not run are audited, never counted as passed."""
+    meta = _run_meta()
+    region = conv.effective_region(meta, scope)
+    if not region:
+        raise RuntimeError("pre-flight: no Control Tower Region (run targetRegion or the design's home Region)")
+    result = preflight_findings(scope=scope, snapshot=snapshot, session=session, region=region,
+                                email_base=meta.get("accountEmailBase"))
+    base.log_tool_event("tool.preflight", {"region": region, **result})
+    if result["blockers"]:
+        raise RuntimeError(
+            "pre-flight found " + ("a problem" if len(result["blockers"]) == 1 else f"{len(result['blockers'])} problems")
+            + " in the target account, so no Transform job was started: " + " | ".join(result["blockers"])
+        )
+
+
 def _execute_pre_discover() -> dict:
     """Organizations snapshot + gap analysis + heuristic classification hint (pre-deploy)."""
     scope = _design_scope()
-    snapshot, gaps = collect_snapshot_and_gaps(scope, base.deploy_boto_session())
+    session = base.deploy_boto_session()
+    snapshot, gaps = collect_snapshot_and_gaps(scope, session)
+    _preflight(scope, snapshot, session)
     paths = deployment_paths(base._state["run"], "pre")
     base_deployment = f"runs/{base._state['run']}/deployment"
     for key, payload in (
@@ -274,6 +294,18 @@ def _execute_transform_init() -> dict:
     return out
 
 
+def _run_decisions(scope: dict) -> dict:
+    """The operator's run inputs that pre-answer Transform's questions (see lzcore.deploy_transform.decisions_section)."""
+    meta = _run_meta()
+    out = {"region": conv.effective_region(meta, scope)}
+    for key in ("accountEmailBase", "mapAgreement"):
+        if meta.get(key):
+            out[key] = meta[key]
+    if isinstance(meta.get("applyScps"), bool):
+        out["applyScps"] = meta["applyScps"]
+    return out
+
+
 def _execute_transform_start_analyze() -> dict:
     step = "transform_start_analyze"
     _require_run_running(step)
@@ -295,6 +327,7 @@ def _execute_transform_start_analyze() -> dict:
             scope=scope,
             put_json=_put_json,
             persist_job=persist,
+            decisions=_run_decisions(scope),
         )
         _save_checkpoint("transform_analyze_started", jobId=out["jobId"])
         base.log_tool_event(f"tool.{step}", {"jobId": out["jobId"]})

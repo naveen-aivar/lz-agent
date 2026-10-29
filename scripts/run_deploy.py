@@ -138,6 +138,9 @@ def main() -> None:
                     "adds '+account-name'. The agent answers Transform's email question from it.")
     ap.add_argument("--map-agreement", help="'none' or the full MAP tag (for example mig12345). The agent answers "
                     "Transform's MAP question from it.")
+    ap.add_argument("--apply-scps", action=argparse.BooleanOptionalAction, default=None,
+                    help="stage the SCPs and controls Transform recommends (--apply-scps) or skip them (--no-apply-scps). "
+                    "Without either, the question goes to a person.")
     ap.add_argument("--no-follow", action="store_true", help="start the run and exit")
     args = ap.parse_args()
     if bool(args.design_run) == bool(args.resume):
@@ -202,6 +205,8 @@ def main() -> None:
         start_body["accountEmail"] = args.account_email
     if args.map_agreement:
         start_body["mapAgreement"] = args.map_agreement
+    if args.apply_scps is not None:
+        start_body["applyScps"] = args.apply_scps
     code, res = _invoke_api(lam, fn, "POST /runs/{runId}/deploy", sub, invoked_by, start_body,
                             run_id=args.design_run)
     if code not in (200, 201, 202):

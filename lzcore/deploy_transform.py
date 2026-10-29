@@ -39,7 +39,30 @@ def _names(items, fmt) -> str:
     return "; ".join(fmt(i) for i in items if isinstance(i, dict)) or "none"
 
 
-def scope_summary_from_scope(scope: dict) -> str:
+def decisions_section(scope: dict, decisions: dict) -> str:
+    """The answers to the questions Transform's guided flow asks, from the approved design and the operator's run
+    inputs, written as instructions so Transform can skip asking them. Only what is known is stated; nothing is
+    invented. It pre-answers nothing that creates or changes AWS resources: those stay explicit approvals."""
+    home = decisions.get("region") or (scope.get("regions") or {}).get("home")
+    lines = ["Decisions already made (please use them and do not ask again):",
+             "- Workflow: Landing Zone only.",
+             "- Structure: use the structure above exactly (\"My own structure\"); do not propose other OUs or accounts. "
+             "OUs or accounts that already exist stay where they are."]
+    if home:
+        lines.append(f"- Control Tower: create a Control Tower landing zone, home Region {home}.")
+    if decisions.get("accountEmailBase"):
+        lines.append(f"- Account emails: plus addressing on {decisions['accountEmailBase']} (prefix+account-name@domain).")
+    if decisions.get("mapAgreement"):
+        lines.append("- MAP agreement: " + ("none." if decisions["mapAgreement"] == "none" else f"{decisions['mapAgreement']}."))
+    if decisions.get("applyScps") is True:
+        lines.append("- SCPs and controls: stage the Service Control Policies and controls you recommend for the Workloads OUs.")
+    elif decisions.get("applyScps") is False:
+        lines.append("- SCPs and controls: skip the optional ones.")
+    lines.append("Execution, the connector and the final deployment are approved by a person when you ask.")
+    return "\n".join(lines)
+
+
+def scope_summary_from_scope(scope: dict, decisions: dict | None = None) -> str:
     """Opening message of the Transform job: the approved design itself, not just its counts.
 
     Transform plans the landing zone from this message, and the deploy agent answers Transform's
@@ -71,6 +94,7 @@ def scope_summary_from_scope(scope: dict) -> str:
         "A deploy agent answers your questions from this design. Any step that creates, changes or deletes "
         "resources or accounts is approved by a person."
     )
+    brief = brief + "\n" + decisions_section(scope, decisions or {})
     if len(brief) > DESIGN_BRIEF_LIMIT:
         raise RuntimeError(
             f"design brief for the Transform job is {len(brief)} characters (limit {DESIGN_BRIEF_LIMIT}); "
@@ -102,8 +126,9 @@ def start_analyze_job(
     scope: dict,
     put_json: Callable[[str, dict], None],
     persist_job: Callable[[str, str], None],
+    decisions: dict | None = None,
 ) -> dict[str, Any]:
-    prompt = scope_summary_from_scope(scope)
+    prompt = scope_summary_from_scope(scope, decisions)
     try:
         result = transform_ops.start_landing_zone_job(run_id=run_id, phase="analyze", prompt=prompt)
     except Exception as exc:
