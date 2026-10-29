@@ -2729,3 +2729,38 @@ class VerifyLandingZone(unittest.TestCase):
         from lzcore.deploy_workflow import verify_landing_zone
         with self.assertRaises(ValueError):
             verify_landing_zone(self.SCOPE, self.org(), "")
+
+
+class ResumeRelooksAtProgressMessages(_SequencerCaseBase):
+    def test_a_summary_judged_progress_only_before_a_resume_is_decided_again_once(self):
+        org = FakeOrgSession()
+        org.landing_zones = [{"arn": LZ_ARN, "status": "ACTIVE"}]
+        self._make_env(transform_ops=FakeTransformOps(poll_script=[("EXECUTING", FINAL)] * 4),
+                       meta_extra={"transformAnalyzeJobId": ANALYZE_JOB, "targetRegion": "us-east-1",
+                                   "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}}, org_session=org)
+        self._seed_foundation()
+        self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
+        # The older release could only call the final summary progress.
+        self.table.items[(f"RUN#{DEPLOY_RUN}", "AGENTQ#message:msg-final")] = {
+            "PK": f"RUN#{DEPLOY_RUN}", "SK": "AGENTQ#message:msg-final", "status": "informational", "informational": True,
+            "reason": "A final deployment summary."}
+        self._invoke()  # same epoch: no model turn (_converse_not_scripted would fail the test)
+        self.assertEqual(self.table.item("AGENTQ#message:msg-final")["status"], "informational")
+
+        self.table.meta["resumeCount"] = 1
+        self._set_converse(_report_complete())
+        self._invoke()
+
+        self.assertEqual(self._stage(), "transform_build_verified")
+        self.assertIn("transform.informational_reopened", self.table.actions())
+
+    def test_progress_judged_in_this_epoch_is_not_asked_again(self):
+        self._make_env(transform_ops=FakeTransformOps(poll_script=[("EXECUTING", FINAL)] * 3),
+                       meta_extra={"transformAnalyzeJobId": ANALYZE_JOB, "resumeCount": 1})
+        self._seed_foundation()
+        self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
+        self._set_converse(_no_reply())
+        self._invoke()
+        self.assertEqual(self.table.item("AGENTQ#message:msg-final")["epoch"], 1)
+        self._invoke()  # a second model turn would fail: _set_converse has only one
+        self.assertEqual(self.table.item("AGENTQ#message:msg-final")["status"], "informational")

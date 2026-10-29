@@ -889,6 +889,14 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
         status = "deciding"
     if status == "build_complete":
         return _verify_build(cp, pending, qkey, item)
+    if status == "informational" and int(item.get("epoch") or 0) != int(_run_meta().get("resumeCount") or 0):
+        # Judged progress-only before the run was resumed: look at it once more (for example a final summary that a
+        # release without report_build_complete could only call progress).
+        base.log_tool_event("transform.informational_reopened", {"question": qkey, "jobId": pending.get("jobId"),
+                                                                  "why": "run resumed"})
+        item = conv.put_question(qkey, status="deciding", turns=0, kind=pending["kind"], title=pending.get("title"),
+                                 lastError=None)
+        status = "deciding"
     if status == "informational":
         return _clear_pending(cp, pending, item)
     if status == "escalated":
@@ -948,6 +956,9 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
         if decided == "escalated":
             return _escalated(cp, pending, item)
         if decided == "informational":
+            # Remember which resume epoch judged it, so a later resume looks at it again.
+            item = conv.put_question(qkey, **{**{k: v for k, v in item.items() if k not in ("PK", "SK", "updatedAt")},
+                                              "epoch": epoch})
             return _clear_pending(cp, pending, item)
         if decided == "build_complete":
             return _verify_build(cp, pending, qkey, item)
