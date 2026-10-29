@@ -18,7 +18,7 @@ export function detailOf(a: AuditItem): Record<string, unknown> {
 
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 
-/** One line for an event, as the classic UI words it. */
+/** One line for an event, as the UI words it. */
 export function feedText(a: AuditItem, userSub: string): string {
   const d = detailOf(a);
   if (a.action === "transform.answer_sent") {

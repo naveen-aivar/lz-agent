@@ -71,7 +71,7 @@ export function DeployDialog({ designRunId, api, onStarted, onCancel }: {
   }
 
   return (
-    <div className="dialog" role="dialog" aria-label="Deploy target account">
+    <div className="modal"><div className="dialog" role="dialog" aria-modal="true" aria-label="Deploy target account">
       <h2>Deploy target</h2>
       <label>Auth method
         <select value={f.method} onChange={set("method")}>
@@ -110,6 +110,6 @@ export function DeployDialog({ designRunId, api, onStarted, onCancel }: {
         {f.method !== "platform" && <button type="button" className="btn" onClick={() => run("verify")} disabled={busy}>Test connection</button>}
         <button type="button" className="btn btn-primary" onClick={() => run("start")} disabled={busy}>Start deploy run</button>
       </div>
-    </div>
+    </div></div>
   );
 }

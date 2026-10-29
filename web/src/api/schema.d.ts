@@ -244,6 +244,8 @@ export interface components {
             /** @enum {string|null} */
             runKind?: "deploy" | null;
             designRunId?: string | null;
+            /** @description A deploy run is waiting for a person to answer or approve something in AWS Transform. */
+            awaitingHitl?: boolean | null;
             error: string;
         };
         Choice: {
@@ -450,10 +452,26 @@ export interface components {
         PendingDecisionData: {
             pendingDecision: components["schemas"]["PendingDecision"];
         };
+        /** @description A download link and the JSON content for JSON artifacts. With `?summary=1` on `report` only `report` and `sha256` come back (no link; the page uses it to show the report). */
         ArtifactData: {
-            url: string;
+            url?: string;
             sha256: string;
-            filename: string;
+            filename?: string;
+            report?: {
+                [key: string]: unknown;
+            };
+            deploymentReport?: {
+                [key: string]: unknown;
+            };
+            iacChangePlan?: {
+                [key: string]: unknown;
+            };
+            iacManifest?: {
+                [key: string]: unknown;
+            };
+            foundationAssessment?: {
+                [key: string]: unknown;
+            };
         } & {
             [key: string]: unknown;
         };
@@ -858,7 +876,10 @@ export interface operations {
     };
     getArtifact: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description For `report` only: return the content without a download link. */
+                summary?: string;
+            };
             header?: never;
             path: {
                 runId: components["parameters"]["runId"];

@@ -12,6 +12,8 @@ export type DeployRequest = Schemas["DeployRequest"];
 export type AnswerRequest = Schemas["AnswerRequest"];
 export type VerifyData = Schemas["VerifyData"];
 export type ResumeRequest = Schemas["ResumeRequest"];
+export type ArtifactData = Schemas["ArtifactData"];
+export type ArtifactName = "terraform" | "cloudformation" | "report" | "reports" | "deployment-report" | "iac-change-plan" | "iac-manifest" | "foundation-assessment";
 
 /** An error envelope from the API: {error: {code, message, details?}}. */
 export class ApiError extends Error {
@@ -72,6 +74,10 @@ export function createClient({ apiUrl, getToken, onExpired, fetchImpl = fetch }:
   const enc = encodeURIComponent;
   return {
     listRuns: () => request<Schemas["RunsData"]>("GET", "/runs"),
+    createRun: (body: Schemas["CreateRunRequest"]) => request<Schemas["CreateRunData"]>("POST", "/runs", body),
+    startRun: (runId: string) => request<Schemas["RunIdData"]>("POST", `/runs/${enc(runId)}/start`),
+    getArtifact: (runId: string, name: ArtifactName) => request<ArtifactData>("GET", `/runs/${enc(runId)}/artifacts/${name}`),
+    getReportSummary: (runId: string) => request<ArtifactData>("GET", `/runs/${enc(runId)}/artifacts/report?summary=1`),
     getRun: (runId: string) => request<Schemas["RunData"]>("GET", `/runs/${enc(runId)}`),
     getAudit: (runId: string) => request<Schemas["AuditData"]>("GET", `/runs/${enc(runId)}/audit`),
     getScope: (runId: string) => request<Schemas["ScopeData"]>("GET", `/runs/${enc(runId)}/scope`),

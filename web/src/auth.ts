@@ -16,7 +16,7 @@ const b64url = (buf: ArrayBuffer | Uint8Array): string =>
   btoa(String.fromCharCode(...new Uint8Array(buf as ArrayBuffer))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
 /** The page Cognito sends the browser back to; listed in the user pool client's callback URLs. */
-export const redirectUri = (): string => `${location.origin}/v2/index.html`;
+export const redirectUri = (): string => `${location.origin}/`;
 
 export function decodeJwt(token: string): Claims {
   const payload = token.split(".")[1];

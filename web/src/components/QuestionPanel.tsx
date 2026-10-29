@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Markdown } from "../ui/Markdown";
 import type { Client, PendingHumanInput, Run } from "../api/client";
 import {
   ANSWER_LIMIT, answeredPending, canDecideHere, consoleLink, decidedPending, isUpdateOnly, optionIndex,
@@ -77,7 +78,7 @@ export function QuestionPanel({ run, pending, canAnswer, userSub, api, onChanged
     <section className="hitl" aria-labelledby="hitl-heading">
       <h2 id="hitl-heading">{heading}</h2>
       {pending.kind === "task" && <p><strong>{pending.title}</strong></p>}
-      {pending.text && <div className="hitl-text" data-testid="question-text">{pending.text}</div>}
+      {pending.text && <div className="hitl-text" data-testid="question-text"><Markdown text={pending.text} /></div>}
 
       {note && !answered && !decided && (
         <div className="agent-note" role="note">

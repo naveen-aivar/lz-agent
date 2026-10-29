@@ -80,7 +80,7 @@ See `docs/AWS-REVIEW.md` for how the design was checked against the AWS document
 | `orchestration/` | Step Functions definition, Lambdas, tests |
 | `buildspecs/` | CodeBuild validation (`validate.yml`, `validate.sh`, `report.py` builds the scan report and bundles) |
 | `infra/platform/platform.yaml` | the platform: Cognito, CloudFront+S3 (OAC), API Gateway, Lambdas, Step Functions, AgentCore runtime, CodeBuild, DynamoDB, KMS |
-| `ui/` | static SPA |
+| `web/` | the React UI (the only UI) |
 | `scripts/deploy.sh` | packages and deploys the platform (creates real resources) |
 | `testing/main.py` | local Transform MCP + Strands smoke test (not deployed) |
 
@@ -123,14 +123,14 @@ python -m unittest discover -s orchestration/tests -v
 
 ## React UI (`web/`)
 
-A Vite + React + TypeScript app served by CloudFront at `/v2/index.html`, next to the classic UI at `/`. It covers the runs list, the run page (question and approval panel, activity, design, details), and the deploy dialog. Creating a design run from a SOW is still in the classic UI.
+A Vite + React + TypeScript app served from the site root. It covers the dashboard (with runs that need a person), run history with filters and search, new design runs from a SOW, the design run page (organization diagram, scope, custom SCPs, security and validation, downloads), the deploy run page (question and approval panel, progress, deployment report, resume, stop), and the deploy dialog. It has light and dark themes.
 
 ```
 cd web
 npm ci
 npm run gen:api   # regenerate src/api/schema.d.ts from docs/openapi.yaml
 npm run typecheck && npm test
-npm run build     # scripts/deploy.sh does this and syncs web/dist to s3://<UiBucket>/v2
+npm run build     # scripts/deploy.sh does this and syncs web/dist to the root of s3://<UiBucket>
 ```
 
-The API contract is `docs/openapi.yaml`: every response is `{data}` or `{error: {code, message, details?}}`, and a test checks the file lists exactly the routes in `infra/platform/platform.yaml`. The React app needs CloudFront (the Cognito callback `https://<distribution>/v2/index.html`).
+The API contract is `docs/openapi.yaml`: every response is `{data}` or `{error: {code, message, details?}}`, and a test checks the file lists exactly the routes in `infra/platform/platform.yaml`. The Cognito callback is `https://<distribution>/` (or the API endpoint when CloudFront is off). `/v2/index.html` redirects to the root.

@@ -1,13 +1,22 @@
+import React from "react";
 import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Client } from "../api/client";
 import { message, run } from "../test/fixtures";
-import { RunPage } from "./RunPage";
+import { ToastProvider } from "../ui/Toasts";
+import { RunPage as Page } from "./RunPage";
+const RunPage = (p: React.ComponentProps<typeof Page>) => <ToastProvider><Page {...p} /></ToastProvider>;
 
+export const SCOPE = {
+  customer: { orgName: "Acme" }, regions: { home: "us-east-1", governed: ["us-east-1"], extraAllowed: [], denied: [], enforceDeny: false },
+  logging: { retentionDays: 365, accessLogRetentionDays: 90 }, ous: [{ name: "Security", basis: "explicit" }], accounts: [{ name: "Audit", kind: "audit", ou: "Security" }],
+  scps: [], controls: [], customScps: [], unsupported: [], assumptions: [], openQuestions: ["Which email?"], missingRequired: ["root email for Audit"],
+  summary: { ous: 1, accounts: 1, controls: 0, controlAttachments: 0, scps: 0 },
+};
 const fake = (r: ReturnType<typeof run>) => ({
   getRun: vi.fn().mockResolvedValue({ run: r }),
   getAudit: vi.fn().mockResolvedValue({ audit: [{ SK: "AUDIT#001793248712#abc", ts: 1793248712, action: "transform.answer_sent", actor: "agent", detail: JSON.stringify({ option: "Landing Zone" }) }] }),
-  getScope: vi.fn().mockResolvedValue({ scope: { regions: { home: "us-east-1" }, ous: [{ name: "Security" }], accounts: [{ name: "Audit" }] }, sha: "s", orgDiagram: "graph TD" }),
+  getScope: vi.fn().mockResolvedValue({ scope: SCOPE, sha: "s", orgDiagram: "graph TD" }),
   stopRun: vi.fn().mockResolvedValue({ runId: "r", status: "FAILED" }),
   answerQuestion: vi.fn(), decideTask: vi.fn(),
 }) as unknown as Client & { getRun: ReturnType<typeof vi.fn>; stopRun: ReturnType<typeof vi.fn> };

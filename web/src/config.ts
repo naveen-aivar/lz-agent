@@ -4,7 +4,7 @@ export interface Config {
   cognitoDomain: string;
 }
 
-/** The classic UI's config.json, written by scripts/deploy.sh at the site root. */
+/** config.json, written by scripts/deploy.sh at the site root. */
 export async function loadConfig(fetchImpl: typeof fetch = fetch): Promise<Config> {
   const r = await fetchImpl("/config.json", { cache: "no-store" });
   if (!r.ok) throw new Error(`config.json could not be loaded (HTTP ${r.status})`);

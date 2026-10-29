@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ago, isDone, pretty, stateOf } from "./format";
 
 describe("format", () => {
-  it("words the known states like the classic UI", () => {
+  it("words the known states as the UI words them", () => {
     expect(["DELIVERED", "RUNNING", "AWAITING_INPUT", "FAILED"].map((s) => stateOf(s))).toEqual([
       ["green", "Ready to download"], ["amber", "In progress"], ["blue", "Starting"], ["red", "Failed"]]);
   });

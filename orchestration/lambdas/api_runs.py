@@ -133,7 +133,7 @@ def _list(sub):
             break
         kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
     runs.sort(key=lambda r: r["createdAt"], reverse=True)
-    keep = ("runId", "customerId", "status", "createdAt", "runKind", "designRunId")
+    keep = ("runId", "customerId", "status", "createdAt", "runKind", "designRunId", "awaitingHitl")
     shown = runs[:MAX_LISTED_RUNS]
     return _resp(200, {"runs": [{**{k: r.get(k) for k in keep}, "error": str(r.get("error", ""))[:200]} for r in shown],
                        "total": len(runs)})

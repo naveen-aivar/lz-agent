@@ -784,16 +784,16 @@ Resources:
       AllowedOAuthFlows: [code]
       AllowedOAuthScopes: [openid, email]
       SupportedIdentityProviders: [COGNITO]
-      # The React UI (web/) is served by CloudFront at /v2/index.html next to the classic UI at /.
+      # The React UI (web/) is served at the site root.
       CallbackURLs:
         !If
           - UseCloudFront
-          - [!Sub "https://${Distribution.DomainName}/", !Sub "https://${Distribution.DomainName}/v2/index.html"]
+          - [!Sub "https://${Distribution.DomainName}/"]
           - [!Sub "${Api.ApiEndpoint}/"]
       LogoutURLs:
         !If
           - UseCloudFront
-          - [!Sub "https://${Distribution.DomainName}/", !Sub "https://${Distribution.DomainName}/v2/index.html"]
+          - [!Sub "https://${Distribution.DomainName}/"]
           - [!Sub "${Api.ApiEndpoint}/"]
       AccessTokenValidity: 60
       IdTokenValidity: 60
@@ -868,10 +868,10 @@ Resources:
     Condition: UseS3WebsiteUi
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref Api, RouteKey: "GET /index.html", AuthorizationType: NONE, Target: !Sub "integrations/${UiIntegration}"}
-  RouteUiAppJs:
+  RouteUiAssets:
     Condition: UseS3WebsiteUi
     Type: AWS::ApiGatewayV2::Route
-    Properties: {ApiId: !Ref Api, RouteKey: "GET /app.js", AuthorizationType: NONE, Target: !Sub "integrations/${UiIntegration}"}
+    Properties: {ApiId: !Ref Api, RouteKey: "GET /assets/{file}", AuthorizationType: NONE, Target: !Sub "integrations/${UiIntegration}"}
   RouteUiConfig:
     Condition: UseS3WebsiteUi
     Type: AWS::ApiGatewayV2::Route

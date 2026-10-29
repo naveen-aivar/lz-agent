@@ -63,6 +63,7 @@ components:
         createdAt: {type: integer}
         runKind: {type: string, nullable: true, enum: [deploy, null]}
         designRunId: {type: string, nullable: true}
+        awaitingHitl: {type: boolean, nullable: true, description: A deploy run is waiting for a person to answer or approve something in AWS Transform.}
         error: {type: string}
     Choice:
       type: object
@@ -286,12 +287,18 @@ components:
         pendingDecision: {$ref: "#/components/schemas/PendingDecision"}
     ArtifactData:
       type: object
-      required: [url, sha256, filename]
+      description: A download link and the JSON content for JSON artifacts. With `?summary=1` on `report` only `report` and `sha256` come back (no link; the page uses it to show the report).
+      required: [sha256]
       additionalProperties: true
       properties:
         url: {type: string}
         sha256: {type: string}
         filename: {type: string}
+        report: {type: object, additionalProperties: true}
+        deploymentReport: {type: object, additionalProperties: true}
+        iacChangePlan: {type: object, additionalProperties: true}
+        iacManifest: {type: object, additionalProperties: true}
+        foundationAssessment: {type: object, additionalProperties: true}
     CreateRunEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/CreateRunData"}}}
     RunIdEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/RunIdData"}}}
     StoppedEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/StoppedData"}}}
@@ -431,6 +438,7 @@ paths:
       summary: A 5-minute download link, plus the content for JSON artifacts.
       parameters:
         - {$ref: "#/components/parameters/runId"}
+        - {name: summary, in: query, required: false, description: "For `report` only: return the content without a download link.", schema: {type: string}}
         - name: name
           in: path
           required: true

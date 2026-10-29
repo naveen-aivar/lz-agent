@@ -2,9 +2,9 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
-// Served by CloudFront at /v2/ next to the classic UI at /. config.json is the classic UI's, at the root.
+// Served at the site root by CloudFront (or the UI Lambda); config.json is written next to it by scripts/deploy.sh.
 export default defineConfig({
-  base: "/v2/",
+  base: "/",
   plugins: [react()],
   build: { outDir: "dist", sourcemap: false },
   test: { environment: "jsdom", globals: true, setupFiles: ["src/test/setup.ts"] },

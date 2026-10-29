@@ -16,7 +16,7 @@ const STEPS: [string, string][] = [
   ["Attest and deliver", "Foundation report and artifacts"],
 ];
 
-/** Where a deploy run is, from its audit log (the classic UI's Progress card). */
+/** Where a deploy run is, from its audit log (the Progress card). */
 export function deploySteps(run: Run, audit: AuditItem[]): Step[] {
   const p = run.pendingHumanInput;
   const waitingOnPerson = run.status === "RUNNING" && (run.awaitingHitl === true || (!!p && !isUpdateOnly(p)));
@@ -36,5 +36,22 @@ export function deploySteps(run: Run, audit: AuditItem[]): Step[] {
     const waiting = state === "active" && waitingOnPerson;
     const text = done[i] ? "Done" : state === "failed" ? "Stopped here" : waiting ? "Waiting for your answer" : state === "active" ? "In progress" : sub;
     return { name, sub: text, state, waiting };
+  });
+}
+const DESIGN_STEPS: [string, string][] = [
+  ["Read the SOW", "Extract the text"],
+  ["Understand the scope", "Map every requirement"],
+  ["Generate the code", "Terraform and CloudFormation"],
+  ["Validate and scan", "Lint and security scan"],
+];
+/** Where a design run is, from its audit log. */
+export function designSteps(run: Run, audit: AuditItem[]): Step[] {
+  const has = (a: string) => audit.some((x) => x.action === a);
+  const done = [has("sow.extracted"), has("phase.completed"), has("bundle.rendered"), run.status === "DELIVERED"];
+  const next = done.indexOf(false);
+  const failed = run.status === "FAILED";
+  return DESIGN_STEPS.map(([name, sub], i) => {
+    const state: Step["state"] = done[i] ? "done" : i === next ? (failed ? "failed" : run.status === "AWAITING_INPUT" ? "" : "active") : "";
+    return { name, sub: done[i] ? "Done" : state === "failed" ? "Stopped here" : state === "active" ? "In progress" : sub, state, waiting: false };
   });
 }

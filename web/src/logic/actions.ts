@@ -1,4 +1,4 @@
-/** Event wording, copied from the classic UI (ui/app.js ACTIONS) so both UIs say the same thing. */
+/** Event wording, the wording the UI uses for audit events. */
 export const ACTIONS: Record<string, string> = {
   "transform.build_reported_complete": "Deploy agent: Transform reports the landing zone deployed",
   "transform.build_verified": "Landing zone verified against the design",

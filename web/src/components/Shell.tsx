@@ -1,22 +1,27 @@
 import type { ReactNode } from "react";
-
-export type Nav = "dashboard" | "runs";
-
-/** The classic UI's frame: INGRAM sidebar, breadcrumb topbar, content. */
-export function Shell({ nav, crumb, email, onSignOut, children }: {
-  nav: Nav; crumb: string; email?: string; onSignOut: () => void; children: ReactNode;
+import type { Theme } from "../theme";
+export type Nav = "dashboard" | "runs" | "new";
+const ITEMS: [Nav, string, string, string][] = [
+  ["dashboard", "#/dashboard", "◧", "Dashboard"],
+  ["runs", "#/runs", "▶", "Runs"],
+  ["new", "#/new", "+", "New run"],
+];
+/** App frame: sidebar, breadcrumb bar with theme switch, content. */
+export function Shell({ nav, crumb, email, theme, onTheme, onSignOut, children }: {
+  nav: Nav; crumb: string; email?: string; theme: Theme; onTheme: (t: Theme) => void; onSignOut: () => void; children: ReactNode;
 }) {
   return (
     <div className="shell">
       <aside className="side">
         <div className="brand"><span className="brand-logo"><span className="in">IN</span>GRAM</span></div>
         <nav className="nav" aria-label="Main">
-          <a href="#/dashboard" className={nav === "dashboard" ? "active" : ""} aria-current={nav === "dashboard" ? "page" : undefined}><span className="nav-ic">◧</span>Dashboard</a>
-          <a href="#/runs" className={nav === "runs" ? "active" : ""} aria-current={nav === "runs" ? "page" : undefined}><span className="nav-ic">▶</span>Runs</a>
+          {ITEMS.map(([id, href, icon, label]) => (
+            <a key={id} href={href} className={nav === id ? "active" : ""} aria-current={nav === id ? "page" : undefined}><span className="nav-ic">{icon}</span>{label}</a>
+          ))}
         </nav>
         <div className="side-foot">
           <strong>Ingram Landing Zone</strong>
-          Design &amp; deploy agent <span className="mode-pill cloud">CLOUD</span>
+          Design &amp; deploy agent
         </div>
       </aside>
       <div className="main">
@@ -24,7 +29,9 @@ export function Shell({ nav, crumb, email, onSignOut, children }: {
           <span className="crumb">Ingram Agents</span><span className="sep">·</span><span>{crumb}</span>
           <span className="who">
             {email}
-            <a href="/">Classic UI</a>
+            <button type="button" className="btn btn-sm" aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`} onClick={() => onTheme(theme === "dark" ? "light" : "dark")}>
+              {theme === "dark" ? "☀ Light" : "☾ Dark"}
+            </button>
             <button type="button" className="btn btn-sm" onClick={onSignOut}>Sign out</button>
           </span>
         </header>

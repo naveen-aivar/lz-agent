@@ -613,6 +613,16 @@ class EnvelopeTests(_Base):
         self.assertEqual(out["runs"][-1]["runId"], DESIGN_ID)
         _validate(self.raw, "RunsEnvelope")
 
+    def test_the_run_list_says_which_deploy_runs_wait_on_a_person(self):
+        self.table.items[(f"RUN#{DESIGN_ID}", "META")]["createdAt"] = 1
+        self.table.put_item({"PK": f"RUN#{'5' * 32}", "SK": "META", "runId": "5" * 32, "requester": USER, "status": "RUNNING",
+                             "runKind": "deploy", "createdAt": 50, "error": "", "awaitingHitl": True})
+        _, out = self.api("GET /runs")
+        by_id = {r["runId"]: r for r in out["runs"]}
+        self.assertIs(by_id["5" * 32]["awaitingHitl"], True)
+        self.assertIsNone(by_id[DESIGN_ID]["awaitingHitl"])
+        _validate(self.raw, "RunsEnvelope")
+
     def test_the_run_list_says_when_it_is_cut(self):
         for i in range(5):
             rid = f"{i:032x}"
@@ -1353,15 +1363,27 @@ class PlatformTemplateTests(unittest.TestCase):
         client = RES["UserPoolClient"]["Properties"]
         for key in ("CallbackURLs", "LogoutURLs"):
             urls = client[key]["If"][1]
-            self.assertEqual(len(urls), 2, key)
-            self.assertTrue(any("/v2/index.html" in str(u) for u in urls), key)
+            self.assertEqual(len(urls), 1, key)
+            self.assertFalse(any("/v2/" in str(u) for u in urls), key)
         route = RES["RouteDecideTask"]["Properties"]
         self.assertEqual((route["RouteKey"], route["AuthorizationType"]), ("POST /runs/{runId}/decision", "JWT"))
 
-    def test_deploy_script_publishes_the_react_build_under_v2(self):
+    def test_deploy_script_publishes_the_react_build_at_the_root_and_not_the_classic_ui(self):
         text = (ROOT / "scripts" / "deploy.sh").read_text()
-        self.assertIn('aws s3 sync web/dist "s3://$UI/v2" --delete', text)
+        self.assertIn('aws s3 sync web/dist "s3://$UI" --delete --exclude config.json', text)
         self.assertIn("npm ci", text)
+        self.assertNotIn("ui/app.js", text)
+        self.assertFalse((ROOT / "ui").exists())
+
+    def test_ui_lambda_serves_only_the_app_files(self):
+        os.environ.setdefault("UI_BUCKET", "test-ui-bucket")
+        import ui_serve
+        for ok in ("/", "/index.html", "/config.json", "/assets/index-AbC_1.js", "/assets/x-1.css"):
+            self.assertIsNotNone(ui_serve._key(ok), ok)
+        for bad in ("/app.js", "/assets/../secrets.js", "/assets/a/b.js", "/v2/index.html", "/assets/x.png"):
+            self.assertIsNone(ui_serve._key(bad), bad)
+        self.assertIn("RouteUiAssets", RES)
+        self.assertNotIn("RouteUiAppJs", RES)
     def test_agent_transform_actions_conditional_and_enumerated(self):
         stmts = [u for s in _statements("AgentRole") for u in _unwrap(s)]
         transform = [(c, s) for c, s in stmts if any(a.startswith("transform:") for a in _actions(s))]

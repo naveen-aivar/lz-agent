@@ -97,17 +97,14 @@ cat > build/config.json <<EOF
 {"apiUrl":"$(out ApiUrl)","clientId":"$(out UserPoolClientId)","cognitoDomain":"$(out CognitoDomain)"}
 EOF
 UI=$(out UiBucketName)
-# no-cache: browsers must revalidate the UI files on every load, or a stale app.js can meet a new index.html (blank page)
-sed "s|src=\"app.js\"|src=\"app.js?v=$(date +%s)\"|" ui/index.html > build/index.html  # version the script so a cached app.js cannot meet a new page
-aws s3 cp build/index.html "s3://$UI/index.html" --content-type text/html --cache-control no-cache --only-show-errors
-aws s3 cp ui/app.js "s3://$UI/app.js" --content-type application/javascript --cache-control no-cache --only-show-errors
+# The React app (web/) is the only UI. It is served from the bucket root; config.json sits next to it.
+(cd web && npm ci --silent && npm run build --silent)
+# Hashed assets and index.html are revalidated on every load, so a stale script cannot meet a new page.
+# --delete removes files of earlier builds (including the retired classic UI) but keeps config.json.
+aws s3 sync web/dist "s3://$UI" --delete --exclude config.json --cache-control no-cache --only-show-errors
 aws s3 cp build/config.json "s3://$UI/config.json" --content-type application/json --cache-control no-store --only-show-errors
-# React UI (web/), served by CloudFront at /v2/index.html next to the classic UI. Needs CloudFront: the callback URL
-# https://<distribution>/v2/index.html is registered on the user pool client by platform.yaml.
-if [ -d web ]; then
-  (cd web && npm ci --silent && npm run build --silent)
-  aws s3 sync web/dist "s3://$UI/v2" --delete --cache-control no-cache --only-show-errors
-  echo "React UI: $(out UiUrl)/v2/index.html"
-fi
+# Bookmarks to the old React path /v2/index.html still work: they go to the root.
+printf '%s' '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/"><title>Landing Zone Agent</title><a href="/">Continue</a>' > build/v2-redirect.html
+aws s3 cp build/v2-redirect.html "s3://$UI/v2/index.html" --content-type text/html --cache-control no-cache --only-show-errors
 echo "UI: $(out UiUrl)"
 [ -n "$TAG" ] || echo "First pass done. Re-run with an image tag (e.g. v1) to build the agent image and create the AgentCore runtime."

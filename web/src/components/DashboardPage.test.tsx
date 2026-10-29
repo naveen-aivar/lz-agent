@@ -15,7 +15,7 @@ const runs: RunSummary[] = [
 const api = (r: RunSummary[] = runs) => ({ listRuns: vi.fn().mockResolvedValue({ runs: r }) }) as unknown as Client;
 
 describe("RunsTable", () => {
-  it("words state and type like the classic UI and links every run", () => {
+  it("words state and type and links every run", () => {
     render(<RunsTable runs={runs} />);
     const rows = screen.getAllByRole("row").slice(1);
     expect(within(rows[0]!).getByText("In progress")).toBeInTheDocument();
@@ -64,7 +64,7 @@ describe("DashboardPage", () => {
 describe("RunsPage", () => {
   it("is the run history", async () => {
     render(<RunsPage api={api()} onOpen={() => {}} />);
-    expect(await screen.findByRole("heading", { name: "Run history" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Runs" })).toBeInTheDocument();
     expect(screen.getAllByRole("row")).toHaveLength(4);
   });
 });
@@ -77,13 +77,13 @@ describe("RunsPage paging", () => {
 
   it("shows 25 runs, then 25 more on request, and says how many there are", async () => {
     render(<RunsPage api={big()} onOpen={() => {}} />);
-    expect(await screen.findByTestId("run-count")).toHaveTextContent("Showing 25 of 60 runs");
+    expect(await screen.findByTestId("run-count")).toHaveTextContent("Showing 25 of 60 matching runs (60 in total)");
     expect(screen.getAllByRole("row")).toHaveLength(26);
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Show 25 more" }));
-    expect(screen.getByTestId("run-count")).toHaveTextContent("Showing 50 of 60 runs");
+    expect(screen.getByTestId("run-count")).toHaveTextContent("Showing 50 of 60 matching runs (60 in total)");
     await user.click(screen.getByRole("button", { name: "Show 10 more" }));
-    expect(screen.getByTestId("run-count")).toHaveTextContent("Showing 60 of 60 runs");
+    expect(screen.getByTestId("run-count")).toHaveTextContent("Showing 60 of 60 matching runs (60 in total)");
     expect(screen.getAllByRole("row")).toHaveLength(61);
     expect(screen.queryByRole("button", { name: /Show .* more/ })).toBeNull();
   });
@@ -91,7 +91,7 @@ describe("RunsPage paging", () => {
   it("says when the API list is shorter than the number of runs", async () => {
     const cut = { listRuns: vi.fn().mockResolvedValue({ runs: many.slice(0, 30), total: 900 }) } as unknown as Client;
     render(<RunsPage api={cut} onOpen={() => {}} />);
-    expect(await screen.findByTestId("run-count")).toHaveTextContent("Showing 25 of 900 runs (the newest 30 can be listed)");
+    expect(await screen.findByTestId("run-count")).toHaveTextContent("Showing 25 of 30 matching runs (900 in total); only the newest 30 can be listed");
   });
 
   it("counts the dashboard over every run, not the first page", async () => {

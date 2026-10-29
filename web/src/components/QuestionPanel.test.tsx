@@ -69,10 +69,12 @@ describe("QuestionPanel messages", () => {
     expect(screen.queryByRole("link", { name: /Approve in the AWS console/ })).toBeNull();
   });
 
-  it("shows the question as plain text, never as HTML", () => {
-    setup(message({ text: "<img src=x onerror=alert(1)> **bold**" }));
-    expect(screen.getByTestId("question-text").textContent).toBe("<img src=x onerror=alert(1)> **bold**");
+  it("renders Markdown in the question but never raw HTML or non-https links", () => {
+    setup(message({ text: "<img src=x onerror=alert(1)> **bold**\n\n[ok](https://example.com) [bad](javascript:alert(1))" }));
     expect(document.querySelector("img")).toBeNull();
+    expect(screen.getByText("bold").tagName).toBe("STRONG");
+    expect(screen.getByRole("link", { name: "ok" })).toHaveAttribute("href", "https://example.com");
+    expect(screen.queryByRole("link", { name: "bad" })).toBeNull();
   });
 
   it("explains that only approvers can answer, and offers no way to send", () => {

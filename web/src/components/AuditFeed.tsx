@@ -2,7 +2,7 @@ import type { AuditItem } from "../api/client";
 import { feedText } from "../logic/activity";
 import { ago } from "../logic/format";
 
-/** Events, already ordered newest first, worded like the classic UI. */
+/** Events, already ordered newest first. */
 export function AuditFeed({ audit, userSub }: { audit: AuditItem[]; userSub: string }) {
   if (!audit.length) return <p className="hint">Nothing recorded yet.</p>;
   return (
