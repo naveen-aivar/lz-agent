@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { AuditItem, Client, Run, Schemas } from "../api/client";
 import { AuditFeed } from "./AuditFeed";
+import { statusTone } from "../logic/status";
 import { DesignPanel } from "./DesignPanel";
 import { QuestionPanel } from "./QuestionPanel";
 import { ResumePanel } from "./ResumePanel";
@@ -58,7 +59,7 @@ export function RunPage({ runId, api, canAnswer, userSub, pollMs = 4000 }: {
 
   return (
     <div className="run">
-      <h1>{run.customerId ?? run.runId.slice(0, 8)} <span className={`badge badge-${run.status.toLowerCase()}`}>{run.status}</span></h1>
+      <h1>{run.customerId ?? run.runId.slice(0, 8)} <span className={`badge badge-${statusTone(run.status)}`}>{run.status}</span></h1>
       {run.error && <p className="error" role="alert">{run.error}</p>}
       {error && <p className="error" role="alert">{error}</p>}
       {run.status === "RUNNING" && run.runKind === "deploy" && (
@@ -77,18 +78,18 @@ export function RunPage({ runId, api, canAnswer, userSub, pollMs = 4000 }: {
         <QuestionPanel key={`${pending.jobId}:${pending.messageId ?? pending.taskId ?? pending.title}`} run={run}
           pending={pending} canAnswer={canAnswer} userSub={userSub} api={api} onChanged={() => void load()} />
       )}
-      <nav role="tablist">
+      <nav role="tablist" className="tabs">
         {(["activity", "design", "details"] as Tab[]).map((t) => (
           <button key={t} role="tab" aria-selected={tab === t} className="tab" onClick={() => setTab(t)}>{t}</button>
         ))}
       </nav>
       {tab === "activity" && (<>
-        <label className="hint"><input type="checkbox" checked={all} onChange={(e) => setAll(e.target.checked)} /> Show every step</label>
+        <label className="check hint"><input type="checkbox" checked={all} onChange={(e) => setAll(e.target.checked)} /> Show every step</label>
         <AuditFeed audit={audit} all={all} />
       </>)}
       {tab === "design" && (design ? <DesignPanel scope={design.scope} diagram={design.orgDiagram} /> : <p className="hint">No approved design to show yet.</p>)}
       {tab === "details" && (
-        <dl>
+        <dl className="kv">
           <dt>Run</dt><dd><code>{run.runId}</code></dd>
           {run.designRunId && (<><dt>Design run</dt><dd><code>{run.designRunId}</code></dd></>)}
           {run.targetRegion && (<><dt>Control Tower Region</dt><dd>{run.targetRegion}</dd></>)}

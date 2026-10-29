@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { Client, RunSummary } from "../api/client";
+import { statusTone } from "../logic/status";
 import { DeployDialog } from "./DeployDialog";
 
 export function RunsPage({ api, onOpen }: { api: Client; onOpen: (runId: string) => void }) {
@@ -23,7 +24,7 @@ export function RunsPage({ api, onOpen }: { api: Client; onOpen: (runId: string)
             <tr key={r.runId}>
               <td><a href={`#/run/${r.runId}`} onClick={(e) => { e.preventDefault(); onOpen(r.runId); }}>{r.customerId ?? r.runId.slice(0, 8)}</a></td>
               <td>{r.runKind === "deploy" ? "deploy" : "design"}</td>
-              <td>{r.status}</td>
+              <td><span className={`badge badge-${statusTone(r.status)}`}>{r.status}</span></td>
               <td>{new Date(r.createdAt * 1000).toLocaleString()}</td>
               <td>{r.runKind !== "deploy" && r.status === "DELIVERED" && (
                 <button type="button" className="btn btn-sm" onClick={() => setDeployFor(r.runId)}>Deploy</button>)}</td>

@@ -27,6 +27,8 @@ export function ResumePanel({ run, api, onResumed }: { run: Run; api: Pick<Clien
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
+  // Only the API says whether a run can continue. Without that answer (an API without resume), show nothing.
+  if (run.resumable === undefined) return null;
   if (!run.resumable) {
     return <p className="hint" data-testid="not-resumable">This run recorded no progress, so there is nothing to continue. Start a new deploy run.</p>;
   }

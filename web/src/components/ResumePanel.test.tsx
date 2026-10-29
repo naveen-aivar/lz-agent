@@ -53,6 +53,11 @@ describe("ResumePanel", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("already have been resumed");
   });
 
+  it("shows nothing when the API does not say whether the run can continue", () => {
+    const { container } = render(<ResumePanel run={failed({ resumable: undefined })} api={{ resumeRun: vi.fn() }} onResumed={() => {}} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
   it("says there is nothing to continue when the run recorded no progress", () => {
     render(<ResumePanel run={failed({ resumable: false })} api={{ resumeRun: vi.fn() }} onResumed={() => {}} />);
     expect(screen.getByTestId("not-resumable")).toBeInTheDocument();
