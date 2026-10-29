@@ -29,8 +29,17 @@ RESERVATION_CONDITION = (
 )
 
 
+# Recording a recovered reply: only over the reservation this call made (same token and lease).
+RECOVERY_CONDITION = "#st = :sending AND idempotencyToken = :tok AND leaseUntil = :lease"
+
+
 class AnswerExists(RuntimeError):
     """The question already has an answer (sent or being sent)."""
+
+
+class SendOutcomeUnknown(RuntimeError):
+    """The send call failed in a way that does not prove Transform did not receive it (timeout, connection
+    error, unexpected response). Raised by the send function; send_answer then checks the conversation."""
 
 
 class AnswerRecordFailed(RuntimeError):
@@ -90,19 +99,21 @@ def send_answer(
     by: str,
     at: int,
     send: Callable[..., dict],
-    find_reply: Callable[[int], Optional[str]],
+    find_reply: Callable[[], Optional[str]],
     audit_extra: Optional[dict] = None,
 ) -> dict[str, Any]:
     """Reserve, send and record one answer to ``pending``. Returns the recorded answer.
 
-    ``find_reply(since)`` returns the Transform message id of a USER reply in the job created at or after
-    epoch ``since``, else None. It is used only when taking over an abandoned reservation: if the earlier
-    sender's reply already reached Transform, that reply is recorded as sent and nothing is sent again.
+    ``find_reply()`` returns the Transform message id of a USER message newer than the pending question
+    (anchored on the question's own Transform timestamp, not on any local clock), else None. It is used in
+    two cases where the reply may already be in Transform: taking over an abandoned reservation, and a send
+    whose outcome is unknown (SendOutcomeUnknown). Then that reply is recorded and nothing is sent again.
 
     Raises ValueError for a malformed reply, AnswerExists when the question already has an answer,
-    AnswerRecordFailed when Transform accepted the reply but recording it failed, and re-raises whatever
+    AnswerRecordFailed when Transform holds the reply but recording it failed, and re-raises whatever
     ``send`` raised (QuestionChanged, TransformAccessDenied, ...) after marking the reservation failed and
-    auditing transform.answer_failed.
+    auditing transform.answer_failed. A recovered result carries ``recovered: True`` and the earlier
+    sender's fields (``by``, ``option``, ``text``), so the caller can tell its own reply was not sent.
     """
     reply_text = validate_reply(pending, option, text)
     message_id, job_id = pending["messageId"], pending["jobId"]
@@ -122,22 +133,10 @@ def send_answer(
     except ClientError as e:
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise
-        raise AnswerExists(f"Transform message {message_id} already has an answer") from e
+        raise AnswerExists(f"Transform message {message_id} already has an answer (sent or being sent)") from e
 
-    if takeover:
-        # The earlier sender died after reserving. If its reply reached Transform, record that reply as sent
-        # instead of sending another one (the live re-check would refuse a second send anyway).
-        already = find_reply(int(previous.get("at") or 0))
-        if already:
-            recovered = {**{k: previous.get(k) for k in ("jobId", "messageId", "option", "text", "by", "at")},
-                         "status": "sent", "sentMessageId": already}
-            _record_sent(table, audit, run_id, key, recovered, {"recovered": True, **(audit_extra or {})})
-            return recovered
-
-    try:
-        sent = send(job_id=job_id, message_id=message_id, idempotency_token=token, option=option, text=reply_text)
-    except Exception as e:  # noqa: BLE001 - recorded, released for retry and re-raised, never swallowed
-        error = f"{type(e).__name__}: {e}"[:AUDIT_TEXT_LIMIT]
+    def mark_failed(error: str) -> None:
+        error = error[:AUDIT_TEXT_LIMIT]
         table.update_item(
             Key=key,
             UpdateExpression="SET #st = :f, #e = :msg",
@@ -145,6 +144,48 @@ def send_answer(
             ExpressionAttributeValues={":f": "failed", ":msg": error},
         )
         audit("transform.answer_failed", {"jobId": job_id, "messageId": message_id, "error": error})
+
+    if takeover:
+        # The earlier sender died after reserving. If its reply reached Transform, record THAT reply (its
+        # sender, option and text) as sent instead of sending another one.
+        try:
+            already = find_reply()
+        except Exception as e:  # noqa: BLE001 - recorded and re-raised; the reservation is released
+            mark_failed(f"checking whether an earlier reply reached Transform failed: {type(e).__name__}: {e}")
+            raise
+        if already:
+            recovered = {**{k: previous.get(k) for k in ("jobId", "messageId", "option", "text", "by", "at")},
+                         "status": "sent", "sentMessageId": already, "recovered": True}
+            try:
+                table.put_item(  # we hold the reservation; never overwrite anything else
+                    Item={**key, **recovered, "idempotencyToken": token},
+                    ConditionExpression=RECOVERY_CONDITION,
+                    ExpressionAttributeNames={"#st": "status"},
+                    ExpressionAttributeValues={":sending": "sending", ":tok": token, ":lease": at + SENDING_LEASE_SECONDS},
+                )
+                _record_sent(table, audit, run_id, key, recovered,
+                             {"recovered": True, "originalSender": previous.get("by")}, update_item=False)
+            except Exception as e:  # noqa: BLE001 - the reply is in Transform; say so
+                raise AnswerRecordFailed(message_id, already, e) from e
+            return recovered
+
+    try:
+        sent = send(job_id=job_id, message_id=message_id, idempotency_token=token, option=option, text=reply_text)
+    except SendOutcomeUnknown as e:
+        # The request may have reached Transform (timeout, unexpected response): look before deciding.
+        try:
+            landed = find_reply()
+        except Exception as e2:  # noqa: BLE001 - both errors recorded, original re-raised
+            mark_failed(f"{type(e).__name__}: {e}; checking whether it reached Transform also failed: "
+                        f"{type(e2).__name__}: {e2}")
+            raise e from e2
+        if not landed:
+            mark_failed(f"{type(e).__name__}: {e}")
+            raise
+        sent = {"sentMessageId": landed}
+        audit_extra = {**(audit_extra or {}), "confirmedAfterError": str(e)[:AUDIT_TEXT_LIMIT]}
+    except Exception as e:  # noqa: BLE001 - Transform refused or the question moved on: nothing was sent
+        mark_failed(f"{type(e).__name__}: {e}")
         raise
 
     # From here on the reply is out. A failure is reported as AnswerRecordFailed so no caller releases or
@@ -160,13 +201,15 @@ def send_answer(
     return recorded
 
 
-def _record_sent(table, audit: Callable[[str, dict], None], run_id: str, key: dict, recorded: dict, extra: dict) -> None:
-    table.update_item(
-        Key=key,
-        UpdateExpression="SET #st = :s, sentMessageId = :m",
-        ExpressionAttributeNames={"#st": "status"},
-        ExpressionAttributeValues={":s": "sent", ":m": recorded["sentMessageId"]},
-    )
+def _record_sent(table, audit: Callable[[str, dict], None], run_id: str, key: dict, recorded: dict, extra: dict,
+                 update_item: bool = True) -> None:
+    if update_item:
+        table.update_item(
+            Key=key,
+            UpdateExpression="SET #st = :s, sentMessageId = :m",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":s": "sent", ":m": recorded["sentMessageId"]},
+        )
     table.update_item(
         Key={"PK": f"RUN#{run_id}", "SK": "META"},
         UpdateExpression="SET pendingAnswer = :a",

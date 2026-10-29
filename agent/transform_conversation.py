@@ -3,10 +3,11 @@
 While the Transform landing zone job runs, each question it asks goes to the deploy agent first.
 In one model turn the agent makes exactly one decision with one of three tools:
 
-* answer_transform_question: the approved design (scope.json) or the run context answers it. The
-  reply goes through lzcore.transform_answers.send_answer, the same reservation and record path the
-  UI approver uses, so a question is never answered twice and every answer is audited with the
-  agent's category, rationale and design basis.
+* answer_transform_question: select an offered "Landing Zone" or "Custom structure" option (the only
+  things the agent sends on its own; no typed text). The reply goes through
+  lzcore.transform_answers.send_answer, the same reservation and record path the UI approver uses, so
+  a question is never answered twice and every answer is audited with the agent's category, rationale
+  and design basis.
 * no_reply_needed: the message only reports progress or status and asks nothing (no options, no
   question). Nothing is sent to Transform and the person is not asked; the model, not a text rule,
   decides this.
@@ -15,9 +16,9 @@ In one model turn the agent makes exactly one decision with one of three tools:
   anything the model is unsure about. The reason and an optional suggestion are shown to the
   person in the UI next to the question.
 
-The tools enforce structure, not judgment: the category must be one of ANSWER_CATEGORIES (there is
-no approval category, so an approval can only be escalated), every basis entry must resolve in the
-design or the run context, and option answers must be an offered label.
+The tools enforce the boundary in code: only AGENT_ANSWERABLE_OPTIONS can be selected, offered exactly
+once with a value equal to the label; typed text is refused; every basis entry must resolve in the
+design or the run context. Everything else is escalated, with any reply text as the suggestion.
 
 Per-question state lives in DynamoDB at RUN#<runId> / AGENTQ#<questionKey>:
     {status: deciding | answered | escalated | informational | superseded, turns, kind, title, reason, suggestion,
@@ -33,7 +34,7 @@ from botocore.exceptions import ClientError
 from strands import tool
 
 from lzcore import transform_ops
-from lzcore.transform_answers import AnswerExists, AnswerRecordFailed, send_answer
+from lzcore.transform_answers import ANSWER_TEXT_LIMIT, AnswerExists, AnswerRecordFailed, send_answer
 
 import tools as base
 
@@ -46,6 +47,9 @@ CONVERSATION_MESSAGES = 12
 SCOPE_PROMPT_LIMIT = 60_000
 RATIONALE_LIMIT = 2000
 NOTE_LIMIT = 1000
+# A suggestion may be the full reply a person sends (for example the design's custom structure): same limit
+# as a reply.
+SUGGESTION_LIMIT = ANSWER_TEXT_LIMIT
 RUN_PURPOSE = (
     "Build the AWS landing zone in the approved design. Landing zone only: no migration planning, "
     "no network migration, no server migration."
@@ -122,6 +126,17 @@ def _release_answer_slot() -> None:
     )
 
 
+def _reply_in_transform(pending: dict) -> Optional[str]:
+    """A USER message newer than the pending question (its own Transform createdAtMs), else None."""
+    since = pending.get("createdAtMs")
+    if isinstance(since, bool) or not isinstance(since, int):
+        raise RuntimeError(
+            f"pending Transform question {pending.get('messageId')} has no integer createdAtMs (got {since!r}); "
+            "it was recorded by an older release and is refreshed on the next poll"
+        )
+    return transform_ops.user_reply_since(pending["jobId"], since, pending.get("workspaceId"))
+
+
 def _json_for_prompt(obj: Any, **kw) -> str:
     """JSON that cannot close or open the prompt's XML-style blocks: Transform text is untrusted."""
     return json.dumps(obj, default=str, **kw).replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
@@ -166,8 +181,9 @@ def build_prompt(*, pending: dict, scope: dict, context: dict, conversation: lis
             f"approved design is {len(scope_json)} characters (limit {SCOPE_PROMPT_LIMIT} for the Transform conversation turn)"
         )
     parts = [
-        "Decide the pending AWS Transform message below with exactly one tool call: "
-        "answer_transform_question, no_reply_needed or escalate_to_human.",
+        "Make exactly one decision on the pending AWS Transform message below, with one of "
+        "answer_transform_question, no_reply_needed or escalate_to_human. If a call is REFUSED, make a "
+        "corrected call (usually escalate_to_human); stop after one call succeeds.",
         f"<pending_question>\n{_json_for_prompt(question, indent=1)}\n</pending_question>",
         f"<recent_transform_conversation>\n{_json_for_prompt(conversation, indent=1)}\n</recent_transform_conversation>",
         f"<run_context>\n{_json_for_prompt(context, indent=1)}\n</run_context>",
@@ -276,7 +292,8 @@ def answer_transform_question(category: str, rationale: str, basis: list[str], o
     if len(offered) != 1:
         return (f"REFUSED: Transform offers {len(offered)} options named {option!r}. Call escalate_to_human.")
     # The value is what Transform receives; it must say the same thing as the label (untrusted Transform data).
-    if str(offered[0].get("value") or "").strip().lower() not in ("", wanted):
+    # An option without a value cannot be sent at all (answer_message refuses it), so it is a person's to answer.
+    if str(offered[0].get("value") or "").strip().lower() != wanted:
         return (f"REFUSED: the option {offered[0]['label']!r} would send {offered[0].get('value')!r} to Transform, "
                 "which is not the same as its label. Call escalate_to_human.")
     opt, txt = offered[0]["label"], None  # the exact label as offered
@@ -295,7 +312,7 @@ def answer_transform_question(category: str, rationale: str, basis: list[str], o
             by="agent",
             at=int(time.time()),
             send=lambda **kw: transform_ops.answer_message(**kw, workspace=pending["workspaceId"]),
-            find_reply=lambda since: transform_ops.user_reply_since(pending["jobId"], since, pending["workspaceId"]),
+            find_reply=lambda: _reply_in_transform(pending),
             audit_extra={"by": "agent", "category": category, "rationale": rationale.strip()[:500],
                          "basis": basis[:20], "question": pending.get("title")},
         )
@@ -305,25 +322,41 @@ def answer_transform_question(category: str, rationale: str, basis: list[str], o
     except AnswerExists:
         _release_answer_slot()
         put_question(qkey, status="superseded", kind=pending["kind"], title=pending.get("title"),
-                     turns=_turn.get("turns"), reason="the question already had an answer (a person answered it)")
+                     turns=_turn.get("turns"), reason="the question already has an answer, sent or being sent")
         _turn["decided"] = "superseded"
-        return "REFUSED: this question already has an answer from a person. Stop now."
+        return "REFUSED: this question already has an answer (sent or being sent). Stop now."
     except transform_ops.QuestionChanged as e:
         _release_answer_slot()
         put_question(qkey, status="superseded", kind=pending["kind"], title=pending.get("title"),
                      turns=_turn.get("turns"), reason=str(e)[:NOTE_LIMIT])
         _turn["decided"] = "superseded"
         return f"REFUSED: AWS Transform moved on ({e}). Stop now; the next question comes on a later poll."
-    except AnswerRecordFailed:
-        # The reply reached Transform: the slot stays taken and the decision is recorded, then the turn fails loudly.
-        put_question(qkey, status="answered", kind=pending["kind"], title=pending.get("title"), turns=_turn.get("turns"),
-                     category=category, rationale=rationale.strip(), basis=basis, option=opt,
-                     reason="sent, but recording the answer failed")
+    except AnswerRecordFailed as e:
+        # The reply is in Transform: the slot stays taken and nothing is resent. The tool returns (Strands would
+        # turn a raise into a tool result anyway) and the failure is audited here, where it happens.
         _turn["decided"] = "answered"
-        raise
+        base.log_tool_event("transform.answer_record_failed", {
+            "jobId": pending.get("jobId"), "messageId": pending.get("messageId"), "option": opt,
+            "sentMessageId": e.sent_message_id, "error": str(e.cause)[:500]})
+        try:
+            put_question(qkey, status="answered", kind=pending["kind"], title=pending.get("title"),
+                         turns=_turn.get("turns"), category=category, rationale=rationale.strip(), basis=basis,
+                         option=opt, reason="sent, but recording the answer failed")
+        except Exception as e2:  # noqa: BLE001 - audited; the ANSWER# lease makes a later turn recover the reply
+            base.log_tool_event("transform.answer_record_failed", {
+                "messageId": pending.get("messageId"), "stage": "recording the decision",
+                "error": f"{type(e2).__name__}: {e2}"[:500]})
+        return "SENT to AWS Transform, but recording it failed (audited). Do not answer again. Reply with one sentence and stop."
     except Exception:
         _release_answer_slot()  # only failures before or during the send reach here: nothing went out
         raise
+    if sent.get("recovered") and sent.get("by") != "agent":
+        # Someone else's earlier reply had already reached Transform; ours was not sent, so the slot goes back.
+        _release_answer_slot()
+        put_question(qkey, status="superseded", kind=pending["kind"], title=pending.get("title"),
+                     turns=_turn.get("turns"), reason=f"an earlier reply by {sent.get('by')} had already reached Transform")
+        _turn["decided"] = "superseded"
+        return "REFUSED: an earlier reply to this question had already reached AWS Transform. Stop now."
     put_question(qkey, status="answered", kind=pending["kind"], title=pending.get("title"), turns=_turn.get("turns"),
                  category=category, rationale=rationale.strip(), basis=basis, option=opt, text=sent.get("text"))
     _turn["decided"] = "answered"
@@ -342,8 +375,8 @@ def escalate_to_human(reason: str, suggestion: str = "") -> str:
         return refused
     if not isinstance(reason, str) or not reason.strip() or len(reason) > NOTE_LIMIT:
         return f"REFUSED: reason must be 1-{NOTE_LIMIT} characters."
-    if suggestion and len(suggestion) > NOTE_LIMIT:
-        return f"REFUSED: suggestion must be at most {NOTE_LIMIT} characters."
+    if suggestion and len(suggestion) > SUGGESTION_LIMIT:
+        return f"REFUSED: suggestion must be at most {SUGGESTION_LIMIT} characters."
     pending = _turn["pending"]
     put_question(_turn["qkey"], status="escalated", kind=pending["kind"], title=pending.get("title"),
                  turns=_turn.get("turns"), reason=reason.strip(), suggestion=(suggestion or "").strip() or None)

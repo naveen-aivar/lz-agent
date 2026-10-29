@@ -17,6 +17,10 @@ import inspect
 import os
 import json
 import uuid
+
+from botocore.exceptions import ConnectionClosedError, ReadTimeoutError
+
+from lzcore.transform_answers import SendOutcomeUnknown
 from typing import Any, Optional
 
 from lzcore.transform_credentials import transform_botocore_credentials, transform_principal_arn
@@ -606,11 +610,17 @@ async def _pending_human_input(ws: str, job_id: str, free_text: bool = False) ->
         # True when the job itself reports AWAITING_HUMAN_INPUT: Transform is blocked on a reply, so the
         # message is never "just progress".
         "jobAwaitingInput": bool(free_text),
+        # Transform's own timestamp of the question (integer epoch milliseconds, so DynamoDB stores it exactly):
+        # any USER message newer than this is a reply to it. Used to tell whether an interrupted reply reached
+        # Transform, with no local clock.
+        "createdAtMs": _epoch_ms(newest["createdAt"], f"message {message_id}"),
         "consoleUrl": console_url(await _application_url(), ws, job_id),
     }
 
 
 ANSWER_TEXT_LIMIT = 4000
+# Errors after which a SendMessage may or may not have reached Transform.
+_UNKNOWN_OUTCOME_ERRORS = (ReadTimeoutError, ConnectionClosedError, asyncio.TimeoutError)
 
 
 class QuestionChanged(RuntimeError):
@@ -666,13 +676,17 @@ def answer_message(
             reply = choice["value"]
         else:
             reply = text.strip()
-        resp = await _call(
-            "SendMessage",
-            SendMessageRequest(text=reply, idempotencyToken=idempotency_token, metadata=_job_metadata(ws, job_id)),
-        )
+        try:
+            resp = await _call(
+                "SendMessage",
+                SendMessageRequest(text=reply, idempotencyToken=idempotency_token, metadata=_job_metadata(ws, job_id)),
+            )
+        except _UNKNOWN_OUTCOME_ERRORS as e:
+            # The request may have been processed; the caller checks the conversation before calling it failed.
+            raise SendOutcomeUnknown(f"Transform SendMessage for job {job_id}: {type(e).__name__}: {e}") from e
         sent = resp.get("message") if isinstance(resp, dict) else None
         if not isinstance(sent, dict) or not sent.get("messageId"):
-            raise RuntimeError(f"Transform SendMessage for job {job_id} returned no message: {resp!r}")
+            raise SendOutcomeUnknown(f"Transform SendMessage for job {job_id} returned no message: {resp!r}")
         return {"jobId": job_id, "answeredMessageId": message_id, "sentMessageId": sent["messageId"], "text": reply}
 
     return _run(_go())
@@ -878,16 +892,22 @@ def _epoch(value: Any, what: str) -> float:
     raise RuntimeError(f"Transform {what} has an unreadable createdAt: {value!r}")
 
 
-def user_reply_since(job_id: str, since: int, workspace: Optional[str] = None) -> Optional[str]:
-    """Message id of the first USER message in the job created at or after epoch ``since``; None if none.
+def _epoch_ms(value: Any, what: str) -> int:
+    return int(round(_epoch(value, what) * 1000))
 
+
+def user_reply_since(job_id: str, since_ms: int, workspace: Optional[str] = None) -> Optional[str]:
+    """Message id of the first USER message in the job created strictly after ``since_ms`` (epoch milliseconds);
+    None if none.
+
+    ``since_ms`` is the pending question's own Transform createdAtMs, so both sides are Transform timestamps.
     Used to tell whether an interrupted answer already reached Transform before sending it again."""
     ws = workspace or workspace_id()
     _ensure_connected()
 
     async def _go():
         for m in _by_created(await _job_messages(ws, job_id), "messageId", "message"):
-            if m.get("messageOrigin") == "USER" and _epoch(m["createdAt"], f"message {m.get('messageId')}") >= since:
+            if m.get("messageOrigin") == "USER" and _epoch_ms(m["createdAt"], f"message {m.get('messageId')}") > since_ms:
                 return m.get("messageId")
         return None
 

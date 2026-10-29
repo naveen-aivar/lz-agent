@@ -88,6 +88,10 @@ def _validate_pending(pending, run_id: str) -> dict | None:
     message_id = pending.get("messageId")
     if message_id is not None and not isinstance(message_id, str):
         raise RuntimeError(f"agent continue payload for {run_id}: pendingHumanInput.messageId must be a string or null")
+    created = pending.get("createdAtMs")
+    if created is not None and (isinstance(created, bool) or not isinstance(created, int)):
+        # DynamoDB (boto3 resource) refuses floats; the agent sends Transform's timestamp as integer milliseconds.
+        raise RuntimeError(f"agent continue payload for {run_id}: pendingHumanInput.createdAtMs must be an integer or absent")
     choices = pending.get("choices")
     if choices is not None and not (
         isinstance(choices, list)
@@ -142,6 +146,10 @@ def _pending_summary(pending: dict | None, awaiting: bool) -> str:
     return "none"
 
 
+def _is_update_only(pending: dict) -> bool:
+    return isinstance(pending, dict) and (pending.get("agentNote") or {}).get("informational") is True
+
+
 def _sync_pending_human_input(run_id: str, phase: str, awaiting: bool, job_id, pending: dict | None) -> None:
     """Mirror the Transform question into META; audit when it appears, changes, or is resolved."""
     run = get_run(run_id)
@@ -149,16 +157,19 @@ def _sync_pending_human_input(run_id: str, phase: str, awaiting: bool, job_id, p
         raise RuntimeError(f"deploy run {run_id} META not found while recording the continue result")
     previous = run.get("pendingHumanInput")
     key = {"PK": f"RUN#{run_id}", "SK": "META"}
-    if not awaiting and pending is not None and (pending.get("agentNote") or {}).get("informational") is True:
+    if not awaiting and pending is not None and _is_update_only(pending):
         # A Transform update the agent judged needs no reply: shown in the UI (a person may still reply), not
         # counted as a wait on a person and not announced as a question.
         table().update_item(
             Key=key,
             UpdateExpression="SET pendingHumanInput = :p, awaitingHitl = :f",
-            ConditionExpression="#s = :running",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":p": pending, ":f": False, ":running": "RUNNING"},
+            ExpressionAttributeValues={":p": pending, ":f": False},
         )
+        if previous is not None and not _is_update_only(previous):
+            # The question announced before it is no longer a wait (Transform moved on, or the agent judged the
+            # same message progress-only): keep "asked" and "resolved" paired.
+            audit(run_id, "system", "phase.human_input_resolved", {"phase": phase, "jobId": previous.get("jobId"),
+                                                                     "title": previous.get("title")})
         return
     if awaiting and pending is not None:
         table().update_item(
@@ -176,6 +187,7 @@ def _sync_pending_human_input(run_id: str, phase: str, awaiting: bool, job_id, p
                     "jobId": pending["jobId"],
                     "kind": pending["kind"],
                     "taskId": pending.get("taskId"),
+                    "messageId": pending.get("messageId"),
                     "title": pending["title"],
                     "text": pending["text"],
                     "options": pending["options"],
@@ -192,7 +204,8 @@ def _sync_pending_human_input(run_id: str, phase: str, awaiting: bool, job_id, p
         # AWAITING_HUMAN_INPUT status without question details (C1 allows it): audit the wait itself.
         audit(run_id, "system", "phase.awaiting_human", {"phase": phase, "jobId": job_id, "title": None,
                                                            "text": None, "options": [], "consoleUrl": None})
-    if previous is not None:
+    if previous is not None and not _is_update_only(previous):
+        # An update that was never announced as a question is not "resolved".
         audit(run_id, "system", "phase.human_input_resolved", {"phase": phase, "jobId": previous.get("jobId"),
                                                                  "title": previous.get("title")})
 

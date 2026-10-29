@@ -47,7 +47,7 @@ def _deploy_agent(prompt: str):
 
 
 def _converse_agent(prompt: str):
-    """One Transform-conversation turn: only the answer and escalate tools, no MCP clients."""
+    """One Transform-conversation turn: only the answer, no-reply and escalate tools, no MCP clients."""
     agent = Agent(
         model=BedrockModel(model_id=MODEL_ID, max_tokens=8192),
         system_prompt=CONVERSE_SYSTEM,

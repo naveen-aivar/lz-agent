@@ -46,12 +46,9 @@ WAIT_STAGES = frozenset({"paused", "transform_analyze_waiting"})
 _FOUNDATION_ASSESSMENT = "foundation-assessment.json"
 _IAC_CHANGE_PLAN = "iac-change-plan.json"
 
-# Model turns at transform_merged that may end without both judgment artifacts (including
-# yields without awaiting_hitl=true) before the run fails.
+# Model turns at transform_merged that may end without both judgment artifacts (any yield included)
+# before the run fails.
 MAX_JUDGMENT_ATTEMPTS = 3
-# Model yields with awaiting_hitl=true during judgment before the run fails. Each one costs a
-# full model turn on the next invoke, so they are bounded separately from incomplete attempts.
-MAX_JUDGMENT_HITL_YIELDS = 3
 # Longest conversation-turn error kept on the AGENTQ# item and in the final failure.
 _CONVERSE_ERROR_LIMIT = 1000
 
@@ -439,9 +436,11 @@ def read_deploy_checkpoint() -> str:
 
 
 @tool
-def yield_for_orchestrator(reason: str, awaiting_hitl: bool = False, job_id: str = "") -> str:
-    """Pause the judgment step because AWS Transform has a pending human-input task you cannot answer.
-    Set awaiting_hitl=true in that case. Any other yield counts as a failed judgment attempt."""
+def yield_for_orchestrator(reason: str) -> str:
+    """End this judgment turn early, giving the reason you cannot save both judgment artifacts now.
+
+    The Transform job has finished before judgment, so a yield never waits for anyone, including a person.
+    It counts as one of your at most 3 judgment turns, exactly like ending without both artifacts."""
     _require_deploy_mode()
     cp = read_checkpoint() or {}
     current_stage = cp.get("stage")
@@ -453,19 +452,15 @@ def yield_for_orchestrator(reason: str, awaiting_hitl: bool = False, job_id: str
     _save_checkpoint(
         "paused",
         reason=reason,
-        awaitingHitl=awaiting_hitl,
-        jobId=job_id or None,
+        awaitingHitl=False,
+        jobId=None,
         resumeStage=resume_stage,
         pendingHumanInput=None,
         # Carry the judgment counters so a pause can never reset the attempt bound.
         judgmentAttempts=int(cp.get("judgmentAttempts") or 0),
-        judgmentHitlYields=int(cp.get("judgmentHitlYields") or 0),
     )
-    base.log_tool_event("tool.yield_for_orchestrator", {"reason": reason, "awaitingHitl": awaiting_hitl})
-    return (
-        f"PAUSED: {reason}. Do not call more tools this turn; reply in one sentence. "
-        f"awaitingHitl={awaiting_hitl}"
-    )
+    base.log_tool_event("tool.yield_for_orchestrator", {"reason": reason})
+    return f"PAUSED: {reason}. Do not call more tools this turn; reply in one sentence."
 
 
 @tool
@@ -630,7 +625,6 @@ def _run_judgment(run_model: Callable[[], object], cp: dict) -> dict:
     HITL yield or an incomplete attempt below the bound, or a named error.
     """
     attempts = int(cp.get("judgmentAttempts") or 0)
-    hitl_yields = int(cp.get("judgmentHitlYields") or 0)
     if attempts >= MAX_JUDGMENT_ATTEMPTS:
         # A previous invoke used the last attempt and did not record an outcome (e.g. it died).
         return _named_error(
@@ -640,7 +634,7 @@ def _run_judgment(run_model: Callable[[], object], cp: dict) -> dict:
         )
     attempts += 1
     # Persist before the model runs so a crashed or timed-out turn still counts.
-    _save_checkpoint("transform_merged", judgmentAttempts=attempts, judgmentHitlYields=hitl_yields)
+    _save_checkpoint("transform_merged", judgmentAttempts=attempts)
     base.log_tool_event("deploy.sequencer.step", {"step": "deploy_judgment", "attempt": attempts})
     try:
         run_model()
@@ -648,36 +642,13 @@ def _run_judgment(run_model: Callable[[], object], cp: dict) -> dict:
         return _step_error("deploy_judgment", e)
 
     missing = _judgment_missing()
-    after = read_checkpoint() or {}
     if not missing:
-        _save_checkpoint("judgment_done", judgmentAttempts=attempts, judgmentHitlYields=hitl_yields)
+        _save_checkpoint("judgment_done", judgmentAttempts=attempts)
         base.log_tool_event("tool.deploy_judgment", {"attempts": attempts})
         return _continue(
             "deploy_judgment complete; render and post-deploy discover run on the next invoke",
             read_checkpoint() or {},
         )
-
-    if after.get("stage") == "paused" and after.get("awaitingHitl") is True:
-        hitl_yields += 1
-        if hitl_yields > MAX_JUDGMENT_HITL_YIELDS:
-            return _named_error(
-                "tool.deploy_judgment.failed",
-                f"deploy_judgment failed: model yielded for human input {hitl_yields} times "
-                f"(limit {MAX_JUDGMENT_HITL_YIELDS}) without saving {[k for _, k in missing]}; "
-                f"last reason: {after.get('reason')}",
-            )
-        # An accepted HITL yield is not an incomplete attempt.
-        _save_checkpoint(
-            "paused",
-            reason=after.get("reason"),
-            awaitingHitl=True,
-            jobId=after.get("jobId"),
-            resumeStage="transform_merged",
-            pendingHumanInput=None,
-            judgmentAttempts=attempts - 1,
-            judgmentHitlYields=hitl_yields,
-        )
-        return _continue_from(read_checkpoint() or {})
 
     step, key = missing[0]
     if attempts >= MAX_JUDGMENT_ATTEMPTS:
@@ -686,8 +657,8 @@ def _run_judgment(run_model: Callable[[], object], cp: dict) -> dict:
             f"deploy_judgment failed: judgment step {step} incomplete after {attempts} model turns "
             f"(limit {MAX_JUDGMENT_ATTEMPTS}): missing {key}",
         )
-    # Plain return or a yield without awaiting_hitl: counted; retry on the next invoke.
-    _save_checkpoint("transform_merged", judgmentAttempts=attempts, judgmentHitlYields=hitl_yields)
+    # A plain return or a yield: counted like any other turn; retry on the next invoke.
+    _save_checkpoint("transform_merged", judgmentAttempts=attempts)
     return _continue(
         f"deploy_judgment attempt {attempts}/{MAX_JUDGMENT_ATTEMPTS} incomplete: {step} missing {key}",
         read_checkpoint() or {},
@@ -767,10 +738,13 @@ def _handle_connector_task(cp: dict, pending: dict, qkey: str, item: dict) -> di
     if status == "ACTIVE":
         # Read what Transform said last BEFORE submitting: that message predates the task. Reading it after the
         # submit could pick up a new question Transform asks in reply, and mark it handled by mistake.
-        before_submit = transform_ops.newest_system_message_id(job_id, ws)
         resuming = item.get("status") == "submitting"  # an earlier invoke marked it and may have submitted
+        # On resume the earlier invoke may already have submitted, so a fresh read could return Transform's next
+        # question: reuse the read made before that submit.
+        before_submit = item.get("beforeSubmitMessageId") if resuming else transform_ops.newest_system_message_id(job_id, ws)
         item = conv.put_question(
-            qkey, **{**{k: v for k, v in item.items() if k not in ("PK", "SK", "updatedAt")}, "status": "submitting"})
+            qkey, **{**{k: v for k, v in item.items() if k not in ("PK", "SK", "updatedAt")}, "status": "submitting",
+                     "beforeSubmitMessageId": before_submit})
         try:
             out = transform_ops.submit_connector_task(
                 job_id=job_id, task_id=task_id, connector_id=connector_id,
@@ -824,6 +798,14 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
         handled = _handle_connector_task(cp, pending, qkey, item)
         if handled is not None:
             return handled
+    if status == "informational" and pending.get("jobAwaitingInput"):
+        # The agent judged this message progress-only, but the job now reports AWAITING_HUMAN_INPUT on it:
+        # it is a real question after all. Re-open it (no_reply_needed is refused while the job waits).
+        item = conv.put_question(qkey, status="deciding", turns=int(item.get("turns") or 0), kind=pending["kind"],
+                                 title=pending.get("title"),
+                                 lastError="you judged this message progress-only, but Transform now waits for a reply to it")
+        base.log_tool_event("transform.informational_reopened", {"question": qkey, "jobId": pending.get("jobId")})
+        status = "deciding"
     if status == "informational":
         return _clear_pending(cp, pending, item)
     if status == "escalated":

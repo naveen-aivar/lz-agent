@@ -210,8 +210,12 @@ class OptionsAndReplies(_Case):
         msgs = [message("m1", "SYSTEM", 1, "Q?"), message("m2", "USER", 5, "yes"), message("m3", "SYSTEM", 6, "ok")]
         self.install(FakeTransform(messages=msgs))
         t5 = msgs[1]["createdAt"].timestamp()
-        self.assertEqual(transform_ops.user_reply_since(JOB, int(t5), WS), "m2")
-        self.assertIsNone(transform_ops.user_reply_since(JOB, int(t5) + 1, WS))
+        t1 = msgs[0]["createdAt"].timestamp()
+        # Strictly newer than the question's own Transform timestamp (integer milliseconds).
+        self.assertEqual(transform_ops.user_reply_since(JOB, int(t1 * 1000), WS), "m2")
+        self.assertIsNone(transform_ops.user_reply_since(JOB, int(t5 * 1000), WS))
+        self.assertEqual(transform_ops.user_reply_since(JOB, int(t5 * 1000) - 1, WS), "m2")
+        self.assertIsNone(transform_ops.user_reply_since(JOB, int(t5 * 1000) + 1, WS))
 
 
 if __name__ == "__main__":

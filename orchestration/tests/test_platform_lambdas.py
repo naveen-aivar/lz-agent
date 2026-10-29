@@ -49,13 +49,17 @@ class FakeTable:
 
     def put_item(self, Item, ConditionExpression=None, ExpressionAttributeNames=None, ExpressionAttributeValues=None):
         if ConditionExpression is not None:
-            # Only the /answer reservation condition is modelled (lzcore.transform_answers.RESERVATION_CONDITION).
-            from lzcore.transform_answers import RESERVATION_CONDITION
-            assert ConditionExpression == RESERVATION_CONDITION, ConditionExpression
+            # Only the answer reservation and recovery conditions are modelled (lzcore.transform_answers).
+            from lzcore.transform_answers import RECOVERY_CONDITION, RESERVATION_CONDITION
             current = self.items.get((Item["PK"], Item["SK"]))
             v = ExpressionAttributeValues
-            free = (current is None or current.get("status") == v[":failed"]
-                    or (current.get("status") == v[":sending"] and int(current.get("leaseUntil") or 0) < v[":now"]))
+            if ConditionExpression == RECOVERY_CONDITION:
+                free = (current is not None and current.get("status") == v[":sending"]
+                        and current.get("idempotencyToken") == v[":tok"] and current.get("leaseUntil") == v[":lease"])
+            else:
+                assert ConditionExpression == RESERVATION_CONDITION, ConditionExpression
+                free = (current is None or current.get("status") == v[":failed"]
+                        or (current.get("status") == v[":sending"] and int(current.get("leaseUntil") or 0) < v[":now"]))
             if not free:
                 raise ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": "x"}}, "PutItem")
         self.items[(Item["PK"], Item["SK"])] = copy.deepcopy(Item)
@@ -469,6 +473,55 @@ class AnswerTests(_Base):
         self.assertEqual(self.sent, [])
 
 
+class AnswerRecoveryTests(AnswerTests):
+    """v26: takeover of an abandoned reservation, anchored on the question's own Transform timestamp."""
+
+    def _stale(self, by):
+        self.table.items[(f"RUN#{self.RUN}", "ANSWER#m-2")] = {
+            "PK": f"RUN#{self.RUN}", "SK": "ANSWER#m-2", "status": "sending", "by": by, "option": "Proceed",
+            "text": None, "at": 1, "jobId": "job-1", "messageId": "m-2", "idempotencyToken": "tok-old", "leaseUntil": 2}
+
+    def _with_created(self, value):
+        from decimal import Decimal  # noqa: F401 - DynamoDB returns numbers as Decimal
+        self.table.meta(self.RUN)["pendingHumanInput"] = {**question(), "createdAtMs": value}
+
+    def test_someone_elses_recovered_reply_is_409_and_nothing_is_sent(self):
+        from decimal import Decimal
+        self._with_created(Decimal("1793248000123"))
+        self._stale(by="agent")
+        seen = []
+        with mock.patch("lzcore.transform_ops.user_reply_since",
+                        lambda job, since, ws=None: (seen.append(since), "user-msg-9")[1]):
+            code, out = self.answer()
+        self.assertEqual(code, 409, out)
+        self.assertIn("already reached AWS Transform", out["error"])
+        self.assertEqual(self.sent, [])
+        self.assertEqual(seen, [1793248000123])
+        lock = self.table.items[(f"RUN#{self.RUN}", "ANSWER#m-2")]
+        self.assertEqual((lock["status"], lock["by"], lock["recovered"]), ("sent", "agent", True))
+
+    def test_takeover_without_a_question_timestamp_is_502_and_released(self):
+        self._stale(by="agent")
+        code, out = self.answer()
+        self.assertEqual(code, 502)
+        self.assertIn("createdAtMs", out["error"])
+        self.assertEqual(self.table.items[(f"RUN#{self.RUN}", "ANSWER#m-2")]["status"], "failed")
+        self.assertEqual(self.sent, [])
+
+    def test_record_failure_after_the_send_is_500_and_audited(self):
+        from lzcore.transform_answers import AnswerRecordFailed
+
+        def boom(**kw):
+            raise AnswerRecordFailed("m-2", "m-sent", RuntimeError("DynamoDB down"))
+
+        with mock.patch("lzcore.transform_answers.send_answer", boom):
+            code, out = self.answer()
+        self.assertEqual(code, 500)
+        self.assertIn("Do not answer again", out["error"])
+        (row,) = self.table.audit(self.RUN, "transform.answer_record_failed")
+        self.assertEqual(json.loads(row["detail"])["sentMessageId"], "m-sent")
+
+
 # ---------------------------------------------------------------- phase_invoke
 class PhaseInvokeTests(_Base):
     RUN = "e" * 32
@@ -524,6 +577,31 @@ class PhaseInvokeTests(_Base):
         self.assertEqual(self.table.audit(self.RUN, "phase.awaiting_human"), [])
         with self.assertRaisesRegex(RuntimeError, "agentNote must be"):
             self.invoke([cont(False, {**update, "agentNote": {**note, "informational": "yes"}})])
+
+    def _update(self, mid="m-9"):
+        note = {"reason": "Progress only.", "suggestion": None, "informational": True}
+        return {**pending(), "kind": "message", "taskId": None, "messageId": mid, "options": [], "agentNote": note}
+
+    def test_question_then_update_on_it_pairs_asked_with_resolved(self):
+        asked = {**pending(), "kind": "message", "taskId": None, "messageId": "m-9", "options": []}
+        self.invoke([cont(True, asked)])
+        self.invoke([cont(False, self._update())])
+        self.assertEqual(len(self.table.audit(self.RUN, "phase.awaiting_human")), 1)
+        self.assertEqual(len(self.table.audit(self.RUN, "phase.human_input_resolved")), 1)
+        detail = json.loads(self.table.audit(self.RUN, "phase.awaiting_human")[0]["detail"])
+        self.assertEqual(detail["messageId"], "m-9")
+
+    def test_an_update_that_goes_away_is_never_resolved(self):
+        self.invoke([cont(False, self._update())])
+        self.invoke([cont(False, self._update("m-10"))])
+        self.invoke([cont(False)])
+        self.assertEqual(self.table.audit(self.RUN, "phase.awaiting_human"), [])
+        self.assertEqual(self.table.audit(self.RUN, "phase.human_input_resolved"), [])
+
+    def test_question_timestamp_must_be_integer_milliseconds(self):
+        self.invoke([cont(True, {**pending(), "createdAtMs": 1793248000123})])
+        with self.assertRaisesRegex(RuntimeError, "createdAtMs must be an integer"):
+            self.invoke([cont(True, {**pending(), "createdAtMs": 1793248000.5})])
 
     def test_agent_note_link_must_be_an_aws_console_url(self):
         ok = {"reason": "Approve it.", "suggestion": None,

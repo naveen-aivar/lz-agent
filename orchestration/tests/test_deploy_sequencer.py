@@ -158,7 +158,7 @@ from lzcore import deploy_transform  # noqa: E402
 from lzcore import transform_credentials as tcred  # noqa: E402
 from lzcore import transform_ops as real_transform_ops  # noqa: E402
 from lzcore.deploy_artifacts import deployment_artifact_keys  # noqa: E402
-from lzcore.transform_answers import RESERVATION_CONDITION  # noqa: E402
+from lzcore.transform_answers import RECOVERY_CONDITION, RESERVATION_CONDITION  # noqa: E402
 from lzcore.iac_plan import PLAN_TYPE  # noqa: E402
 
 assert tools is sys.modules["tools"], "test must patch the same tools module app imports"
@@ -265,7 +265,7 @@ class FakeTable:
     """Serves one deploy META item (also returned for the design run META); records audit rows.
     Evaluates the sequencer's `#s = :running` condition like DynamoDB would."""
 
-    # The answer reservation condition (lzcore.transform_answers) is the only put condition modelled.
+    # The answer reservation and recovery conditions (lzcore.transform_answers) are the put conditions modelled.
     _ANSWER_CONDITION = RESERVATION_CONDITION
 
     def __init__(self, meta: dict):
@@ -287,12 +287,16 @@ class FakeTable:
             return {}
         key = (Item["PK"], sk)
         if ConditionExpression is not None:
-            if ConditionExpression != self._ANSWER_CONDITION:
-                raise AssertionError(f"FakeTable: unscripted put condition {ConditionExpression!r}")
             current = self.items.get(key)
             v = ExpressionAttributeValues
-            free = (current is None or current.get("status") == v[":failed"]
-                    or (current.get("status") == v[":sending"] and int(current.get("leaseUntil") or 0) < v[":now"]))
+            if ConditionExpression == RECOVERY_CONDITION:
+                free = (current is not None and current.get("status") == v[":sending"]
+                        and current.get("idempotencyToken") == v[":tok"] and current.get("leaseUntil") == v[":lease"])
+            elif ConditionExpression == self._ANSWER_CONDITION:
+                free = (current is None or current.get("status") == v[":failed"]
+                        or (current.get("status") == v[":sending"] and int(current.get("leaseUntil") or 0) < v[":now"]))
+            else:
+                raise AssertionError(f"FakeTable: unscripted put condition {ConditionExpression!r}")
             if not free:
                 from botocore.exceptions import ClientError
 
@@ -414,8 +418,13 @@ class FakeTransformOps:
     def transform_region(self):
         return "ap-south-1"
 
-    def user_reply_since(self, job_id, since, workspace=None):
-        return None
+    reply_since = None  # the USER message id user_reply_since reports, or an exception to raise
+
+    def user_reply_since(self, job_id, since_ms, workspace=None):
+        self.reply_checks = getattr(self, "reply_checks", []) + [since_ms]
+        if isinstance(self.reply_since, Exception):
+            raise self.reply_since
+        return self.reply_since
 
     def recent_conversation(self, job_id, workspace=None, limit=12):
         return [{"messageId": "m-0", "origin": "SYSTEM", "createdAt": "1", "text": "Welcome", "options": []}]
@@ -1048,45 +1057,45 @@ class CaseF_JudgmentBounded(_SequencerCaseBase):
         self._assert_error(self._invoke(), "deploy_judgment failed")
         self.assertEqual(model.calls, 3)
 
-    def test_non_hitl_yield_counts_as_an_attempt(self):
+    def test_yield_counts_as_an_attempt_and_never_waits_for_a_person(self):
         self._env()
-        self._set_model([lambda: dwt.yield_for_orchestrator("thinking", awaiting_hitl=False)])
+        self._set_model([lambda: dwt.yield_for_orchestrator("thinking")])
 
         result = self._invoke()
 
         self._assert_continue(result, awaiting=False)
         self.assertEqual(self._stage(), "transform_merged")
-        self.assertEqual(self._checkpoint()["judgmentAttempts"], 1)
+        cp = self._checkpoint()
+        self.assertEqual(cp["judgmentAttempts"], 1)
+        self.assertNotIn("judgmentHitlYields", cp)
 
-    def test_hitl_yield_continues_without_using_an_attempt_and_is_bounded(self):
+    def test_repeated_yields_hit_the_attempt_limit(self):
         self._env()
-        model = self._set_model([lambda: dwt.yield_for_orchestrator("Transform asks a question", awaiting_hitl=True)])
+        model = self._set_model([lambda: dwt.yield_for_orchestrator("Transform asks a question")])
 
-        for n in (1, 2, 3):
-            result = self._invoke()
-            self._assert_continue(result, awaiting=True)
-            cp = self._checkpoint()
-            self.assertEqual(cp["stage"], "paused")
-            self.assertEqual(cp["resumeStage"], "transform_merged")
-            self.assertEqual((cp["judgmentAttempts"], cp["judgmentHitlYields"]), (0, n))
-        result = self._invoke()
+        for attempt in (1, 2):
+            self._assert_continue(self._invoke(), awaiting=False)
+            self.assertEqual(self._checkpoint()["judgmentAttempts"], attempt)
+        self._assert_error(self._invoke(), "deploy_judgment failed", "after 3 model turns")
+        self.assertEqual(model.calls, 3)
 
-        self._assert_error(result, "deploy_judgment failed", "yielded for human input 4 times")
-        self.assertEqual(model.calls, 4)
-
-    def test_hitl_yield_then_completion_resumes_from_paused(self):
+    def test_yield_then_completion_finishes_judgment(self):
         self._env()
         turns = iter([
-            lambda: dwt.yield_for_orchestrator("waiting on Transform", awaiting_hitl=True),
+            lambda: dwt.yield_for_orchestrator("waiting on Transform"),
             lambda: self.s3.put_json(PLAN_KEY, _valid_plan()),
         ])
         self._set_model([lambda: next(turns)()])
 
-        self._assert_continue(self._invoke(), awaiting=True)
+        self._assert_continue(self._invoke(), awaiting=False)
         result = self._invoke()
 
         self._assert_continue(result)
         self.assertEqual(self._stage(), "judgment_done")
+
+    def test_yield_tool_has_no_awaiting_hitl_parameter(self):
+        import inspect
+        self.assertNotIn("awaiting_hitl", inspect.signature(dwt.yield_for_orchestrator).parameters)
 
     def test_model_exception_is_named_and_audited(self):
         self._env()
@@ -1845,7 +1854,7 @@ class ApprovalGate(_SequencerCaseBase):
         p = mock.patch.object(conv, "send_answer", sent_then_failed)
         p.start()
         self.addCleanup(p.stop)
-        self._set_converse(_answer(expect="never"))
+        self._set_converse(_answer(expect="SENT to AWS Transform, but recording it failed"))
 
         result = self._invoke()
 
@@ -1853,7 +1862,9 @@ class ApprovalGate(_SequencerCaseBase):
         self.assertEqual(self.table.meta["agentAnswerCount"], 1)  # not given back: the reply is out
         self.assertEqual(self.table.item("AGENTQ#message:msg-0001")["status"], "answered")
         self.assertEqual(result["status"], "continue")  # the recorded decision stands
-        self.assertIn("transform.agent_turn_error_after_decision", self.table.actions())
+        (row,) = self.table.audit_of("transform.answer_record_failed")
+        self.assertEqual(json.loads(row["detail"])["sentMessageId"], "sent-1")
+        self.assertNotIn("transform.agent_turn_error_after_decision", self.table.actions())
         del real_send
 
     def test_failed_send_gives_the_answer_slot_back(self):
@@ -1989,3 +2000,188 @@ _REAL_CONVERSE_AGENT = app._converse_agent
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------------------
+# v26: fixes from the v25 agent-side review
+# --------------------------------------------------------------------------------------
+class V26ReviewFixes(_SequencerCaseBase):
+    ASKED = {**MESSAGE, "createdAtMs": 1_793_248_000_000}
+
+    def _env(self, script, **ops):
+        self._make_env(transform_ops=FakeTransformOps(poll_script=script, **ops),
+                       meta_extra={"transformAnalyzeJobId": ANALYZE_JOB,
+                                   "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}})
+        self._seed_foundation()
+        self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
+
+    def _q(self, qkey="message:msg-0001"):
+        return self.table.item(f"AGENTQ#{qkey}")
+
+    def test_informational_message_is_reopened_when_the_job_starts_waiting_on_it(self):
+        progress = {**MESSAGE, "messageId": "msg-p", "text": "Working on it...", "options": [], "choices": []}
+        self._env([("EXECUTING", {**progress, "jobAwaitingInput": False}),
+                   ("EXECUTING", {**progress, "jobAwaitingInput": True})])
+        prompts = self._set_converse(_no_reply(), _escalate("Transform is waiting on a reply.", "Yes"))
+
+        self._invoke()
+        self.assertEqual(self._q("message:msg-p")["status"], "informational")
+        result = self._invoke()
+
+        self.assertEqual(self._q("message:msg-p")["status"], "escalated")
+        self.assertIs(result["awaitingHitl"], True)
+        self.assertIn("transform.informational_reopened", self.table.actions())
+        self.assertIn("progress-only", prompts[1])  # the second turn is told why it is asked again
+
+    def test_option_with_an_empty_or_missing_value_is_refused(self):
+        for value in ("", None):
+            with self.subTest(value=value):
+                self._env([("EXECUTING", {**MESSAGE, "choices": [{"label": "Landing Zone", "value": value}],
+                                          "options": ["Landing Zone"]})])
+                self._set_converse(lambda prompt: (_answer(expect="REFUSED")(prompt), _escalate("No value.")(prompt)))
+                self._invoke()
+                self.assertEqual(self.fake_ops.answers, [])
+
+    def test_a_full_length_suggestion_is_accepted_and_a_longer_one_refused(self):
+        self._env([("EXECUTING", MESSAGE)])
+        long_ok = "x" * conv.SUGGESTION_LIMIT
+        self._set_converse(lambda prompt: (
+            self.assertTrue(conv.escalate_to_human("r", long_ok + "y").startswith("REFUSED")),
+            _escalate("Needs the structure typed in.", long_ok)(prompt)))
+
+        result = self._invoke()
+
+        self.assertEqual(len(result["pendingHumanInput"]["agentNote"]["suggestion"]), conv.SUGGESTION_LIMIT)
+        self.assertGreater(conv.SUGGESTION_LIMIT, 1000)
+
+    def _stale_reservation(self, by):
+        self.table.items[(f"RUN#{DEPLOY_RUN}", "ANSWER#msg-0001")] = {
+            "PK": f"RUN#{DEPLOY_RUN}", "SK": "ANSWER#msg-0001", "status": "sending", "by": by, "option": None,
+            "text": "Custom: two OUs", "at": 1, "jobId": ANALYZE_JOB, "messageId": "msg-0001",
+            "idempotencyToken": "tok-old", "leaseUntil": 2}
+
+    def test_a_recovered_reply_from_someone_else_supersedes_the_agent_and_gives_the_slot_back(self):
+        self._env([("EXECUTING", self.ASKED)])
+        self._stale_reservation(by="user-sub-1")
+        self.fake_ops.reply_since = "user-msg-5"
+        self._set_converse(_answer(expect="REFUSED: an earlier reply"))
+
+        self._invoke()
+
+        self.assertEqual(self.fake_ops.answers, [])
+        self.assertEqual(self.fake_ops.reply_checks, [self.ASKED["createdAtMs"]])
+        self.assertEqual(self._q()["status"], "superseded")
+        self.assertEqual(self.table.meta.get("agentAnswerCount", 0), 0)
+        lock = self.table.item("ANSWER#msg-0001")
+        self.assertEqual((lock["status"], lock["by"], lock["text"], lock["recovered"]),
+                         ("sent", "user-sub-1", "Custom: two OUs", True))
+
+    def test_takeover_without_a_question_timestamp_fails_the_turn_and_releases_everything(self):
+        self._env([("EXECUTING", MESSAGE)])  # recorded by an older release: no createdAtMs
+        self._stale_reservation(by="agent")
+        self._set_converse(_answer(expect="never"))
+
+        self._invoke()
+
+        self.assertEqual(self.fake_ops.answers, [])
+        self.assertIn("createdAtMs", self._q()["lastError"])
+        self.assertEqual(self.table.item("ANSWER#msg-0001")["status"], "failed")
+        self.assertEqual(self.table.meta.get("agentAnswerCount", 0), 0)
+
+    def test_unknown_send_outcome_with_the_reply_in_transform_is_recorded_as_sent(self):
+        from lzcore.transform_answers import SendOutcomeUnknown
+
+        self._env([("EXECUTING", self.ASKED)], answer_error=SendOutcomeUnknown("read timeout"))
+        self.fake_ops.reply_since = "user-msg-7"
+        self._set_converse(_answer())
+
+        self._invoke()
+
+        self.assertEqual(self._q()["status"], "answered")
+        lock = self.table.item("ANSWER#msg-0001")
+        self.assertEqual((lock["status"], lock["sentMessageId"]), ("sent", "user-msg-7"))
+        (row,) = self.table.audit_of("transform.answer_sent")
+        self.assertIn("read timeout", json.loads(row["detail"])["confirmedAfterError"])
+        self.assertEqual(self.table.meta["agentAnswerCount"], 1)
+
+    def test_unknown_send_outcome_without_a_reply_is_a_failed_turn(self):
+        from lzcore.transform_answers import SendOutcomeUnknown
+
+        self._env([("EXECUTING", self.ASKED)], answer_error=SendOutcomeUnknown("connection closed"))
+        self._set_converse(_answer(expect="never"))
+
+        self._invoke()
+
+        self.assertEqual(self._q()["status"], "deciding")
+        self.assertEqual(self.table.item("ANSWER#msg-0001")["status"], "failed")
+        self.assertEqual(self.table.meta.get("agentAnswerCount", 0), 0)
+
+    def test_answer_record_failure_through_a_real_strands_agent_returns_and_is_audited(self):
+        from strands import Agent
+        from strands.models.model import Model
+
+        class NoModel(Model):
+            def update_config(self, **kw):
+                pass
+
+            def get_config(self):
+                return {}
+
+            async def structured_output(self, *a, **k):
+                raise AssertionError("no model in this test")
+                yield  # pragma: no cover
+
+            async def stream(self, *a, **k):
+                raise AssertionError("no model in this test")
+                yield  # pragma: no cover
+
+        self._env([("EXECUTING", MESSAGE)])
+
+        def sent_then_failed(**kw):
+            kw["send"](job_id=kw["pending"]["jobId"], message_id=kw["pending"]["messageId"],
+                       idempotency_token="t", option=kw["option"], text=None)
+            raise conv.AnswerRecordFailed(kw["pending"]["messageId"], "sent-1", RuntimeError("DynamoDB down"))
+
+        p = mock.patch.object(conv, "send_answer", sent_then_failed)
+        p.start()
+        self.addCleanup(p.stop)
+        results = []
+
+        def turn(prompt):
+            agent = Agent(model=NoModel(), tools=conv.converse_tools(), callback_handler=None)
+            results.append(agent.tool.answer_transform_question(
+                category="workflow", rationale="Landing zone run.", basis=["context:runPurpose"],
+                option="Landing Zone", record_direct_tool_call=False))
+
+        self._set_converse(turn)
+
+        self._invoke()
+
+        (out,) = results
+        self.assertEqual(out["status"], "success", out)
+        self.assertIn("recording it failed", out["content"][0]["text"])
+        self.assertIn("transform.answer_record_failed", self.table.actions())
+        self.assertEqual(self._q()["status"], "answered")
+        self.assertEqual(self.table.meta["agentAnswerCount"], 1)
+
+
+class V26ConnectorResume(_SequencerCaseBase):
+    def test_resume_reuses_the_message_read_before_the_earlier_submit(self):
+        self._make_env(transform_ops=FakeTransformOps(poll_script=[("EXECUTING", PENDING)],
+                                                      connector_request=ConnectorTask.REQUEST,
+                                                      connector_states=["ACTIVE"]),
+                       meta_extra={"transformAnalyzeJobId": ANALYZE_JOB,
+                                   "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}})
+        self.table.items[(f"RUN#{DEPLOY_RUN}", "AGENTQ#task:task-0001")] = {
+            "PK": f"RUN#{DEPLOY_RUN}", "SK": "AGENTQ#task:task-0001", "status": "submitting", "kind": "task",
+            "connectorId": "conn-1", "account": TARGET_ACCOUNT, "region": "eu-west-1",
+            "beforeSubmitMessageId": "msg-before"}
+        # A fresh read now would return Transform's NEXT question, which must not be marked handled.
+        self.fake_ops.stale_message_id = "msg-next-question"
+        self.fake_ops.submit_error = real_transform_ops.QuestionChanged("task is closed")
+
+        self._invoke()
+
+        self.assertEqual(self.table.item("AGENTQ#message:msg-before")["status"], "superseded")
+        self.assertIsNone(self.table.item("AGENTQ#message:msg-next-question"))
+        self.assertEqual(self.table.item("AGENTQ#task:task-0001")["status"], "answered")

@@ -361,11 +361,24 @@ def _send_transform_answer(**kwargs) -> dict:
     return transform_ops.answer_message(**kwargs)
 
 
-def _find_transform_reply(*, job_id: str, since: int):
-    """Seam for tests. Imported lazily: only this route loads the Transform library."""
+def _find_transform_reply(*, pending: dict):
+    """Seam for tests. Imported lazily: only this route loads the Transform library.
+
+    A USER message newer than the pending question (its own Transform createdAtMs) is a reply to it.
+    DynamoDB returns the number as a Decimal; only an integral value is accepted."""
+    from decimal import Decimal
+
     from lzcore import transform_ops
 
-    return transform_ops.user_reply_since(job_id, since)
+    since = pending.get("createdAtMs")
+    if isinstance(since, Decimal) and since == since.to_integral_value():
+        since = int(since)
+    if isinstance(since, bool) or not isinstance(since, int):
+        raise RuntimeError(
+            f"pending Transform question {pending.get('messageId')} has no integer createdAtMs (got {since!r}); "
+            "wait for the next poll"
+        )
+    return transform_ops.user_reply_since(pending["jobId"], since, pending.get("workspaceId"))
 
 
 def _answer(run_id, sub, event, invoked_by):
@@ -425,9 +438,12 @@ def _answer(run_id, sub, event, invoked_by):
             by=sub,
             at=now(),
             send=_send_transform_answer,
-            find_reply=lambda since: _find_transform_reply(job_id=pending["jobId"], since=since),
+            find_reply=lambda: _find_transform_reply(pending=pending),
         )
     except AnswerRecordFailed as e:
+        audit(run_id, sub, "transform.answer_record_failed",
+              {"jobId": pending["jobId"], "messageId": pending["messageId"], "sentMessageId": e.sent_message_id,
+               "error": str(e.cause)[:500]})
         return _resp(500, {"error": f"{e}. Do not answer again; check the run's activity."})
     except AnswerExists:
         return _resp(409, {"error": "this question already has an answer"})
@@ -437,6 +453,10 @@ def _answer(run_id, sub, event, invoked_by):
         return _resp(502, {"error": str(e)})
     except Exception as e:  # noqa: BLE001 - recorded and released by send_answer, returned here
         return _resp(502, {"error": f"sending the answer to AWS Transform failed: {type(e).__name__}: {str(e)[:300]}"})
+    if sent_answer.get("recovered") and sent_answer.get("by") != sub:
+        # An earlier reply (another person or the deploy agent) had already reached Transform; this one was not sent.
+        return _resp(409, {"error": "an earlier reply to this question had already reached AWS Transform; "
+                                    "yours was not sent", "pendingAnswer": sent_answer})
     return _resp(200, {"pendingAnswer": sent_answer})
 
 

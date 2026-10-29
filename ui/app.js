@@ -435,6 +435,9 @@ function deployContinueNotice(audit, run) {
 // META.pendingHumanInput (phase_invoke) mirrors the question an AWS Transform job is waiting on.
 // Everything from Transform is untrusted text: md() escapes it, and only https console URLs are linked.
 // Message questions can be answered here (POST /runs/{id}/answer, approver group); tasks need Transform's own form.
+// Index of the offered option the suggestion names (same label, ignoring case and outer spaces), or -1.
+const suggestedOptionIndex = (p, sug) => (Array.isArray(p.options) ? p.options : [])
+  .findIndex((o) => typeof o === "string" && o.trim().toLowerCase() === String(sug || "").trim().toLowerCase());
 const isUpdateOnly = (p) => !!(p && p.agentNote && p.agentNote.informational === true);
 const questionKey = (p) => (p ? `${p.jobId}:${p.messageId || p.taskId || p.title}` : "");
 function answerState(p) {
@@ -443,7 +446,13 @@ function answerState(p) {
   return S.answer;
 }
 function askedAt(audit, p) {
-  const row = [...audit].reverse().find((a) => a.action === "phase.awaiting_human" && parseAuditDetail(a).jobId === p.jobId);
+  // Match the exact message or task when the audit row names it (newer rows do); else the job.
+  const row = [...audit].reverse().find((a) => {
+    if (a.action !== "phase.awaiting_human") return false;
+    const d = parseAuditDetail(a);
+    if (d.jobId !== p.jobId) return false;
+    return d.messageId || d.taskId ? (d.messageId || d.taskId) === (p.messageId || p.taskId) : true;
+  });
   return row ? row.ts : null;
 }
 function humanInputBanner(run, audit = []) {
@@ -500,10 +509,16 @@ function humanInputBanner(run, audit = []) {
   }
   return `<section class="hitl" role="region" aria-labelledby="hitl-heading">
     <div class="hitl-head"><span class="pulse" aria-hidden="true"></span><h2 id="hitl-heading">${answered ? "Answer sent to AWS Transform" : isUpdateOnly(p) ? "Update from AWS Transform" : "AWS Transform needs your input"}</h2>
-      ${asked ? `<span class="hint" style="margin:0">asked ${esc(ago(asked))}</span>` : ""}<span class="hitl-link">${openLink}</span></div>
+      ${asked && !isUpdateOnly(p) ? `<span class="hint" style="margin:0">asked ${esc(ago(asked))}</span>` : ""}<span class="hitl-link">${openLink}</span></div>
     ${p.title && p.kind === "task" ? `<p style="margin:0 0 8px"><strong>${esc(p.title)}</strong></p>` : ""}
-    ${question}${note && !answered ? `<div class="agent-note" role="note"><strong>${isUpdateOnly(p) ? "Deploy agent (no reply needed):" : "Deploy agent:"}</strong> ${esc(note.reason)}${note.suggestion ? `<div class="hint">Suggested: ${esc(note.suggestion)}</div>` : ""}${note.suggestion && p.kind === "message" && p.messageId && canAnswerTransform() && !answered ? `<div style="margin-top:8px"><button class="btn btn-sm" type="button" data-answer-use-suggestion>Use this as my reply</button> <span class="hint">You can edit it before sending.</span></div>` : ""}${typeof note.link === "string" && /^https:\/\/[a-z0-9-]+\.console\.aws\.amazon\.com\//.test(note.link) ? `<div style="margin-top:8px"><a class="btn btn-sm btn-primary" href="${esc(note.link)}" target="_blank" rel="noopener noreferrer">Approve in the AWS console ↗<span class="sr-only"> (opens in a new tab)</span></a></div>` : ""}</div>` : ""}${action}
-    <p class="hint" style="margin-top:12px">Transform job <code>${esc(p.jobId || "")}</code>. The deploy resumes on its own once Transform has your answer. It fails if no answer arrives within about 24 hours.</p></section>`;
+    ${question}${note && !answered ? `<div class="agent-note" role="note"><strong>${isUpdateOnly(p) ? "Deploy agent (no reply needed):" : "Deploy agent:"}</strong> ${esc(note.reason)}${note.suggestion ? `<div class="hint">Suggested: ${esc(note.suggestion)}</div>` : ""}${note.suggestion && p.kind === "message" && p.messageId && canAnswerTransform() && !answered
+      ? (suggestedOptionIndex(p, note.suggestion) >= 0
+        ? `<div style="margin-top:8px"><button class="btn btn-sm" type="button" data-answer-use-suggestion>Select this option</button> <span class="hint">You confirm before it is sent.</span></div>`
+        : `<div style="margin-top:8px"><button class="btn btn-sm" type="button" data-answer-use-suggestion>Use this as my reply</button> <span class="hint">You can edit it before sending.</span></div>`)
+      : ""}${typeof note.link === "string" && /^https:\/\/[a-z0-9-]+\.console\.aws\.amazon\.com\//.test(note.link) ? `<div style="margin-top:8px"><a class="btn btn-sm btn-primary" href="${esc(note.link)}" target="_blank" rel="noopener noreferrer">Approve in the AWS console ↗<span class="sr-only"> (opens in a new tab)</span></a></div>` : ""}</div>` : ""}${action}
+    <p class="hint" style="margin-top:12px">Transform job <code>${esc(p.jobId || "")}</code>. ${isUpdateOnly(p)
+      ? "Transform is still working; the deploy continues on its own. Reply only if this message actually asks you something."
+      : "The deploy resumes on its own once Transform has your answer. It fails if no answer arrives within about 24 hours."}</p></section>`;
 }
 
 async function sendAnswer(payload) {
@@ -944,6 +959,8 @@ function onView(e) {
   if (e.target.closest("[data-answer-use-suggestion]")) {
     const p = S.data && S.data.run && S.data.run.pendingHumanInput;
     const sug = p && p.agentNote && typeof p.agentNote.suggestion === "string" ? p.agentNote.suggestion : "";
+    const k = p ? suggestedOptionIndex(p, sug) : -1;
+    if (k >= 0) { S.answer.selected = p.options[k]; S.answer.reply = false; renderRun(); return; }  // the option, not typed text
     if (sug) { S.answer.draft = sug.slice(0, 4000); S.answer.reply = true; S.answer.selected = null; renderRun(); const t = $("answer-text"); if (t) t.focus(); }
     return;
   }
