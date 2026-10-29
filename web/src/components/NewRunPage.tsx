@@ -43,8 +43,8 @@ export function NewRunPage({ api, onStarted }: { api: Pick<Client, "createRun" |
   }
   return (
     <>
-      <h1 className="page-title">New design run</h1>
-      <p className="page-sub">Upload the customer's statement of work. The agent reads it, designs the landing zone, generates Terraform and CloudFormation, and validates both.</p>
+      <h1 className="page-title">New project</h1>
+      <p className="page-sub">Upload the customer's statement of work. The agent reads it, designs the landing zone, and generates and checks the Terraform and CloudFormation. Then you review the design and deploy it, all from one page.</p>
       <form className="panel panel-pad form" onSubmit={(e) => { e.preventDefault(); void submit(); }} noValidate>
         <label>Customer name
           <input value={customer} onChange={(e) => setCustomer(e.target.value)} placeholder="Moon Trades" autoFocus aria-describedby="cust-hint" />

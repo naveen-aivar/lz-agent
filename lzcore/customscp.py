@@ -21,6 +21,44 @@ def policy_text(policy):
     return json.dumps(policy, separators=(",", ":"), sort_keys=True)
 
 
+VALUE_MAX = 200
+
+
+def value_error(name, value):
+    """Why a value for input `name` cannot be put into a policy, or None. Values become JSON string content."""
+    if not isinstance(value, str):
+        return f"the value for {name} must be text"
+    if len(value) > VALUE_MAX:
+        return f"the value for {name} is longer than {VALUE_MAX} characters"
+    if "{{" in value or "}}" in value:
+        return f"the value for {name} must not contain {{{{ or }}}}"
+    if any(ord(c) < 32 for c in value):
+        return f"the value for {name} must not contain control characters"
+    return None
+
+
+def fill(policy, values):
+    """The policy with every {{NAME}} that has a value replaced. Works on the parsed JSON (keys and strings), so a
+    value can never change the structure of the document. Names without a value stay as placeholders."""
+    def sub(text):
+        return PLACEHOLDER_RE.sub(lambda m: values.get(m.group(1), m.group(0)), text)
+    def walk(node):
+        if isinstance(node, dict):
+            return {sub(k): walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        return sub(node) if isinstance(node, str) else node
+    return walk(policy)
+
+
+def values_of(entry):
+    return {i["name"]: i["value"] for i in entry.get("inputs", []) if i.get("value")}
+
+
+def is_filled(entry):
+    return all(i.get("value") for i in entry.get("inputs", []))
+
+
 def validate_policy(policy):
     """Returns (errors, warnings) for an SCP policy document (a dict)."""
     errors, warnings = [], []
@@ -99,11 +137,22 @@ def validate_entry(entry, label, ou_targets, catalog_ids, evidence):
             continue
         declared[inp["name"]] = {"name": inp["name"], "description": str(inp["description"])[:300],
                                  "example": str(inp.get("example", ""))[:200]}
+        value = inp.get("value")
+        if value:  # an empty value means "not filled in yet"
+            verr = value_error(inp["name"], value)
+            if verr:
+                errors.append(f"{label}: {verr}")
+            else:
+                declared[inp["name"]]["value"] = value
     used = set(PLACEHOLDER_RE.findall(policy_text(policy))) if policy is not None else set()
     for name in sorted(used - set(declared)):
         errors.append(f"{label}: placeholder {{{{{name}}}}} is used in the policy but not declared under inputs")
     for name in sorted(set(declared) - used):
         errors.append(f"{label}: input {name} is declared but never used in the policy")
+    if policy is not None and not perr:
+        values = {n: d["value"] for n, d in declared.items() if d.get("value")}
+        filled_errors, _ = validate_policy(fill(policy, values))
+        errors += [f"{label}: after filling in the inputs, {e}" for e in filled_errors if e not in perr]
     evidence(label, entry.get("basis"), entry.get("source"))  # the scope validator adds its own errors
 
     norm = {"id": cid_, "title": title, "description": str(entry.get("description", "") or "")[:600],
@@ -111,16 +160,69 @@ def validate_entry(entry, label, ou_targets, catalog_ids, evidence):
             "inputs": [declared[k] for k in sorted(declared)], "warnings": warnings,
             "basis": entry.get("basis"), "source": entry.get("source")}
     if policy is not None:
-        norm["sha256"] = hashlib.sha256(policy_text(policy).encode()).hexdigest()
+        norm["sha256"] = hashlib.sha256(policy_text(policy).encode()).hexdigest()  # of the template, as written
+        if declared and all(d.get("value") for d in declared.values()) or not declared:
+            norm["filledSha256"] = hashlib.sha256(policy_text(fill(policy, values_of(norm))).encode()).hexdigest()
     return norm, errors
 
 
+def apply_edits(scope, edits):
+    """Applies the user's edits to a copy of the scope's customScps and returns (new_scope, errors).
+
+    Each edit is {"id", "policy"?, "values"?}. `policy` replaces the policy template (a dict or JSON text); `values`
+    maps an input name to the text to put in place of {{NAME}}. Only the policy and the values can change; the
+    id, title, targets and the SOW evidence stay as the agent wrote them. Inputs follow the template: a {{NAME}} the
+    editor added is declared, and an input the editor replaced with a literal is dropped. The caller re-runs the
+    scope validator on the result, which applies every rule in validate_entry."""
+    new = json.loads(json.dumps(scope))
+    by_id = {e["id"]: e for e in new.get("customScps", [])}
+    errors = []
+    seen = set()
+    for n, edit in enumerate(edits):
+        label = f"edits[{n}]"
+        if not isinstance(edit, dict) or edit.get("id") not in by_id:
+            errors.append(f"{label}: unknown policy id {edit.get('id') if isinstance(edit, dict) else edit!r}")
+            continue
+        if edit["id"] in seen:
+            errors.append(f"{label}: policy {edit['id']} appears twice")
+            continue
+        seen.add(edit["id"])
+        entry = by_id[edit["id"]]
+        policy = edit.get("policy", entry["policy"])
+        if isinstance(policy, str):
+            try:
+                policy = json.loads(policy)
+            except ValueError as e:
+                errors.append(f"{label}: the policy is not valid JSON: {e}")
+                continue
+        values = edit.get("values")
+        if values is None:
+            values = {}
+        if not isinstance(values, dict):
+            errors.append(f"{label}.values must be an object of input name to text")
+            continue
+        used = sorted(set(PLACEHOLDER_RE.findall(policy_text(policy))))
+        old = {i["name"]: i for i in entry.get("inputs", [])}
+        inputs = []
+        for name in used:
+            item = dict(old.get(name) or {"name": name, "description": "Added in the editor", "example": ""})
+            if name in values:
+                item["value"] = values[name]
+            inputs.append(item)
+        for name in sorted(set(values) - set(used)):
+            errors.append(f"{label}: {name} is not an input of the policy")
+        entry["policy"], entry["inputs"] = policy, inputs
+    return new, errors
+
+
 def policy_file(entry):
-    return json.dumps(entry["policy"], indent=2) + "\n"
+    """The policy with the filled-in values in place. An input without a value keeps its {{PLACEHOLDER}}."""
+    return json.dumps(fill(entry["policy"], values_of(entry)), indent=2) + "\n"
 
 
 def index_json(scope):
-    items = [{k: e[k] for k in ("id", "title", "description", "targets", "basis", "source", "inputs", "warnings", "sha256")}
+    items = [{**{k: e[k] for k in ("id", "title", "description", "targets", "basis", "source", "inputs", "warnings", "sha256")},
+              "filled": is_filled(e), **({"filledSha256": e["filledSha256"]} if "filledSha256" in e else {})}
              for e in scope.get("customScps", [])]
     return json.dumps({"aiGenerated": True, "reviewRequired": True, "appliedByStacks": False, "policies": items}, indent=2) + "\n"
 
@@ -128,7 +230,10 @@ def index_json(scope):
 def readme(scope):
     org = scope["customer"]["orgName"]
     entries = scope.get("customScps", [])
-    rows = "\n".join(f"| `{e['id']}` | {', '.join(e['targets'])} | {', '.join(i['name'] for i in e['inputs']) or 'none'} | "
+    def left(e):
+        todo = [i["name"] for i in e["inputs"] if not i.get("value")]
+        return ", ".join(todo) if todo else ("none" if not e["inputs"] else "none (all filled in)")
+    rows = "\n".join(f"| `{e['id']}` | {', '.join(e['targets'])} | {left(e)} | "
                      f"{len(e['warnings'])} |" for e in entries) or "| none | | | |"
     return f"""# Custom service control policies for {org} (AI-generated, review required)
 
@@ -136,7 +241,7 @@ These policies were written by an AI model from the statement of work. They are 
 Terraform / CloudFormation in this bundle does **not** apply them. A person must review each one, fill in its inputs,
 and test it before it is attached to anything.
 
-| Policy | Target | Inputs to fill in | Warnings |
+| Policy | Target | Inputs still to fill in | Warnings |
 |---|---|---|---|
 {rows}
 
@@ -144,7 +249,8 @@ and test it before it is attached to anything.
 
 ## Before you use a policy
 1. Read it against the SOW quote in `index.json`. Nothing here proves the policy does what the SOW intends.
-2. Replace each `{{{{INPUT_NAME}}}}` placeholder in the policy file with a real value (role names, account ids, ...).
+2. Replace each `{{{{INPUT_NAME}}}}` still left in a policy file with a real value (role names, account ids, ...).
+   Values entered in the web app are already in the policy file; `index.json` shows which policies are `filled`.
 3. Check the limits: an OU or account can have at most 5 SCPs including `FullAWSAccess` and the ones Control Tower manages,
    and each SCP is at most {SCP_MAX_CHARS} characters. Catalog SCPs already attached count toward this.
 4. Test on a **non-production** account first (attach to its OU, watch CloudTrail for unexpected `AccessDenied`), then

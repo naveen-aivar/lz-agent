@@ -19,7 +19,8 @@ export interface Scope {
 
 export interface CustomScp {
   id: string; title: string; description?: string; targets: string[]; basis?: Basis;
-  inputs: { name: string; description: string }[]; warnings: string[]; policy: { Statement?: unknown[] } & Record<string, unknown>;
+  inputs: { name: string; description: string; example?: string; value?: string }[]; warnings: string[];
+  policy: { Statement?: unknown[] } & Record<string, unknown>; filledSha256?: string;
 }
 
 const need = (cond: boolean, what: string): void => {

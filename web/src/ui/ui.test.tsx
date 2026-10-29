@@ -64,16 +64,16 @@ describe("RunsPage filters", () => {
     { runId: "b".repeat(32), customerId: "beta", status: "FAILED", createdAt: 1, runKind: "deploy", error: "x" },
   ];
   it("filters by chip and by search text", async () => {
-    render(<RunsPage api={{ listRuns: vi.fn().mockResolvedValue({ runs, total: 2 }) } as unknown as Client} onOpen={() => {}} />);
+    render(<RunsPage api={{ listRuns: vi.fn().mockResolvedValue({ runs, total: 2 }) } as unknown as Client} />);
     await screen.findByText("Alpha");
-    await userEvent.click(screen.getByRole("button", { name: /Failed/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Stopped/ }));
     expect(screen.queryByText("Alpha")).toBeNull();
     expect(screen.getByText("Beta")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /^All/ }));
-    await userEvent.type(screen.getByLabelText("Search runs"), "alp");
+    await userEvent.type(screen.getByLabelText("Search projects"), "alp");
     expect(screen.queryByText("Beta")).toBeNull();
-    await userEvent.clear(screen.getByLabelText("Search runs"));
-    await userEvent.type(screen.getByLabelText("Search runs"), "zzz");
-    expect(screen.getByText("No runs match these filters.")).toBeInTheDocument();
+    await userEvent.clear(screen.getByLabelText("Search projects"));
+    await userEvent.type(screen.getByLabelText("Search projects"), "zzz");
+    expect(screen.getByText("No projects match these filters.")).toBeInTheDocument();
   });
 });

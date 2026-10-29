@@ -249,5 +249,20 @@ def zip_bytes(files, root):
     return buf.getvalue()
 
 
+SCOPE_DERIVED = ("custom-scps/", "docs/")  # the parts of a bundle that come from the scope and not from the static templates
+def patch_bundle(old_zip, fmt, files):
+    """The delivered zip with its custom-scps/ and docs/ replaced by those in `files` (a fresh render of the edited scope).
+    Every other entry, including the validation reports, is copied byte for byte: the templates the reports were
+    produced from are not re-rendered, so the reports still describe the files in the zip."""
+    keep = {}
+    with zipfile.ZipFile(io.BytesIO(old_zip)) as z:
+        for info in z.infolist():
+            rel = info.filename[len(fmt) + 1:] if info.filename.startswith(fmt + "/") else None
+            if rel is None:
+                raise ValueError(f"the delivered {fmt} bundle has an entry outside {fmt}/: {info.filename}")
+            if not rel.startswith(SCOPE_DERIVED):
+                keep[rel] = z.read(info)
+    fresh = {n: c for n, c in files.items() if n.startswith(SCOPE_DERIVED)}
+    return zip_bytes({**keep, **fresh}, fmt)
 def render_all(scope):
     return {"terraform": render_terraform(scope), "cloudformation": render_cloudformation(scope)}

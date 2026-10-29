@@ -259,6 +259,21 @@ components:
       required: [audit]
       properties:
         audit: {type: array, items: {$ref: "#/components/schemas/AuditItem"}}
+    EditCustomScpsRequest:
+      type: object
+      required: [baseSha, edits]
+      properties:
+        baseSha: {type: string, description: The `sha` of the scope the edits were made on. A different current sha answers 409.}
+        edits:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [id]
+            properties:
+              id: {type: string, description: Id of an existing custom SCP.}
+              policy: {type: object, additionalProperties: true, description: "Replaces the policy template. Keep the placeholder (two curly braces, NAME, two curly braces) where a value is still to be entered. Deny-only, at most 5120 characters."}
+              values: {type: object, additionalProperties: {type: string, maxLength: 200}, description: "Input name to the text that replaces its placeholder. An empty string clears it."}
     ScopeData:
       type: object
       required: [scope, sha, orgDiagram]
@@ -424,6 +439,17 @@ paths:
       responses:
         "200": {description: OK., content: {application/json: {schema: {$ref: "#/components/schemas/ScopeEnvelope"}}}}
         "404": {$ref: "#/components/responses/NotFound"}
+  /runs/{runId}/custom-scps:
+    post:
+      operationId: editCustomScps
+      summary: Save values and edits for a DELIVERED design run's custom SCPs. The delivered bundles are updated; nothing is applied to AWS.
+      parameters: [{$ref: "#/components/parameters/runId"}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/EditCustomScpsRequest"}}}}
+      responses:
+        "200": {description: Saved. The body is the new scope., content: {application/json: {schema: {$ref: "#/components/schemas/ScopeEnvelope"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
   /runs/{runId}/audit:
     get:
       operationId: getAudit

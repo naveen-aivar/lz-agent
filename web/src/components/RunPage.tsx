@@ -5,18 +5,15 @@ import { parseScope } from "../logic/design";
 import type { Scope } from "../logic/design";
 import { ago, isDone, pretty, stateOf, when } from "../logic/format";
 import { pauseNotice } from "../logic/notices";
-import { questionKey, isUpdateOnly, answeredPending } from "../logic/question";
-import { parseDeploymentReport, parseValidationReport } from "../logic/reports";
-import type { DeploymentReport as DeploymentReportData, ValidationReport } from "../logic/reports";
-import { deploySteps, designSteps } from "../logic/steps";
+import { answeredPending, isUpdateOnly, questionKey } from "../logic/question";
+import { parseDeploymentReport } from "../logic/reports";
+import type { DeploymentReport as DeploymentReportData } from "../logic/reports";
+import { deploySteps } from "../logic/steps";
 import type { Theme } from "../theme";
 import { Badge } from "../ui/Badge";
-import { CustomScpPanel } from "../ui/CustomScpPanel";
 import { DeploymentReport } from "../ui/DeploymentReport";
-import { Kpi } from "../ui/Kpi";
 import { OrgDiagram } from "../ui/OrgDiagram";
 import { ScopePanel } from "../ui/ScopePanel";
-import { SecurityPanel } from "../ui/SecurityPanel";
 import { useToast } from "../ui/Toasts";
 import { AuditFeed } from "./AuditFeed";
 import { Progress } from "./Progress";
@@ -24,17 +21,19 @@ import { QuestionPanel } from "./QuestionPanel";
 import { ResumePanel } from "./ResumePanel";
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 const hasArtifact = (run: Run, k: string): boolean => !!(run.artifacts && (run.artifacts as Record<string, unknown>)[k]);
-type TabId = "organization" | "scope" | "scps" | "security" | "deployment" | "activity";
-export function RunPage({ runId, api, canAnswer, userSub, pollMs = 4000, onCrumb, onDeploy, theme = "dark" }: {
-  runId: string; api: Client; canAnswer: boolean; userSub: string; pollMs?: number; theme?: Theme;
-  onCrumb?: (name: string) => void; onDeploy?: (designRunId: string) => void;
+type TabId = "organization" | "scope" | "deployment" | "activity";
+/** A deploy run: what AWS Transform is asking, progress, and the results. Inside a project (`embedded`) the design is on its own step. */
+export function RunPage({ runId, api, canAnswer, userSub, pollMs = 4000, onCrumb, onLoaded, theme = "dark", embedded = false, view = "progress" }: {
+  runId: string; api: Client; canAnswer: boolean; userSub: string; pollMs?: number; theme?: Theme; embedded?: boolean;
+  /** "results" shows only the finished run's report and downloads. */
+  view?: "progress" | "results";
+  onCrumb?: (name: string) => void; onLoaded?: (run: Run) => void;
 }) {
   const toast = useToast();
   const [run, setRun] = useState<Run | null>(null);
   const [audit, setAudit] = useState<AuditItem[]>([]);
   const [scope, setScope] = useState<{ scope: Scope; diagram: string } | null>(null);
   const [scopeError, setScopeError] = useState("");
-  const [report, setReport] = useState<ValidationReport | null>(null);
   const [depReport, setDepReport] = useState<DeploymentReportData | null>(null);
   const [reportError, setReportError] = useState("");
   const [tab, setTab] = useState<TabId | null>(null);
@@ -50,42 +49,34 @@ export function RunPage({ runId, api, canAnswer, userSub, pollMs = 4000, onCrumb
       setAudit(a.audit);
       setError("");
       setStale(false);
+      onLoaded?.(r.run);
     } catch (e) {
       setError(msg(e));
       setStale(true);
     }
-  }, [api, runId]);
-  useEffect(() => { setRun(null); setScope(null); setReport(null); setDepReport(null); void load(); }, [load]);
+  }, [api, runId, onLoaded]);
+  useEffect(() => { setRun(null); setScope(null); setDepReport(null); void load(); }, [load]);
   useEffect(() => {
     if (!run || isDone(run.status)) return;
     const t = setInterval(() => void load(), pollMs);
     return () => clearInterval(t);
   }, [run, load, pollMs]);
-  const deploy = run?.runKind === "deploy";
-  const scopeRunId = run ? (run.designRunId ?? (deploy ? null : run.runId)) : null;
-  const designReady = !!run && (isDone(run.status) || audit.some((a) => a.action === "phase.completed"));
+  const designId = run?.designRunId;
   useEffect(() => {
-    if (!scopeRunId || !designReady || scope) return;
-    api.getScope(scopeRunId)
+    if (embedded || !designId || scope) return;
+    api.getScope(designId)
       .then((d) => { setScope({ scope: parseScope(d.scope), diagram: d.orgDiagram }); setScopeError(""); })
       .catch((e: unknown) => setScopeError(msg(e)));
-  }, [api, scopeRunId, designReady, scope]);
-  const reportSha = run && hasArtifact(run, "report");
-  useEffect(() => {
-    if (!run || deploy || !reportSha || report) return;
-    api.getReportSummary(run.runId)
-      .then((d) => { setReport(parseValidationReport(d.report)); setReportError(""); })
-      .catch((e: unknown) => setReportError(msg(e)));
-  }, [api, run, deploy, reportSha, report]);
+  }, [api, designId, embedded, scope]);
   const depSha = run && hasArtifact(run, "deployment-report");
   useEffect(() => {
-    if (!run || !deploy || !depSha || depReport) return;
+    if (!run || !depSha || depReport) return;
     api.getArtifact(run.runId, "deployment-report")
       .then((d) => { setDepReport(parseDeploymentReport(d.deploymentReport)); setReportError(""); })
       .catch((e: unknown) => setReportError(msg(e)));
-  }, [api, run, deploy, depSha, depReport]);
+  }, [api, run, depSha, depReport]);
   const name = scope?.scope.customer.orgName ?? (run ? pretty(run.customerId) || run.runId.slice(0, 8) : "");
-  useEffect(() => { if (name) onCrumb?.(`${name} ${deploy ? "deploy" : "design"}`); }, [name, deploy, onCrumb]);
+  useEffect(() => { if (name && !embedded) onCrumb?.(`${name} deploy`); }, [name, embedded, onCrumb]);
   const pending = run?.status === "RUNNING" ? run.pendingHumanInput : undefined;
   const needsInput = !!run && !!pending && !isUpdateOnly(pending) && !answeredPending(run, pending);
   useEffect(() => {
@@ -119,32 +110,45 @@ export function RunPage({ runId, api, canAnswer, userSub, pollMs = 4000, onCrumb
   if (!run) return <p className="empty">{error || "Loading…"}</p>;
   const [tone, label] = stateOf(run.status);
   const delivered = run.status === "DELIVERED";
-  const steps = deploy ? deploySteps(run, audit) : designSteps(run, audit);
+  const steps = deploySteps(run, audit);
   const recent = latestActivity(audit);
-  const pause = deploy && !isDone(run.status) ? pauseNotice(audit, run) : null;
+  const pause = !isDone(run.status) ? pauseNotice(audit, run) : null;
   const sc = scope?.scope;
-  const tabs: { id: TabId; label: string; count?: number }[] = [];
-  if (deploy && depReport) tabs.push({ id: "deployment", label: "Deployment report" });
+  const tabs: { id: TabId; label: string }[] = [];
+  if (depReport) tabs.push({ id: "deployment", label: "Deployment report" });
   if (sc && scope.diagram) tabs.push({ id: "organization", label: "Organization" });
   if (sc) tabs.push({ id: "scope", label: "Scope" });
-  if (sc && !deploy) tabs.push({ id: "scps", label: "Custom SCPs", count: sc.customScps.length });
-  if (report) tabs.push({ id: "security", label: "Security and validation" });
   tabs.push({ id: "activity", label: "Activity" });
   const current = tabs.find((t) => t.id === tab)?.id ?? tabs[0]!.id;
-  const missing = sc?.missingRequired ?? [];
-  const questions = sc?.openQuestions.length ?? 0;
   const dl = (k: ArtifactName, text: string, primary = false) => (
-    <button type="button" className={`btn ${primary ? "btn-primary" : ""}`} disabled={!(k === "reports" ? hasArtifact(run, k) : delivered && hasArtifact(run, k))} onClick={() => void download(k)}>{text}</button>
+    <button type="button" className={`btn ${primary ? "btn-primary" : ""}`} disabled={!(delivered && hasArtifact(run, k))} onClick={() => void download(k)}>{text}</button>
   );
+  const downloads = (
+    <div className="card">
+      <div className="card-head"><h2>Downloads</h2></div>
+      <div className="row">{dl("deployment-report", "Deployment report", true)}{dl("foundation-assessment", "Foundation assessment")}{dl("iac-change-plan", "IaC change plan")}{dl("iac-manifest", "IaC manifest")}</div>
+      <p className="hint">
+        {delivered ? "Foundation attestation, IaC plan, manifest and evidence from the deploy workflow." : run.status === "FAILED" ? "Deliverables appear here if attestation completed before the failure." : "Available when the deploy finishes."}
+      </p>
+    </div>
+  );
+  if (view === "results") {
+    return (
+      <div className="run">
+        {depReport ? <div className="card"><DeploymentReport report={depReport} onDownload={() => void download("deployment-report")} /></div> : <p className="hint">{reportError || "The deployment report is not available."}</p>}
+        {downloads}
+      </div>
+    );
+  }
   return (
     <div className="run">
-      <div className="crumbs"><a href="#/runs">← Runs</a></div>
-      <h1 className="page-title">
-        {name} <Badge tone={deploy ? "violet" : "muted"}>{deploy ? "Deploy" : "Design"}</Badge> <Badge tone={tone}>{label}</Badge>
+      {!embedded && <div className="crumbs"><a href="#/runs">← Projects</a></div>}
+      <h1 className={embedded ? "sub-title" : "page-title"}>
+        {embedded ? "Deploy run" : name} {!embedded && <Badge tone="violet">Deploy</Badge>} <Badge tone={tone}>{label}</Badge>
         {!isDone(run.status) && (
           <span className={`live${stale ? " stale" : ""}`} role="status"><i aria-hidden="true" />{stale ? "Reconnecting…" : "Live"}</span>
         )}
-        {run.status === "RUNNING" && deploy && (
+        {run.status === "RUNNING" && (
           confirmStop ? (
             <span role="group" aria-label="Confirm stop" className="confirm">
               <span className="hint">Stop this run? It is marked failed and can be resumed later.</span>
@@ -157,13 +161,13 @@ export function RunPage({ runId, api, canAnswer, userSub, pollMs = 4000, onCrumb
         )}
       </h1>
       <p className="page-sub">
-        {run.createdAt ? `Started ${when(run.createdAt)} · ` : ""}{deploy ? "Deploy" : "Design"} run <code>{run.runId.slice(0, 8)}</code>
-        {run.designRunId && <> · Design run <a href={`#/run/${run.designRunId}`}><code>{run.designRunId.slice(0, 8)}</code></a></>}
+        {run.createdAt ? `Started ${when(run.createdAt)} · ` : ""}Deploy run <code>{run.runId.slice(0, 8)}</code>
+        {run.designRunId && !embedded && <> · Design run <a href={`#/run/${run.designRunId}`}><code>{run.designRunId.slice(0, 8)}</code></a></>}
       </p>
       {run.status === "FAILED" && (
         <div className="notice notice-err" role="alert">
-          <strong>{deploy ? "Deploy failed." : "This run failed."}</strong> {run.error || "No reason was recorded."}
-          <br />{deploy ? "Open the Activity tab to see where it stopped." : "A failed design run can't be resumed. Start a new run, or open the Activity tab to see where it stopped."}
+          <strong>Deploy stopped.</strong> {run.error || "No reason was recorded."}
+          <br />Open the Activity tab to see where it stopped.
         </div>
       )}
       {typeof run.credentialsCleanupError === "string" && run.credentialsCleanupError && (
@@ -173,7 +177,7 @@ export function RunPage({ runId, api, canAnswer, userSub, pollMs = 4000, onCrumb
         </div>
       )}
       {error && !stale && <p className="errtext" role="alert">{error}</p>}
-      {deploy && run.status === "FAILED" && <ResumePanel run={run} api={api} onResumed={() => void load()} />}
+      {run.status === "FAILED" && <ResumePanel run={run} api={api} onResumed={() => void load()} />}
       {pending && (
         <QuestionPanel key={questionKey(pending)} run={run}
           pending={pending} canAnswer={canAnswer} userSub={userSub} api={api} onChanged={() => void load()} />
@@ -183,7 +187,7 @@ export function RunPage({ runId, api, canAnswer, userSub, pollMs = 4000, onCrumb
       )}
       <div className="grid-3">
         <div className="card"><div className="card-head"><h2>Progress</h2></div><Progress steps={steps} /></div>
-        {deploy && recent.length > 0 && (
+        {recent.length > 0 && (
           <div className="card">
             <div className="card-head"><h2>Latest activity</h2><button type="button" className="btn-link" onClick={() => setTab("activity")}>All events</button></div>
             <ol className="feed" aria-live="polite">
@@ -196,62 +200,19 @@ export function RunPage({ runId, api, canAnswer, userSub, pollMs = 4000, onCrumb
             </ol>
           </div>
         )}
-        <div className="card">
-          <div className="card-head"><h2>Downloads</h2></div>
-          <div className="row">
-            {deploy ? (<>
-              {dl("deployment-report", "Deployment report", true)}{dl("foundation-assessment", "Foundation assessment")}
-              {dl("iac-change-plan", "IaC change plan")}{dl("iac-manifest", "IaC manifest")}
-            </>) : (<>{dl("terraform", "Terraform", true)}{dl("cloudformation", "CloudFormation")}{dl("reports", "Scan reports")}</>)}
-          </div>
-          <p className="hint">
-            {deploy
-              ? delivered ? "Foundation attestation, IaC plan, manifest and evidence from the deploy workflow." : run.status === "FAILED" ? "Deliverables appear here if attestation completed before the failure." : "Available when the deploy run finishes."
-              : delivered ? "Each zip includes the docs, the custom SCPs for review, and its own scan reports." : run.status === "FAILED" ? (hasArtifact(run, "reports") ? "The code isn't available because validation failed. The scan reports are." : "The code isn't available because the run failed.") : "Ready when validation finishes."}
-          </p>
-          {!deploy && delivered && onDeploy && (<>
-            <h3>Deploy</h3>
-            <p className="hint">Run the deploy agent against a target AWS account. AWS Transform builds the landing zone from this design.</p>
-            <button type="button" className="btn btn-primary" onClick={() => onDeploy(run.runId)}>Start deploy run</button>
-          </>)}
-        </div>
-        {!deploy && (missing.length > 0 || questions > 0) && (
-          <div className="card">
-            <div className="card-head"><h2>Before you apply</h2></div>
-            {missing.length > 0 && (<>
-              <ul className="todo">{missing.map((n) => <li key={n}><b>!</b><span>{n[0]!.toUpperCase() + n.slice(1)}</span></li>)}</ul>
-              <p className="hint">Each account needs a unique root email that has never been used for another AWS account. Terraform reads them from <code>terraform.tfvars</code>, CloudFormation from the parameter files.</p>
-            </>)}
-            {questions > 0 && <p>{questions} open question{questions === 1 ? "" : "s"} to confirm with the customer. <button type="button" className="btn-link" onClick={() => setTab("scope")}>Review</button></p>}
-          </div>
-        )}
+        {downloads}
       </div>
-      {sc && !deploy && (
-        <div className="grid-kpi">
-          <Kpi label="OUs" value={String(sc.summary.ous)} /><Kpi label="Accounts" value={String(sc.summary.accounts)} />
-          <Kpi label="Controls enabled" value={String(sc.summary.controlAttachments)} /><Kpi label="Catalog SCPs" value={String(sc.summary.scps)} />
-          <Kpi label="Custom SCPs" value={String(sc.summary.customScps ?? 0)} hint="for review" tone={sc.summary.customScps ? "amber" : ""} />
-        </div>
-      )}
-      {!sc && !isDone(run.status) && !deploy && (
-        <div className="card"><div className="card-head"><h2><span className="spin" /> The agent is reading the SOW</h2></div>
-          <p className="hint">This usually takes a few minutes. You can leave this page: the run continues and stays under Runs.</p></div>
-      )}
-      {scopeError && (deploy || delivered) && <p className="errtext" role="alert">The approved design could not be shown: {scopeError}</p>}
+      {scopeError && <p className="errtext" role="alert">The approved design could not be shown: {scopeError}</p>}
       {reportError && <p className="errtext" role="alert">A report could not be shown: {reportError}</p>}
       <div className="panel panel-pad">
         <div className="tabs" role="tablist" aria-label="Run details">
           {tabs.map((t) => (
-            <button key={t.id} type="button" role="tab" aria-selected={current === t.id} className="tab" onClick={() => setTab(t.id)}>
-              {t.label}{t.count ? <span className="count">{t.count}</span> : null}
-            </button>
+            <button key={t.id} type="button" role="tab" aria-selected={current === t.id} className="tab" onClick={() => setTab(t.id)}>{t.label}</button>
           ))}
         </div>
         {current === "deployment" && depReport && <DeploymentReport report={depReport} onDownload={() => void download("deployment-report")} />}
         {current === "organization" && scope && <OrgDiagram source={scope.diagram} theme={theme} />}
         {current === "scope" && sc && <ScopePanel scope={sc} />}
-        {current === "scps" && sc && <CustomScpPanel scope={sc} />}
-        {current === "security" && report && <SecurityPanel report={report} onDownload={(n) => void download(n)} />}
         {current === "activity" && (<>
           <label className="check"><input type="checkbox" checked={all} onChange={(e) => setAll(e.target.checked)} /> Show every step</label>
           <AuditFeed audit={allActivity(audit, all)} userSub={userSub} />

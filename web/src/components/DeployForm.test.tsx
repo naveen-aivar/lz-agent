@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildDeployRequest } from "./DeployDialog";
+import { buildDeployRequest } from "./DeployForm";
 
 const base = { method: "role" as const, accountId: "710507380209", roleArn: "arn:aws:iam::710507380209:role/R", externalId: "ext",
   accessKeyId: "", secretAccessKey: "", sessionToken: "", accountEmail: "", mapAgreement: "", targetRegion: "", applyScps: true };

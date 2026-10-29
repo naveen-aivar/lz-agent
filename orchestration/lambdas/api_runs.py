@@ -1,4 +1,4 @@
-"""POST /runs, POST /deploy-target/verify, POST /runs/{id}/start, POST /runs/{id}/stop, POST /runs/{id}/deploy,
+"""POST /runs/{id}/custom-scps saves edited custom SCPs. POST /runs, POST /deploy-target/verify, POST /runs/{id}/start, POST /runs/{id}/stop, POST /runs/{id}/deploy,
 POST /runs/{id}/answer, GET /runs/{id}, GET /runs/{id}/audit, GET /runs/{id}/scope
 
 Create returns an S3 presigned POST for the SOW (pdf/docx/txt/md, <= 10 MB). The workflow only starts on /start,
@@ -16,6 +16,7 @@ deploy.started / design.deploy_requested / run.stopped audit details. The value 
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -33,6 +34,7 @@ from lzcore.deploy_target_api import (
     parse_deploy_target_from_request,
     verify_deploy_target_credentials,
 )
+from lzcore import customscp, render, scope as scopelib
 from lzcore.diagram import org_mermaid
 
 sfn = boto3.client("stepfunctions")
@@ -337,6 +339,83 @@ def _scope(run_id, sub):
     body = s3().get_object(Bucket=ARTIFACT_BUCKET, Key=art["key"])["Body"].read().decode()
     scope = json.loads(body)
     return _resp(200, {"scope": scope, "sha": art["sha"], "orgDiagram": org_mermaid(scope)})
+
+
+def _edit_custom_scps(run_id, sub, event, invoked_by):
+    """Save the values and policy edits a person made to a delivered design run's custom SCPs.
+
+    The edited scope replaces intake/scope.json (the bucket is versioned, so the earlier one stays recoverable) and the
+    delivered terraform and cloudformation zips get the new custom-scps/ and docs/. Their validation reports stay: the
+    SCP files are not inputs to the lint and security scans. Nothing is applied to an AWS organization."""
+    run = get_run(run_id)
+    if not run or not _can_view(run, sub):
+        return _resp(404, {"error": "not found"})
+    if run.get("runKind") == "deploy":
+        return _resp(400, {"error": "custom SCPs belong to a design run; open the design run to edit them"})
+    if run.get("status") != "DELIVERED":
+        return _resp(409, {"error": f"run is {run.get('status')}; only a DELIVERED design run can be edited"})
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "body must be JSON"})
+    edits = body.get("edits") if isinstance(body, dict) else None
+    if not isinstance(edits, list) or not edits:
+        return _resp(400, {"error": "edits must be a non-empty list of {id, policy?, values?}"})
+    arts = run.get("artifacts") or {}
+    missing = [k for k in ("intake", "sow", "terraform", "cloudformation") if k not in arts]
+    if missing:
+        return _resp(409, {"error": f"the run has no {', '.join(missing)} artifact yet"})
+    if body.get("baseSha") != arts["intake"]["sha"]:
+        return _resp(409, {"error": "the design changed since you opened it; reload and edit again", "sha": arts["intake"]["sha"]})
+    busy = [r for r in _scan_meta() if r.get("designRunId") == run_id and r.get("status") == "RUNNING"]
+    if busy:
+        return _resp(409, {"error": f"deploy run {busy[0]['runId'][:8]} is using this design; stop it before editing the SCPs"})
+    sow = s3().get_object(Bucket=ARTIFACT_BUCKET, Key=arts["sow"]["key"])["Body"].read().decode()
+    current = json.loads(s3().get_object(Bucket=ARTIFACT_BUCKET, Key=arts["intake"]["key"])["Body"].read().decode())
+    edited, errors = customscp.apply_edits(current, edits)
+    if not errors:
+        edited, errors = scopelib.validate(edited, sow)
+    if errors:
+        return _resp(400, {"error": "the SCP edits are not valid: " + "; ".join(errors[:5]), "errors": errors})
+    scope_bytes = json.dumps(edited, indent=2, sort_keys=True).encode()
+    new_sha = hashlib.sha256(scope_bytes).hexdigest()
+    s3().put_object(Bucket=ARTIFACT_BUCKET, Key=arts["intake"]["key"], Body=scope_bytes)
+    zips = {}
+    for fmt, files in render.render_all(edited).items():
+        base = f"runs/{run_id}/bundle-src/{fmt}"
+        for name, content in files.items():
+            if name.startswith(render.SCOPE_DERIVED):
+                s3().put_object(Bucket=ARTIFACT_BUCKET, Key=f"{base}/{name}", Body=content.encode())
+        old = s3().get_object(Bucket=ARTIFACT_BUCKET, Key=arts[fmt]["key"])["Body"].read()
+        data = render.patch_bundle(old, fmt, files)
+        s3().put_object(Bucket=ARTIFACT_BUCKET, Key=arts[fmt]["key"], Body=data)
+        zips[fmt] = hashlib.sha256(data).hexdigest()
+    try:
+        table().update_item(
+            Key={"PK": f"RUN#{run_id}", "SK": "META"},
+            UpdateExpression="SET artifacts.intake.sha = :i, artifacts.terraform.sha = :t, artifacts.cloudformation.sha = :c",
+            ConditionExpression="#s = :d AND artifacts.intake.sha = :base",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":i": new_sha, ":t": zips["terraform"], ":c": zips["cloudformation"], ":d": "DELIVERED",
+                                       ":base": arts["intake"]["sha"]})
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return _resp(409, {"error": "the design changed while saving; reload and edit again"})
+        raise
+    audit(run_id, sub, "scope.custom_scps_edited", {
+        "ids": sorted({e["id"] for e in edits}), "baseSha": arts["intake"]["sha"], "newSha": new_sha, "invokedBy": invoked_by,
+        "filled": {e["id"]: customscp.is_filled(e) for e in edited.get("customScps", [])}})
+    return _resp(200, {"scope": edited, "sha": new_sha, "orgDiagram": org_mermaid(edited)})
+
+
+def _scan_meta():
+    kwargs = {"FilterExpression": "SK = :m", "ExpressionAttributeValues": {":m": "META"}}
+    while True:
+        page = table().scan(**kwargs)
+        yield from page["Items"]
+        if "LastEvaluatedKey" not in page:
+            return
+        kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
 
 
 def _verify_deploy_target(event, sub):
@@ -710,4 +789,6 @@ def handler(event, _ctx):
         return _audit(run_id, sub)
     if route.endswith("/scope"):
         return _scope(run_id, sub)
+    if route.endswith("/custom-scps"):
+        return _edit_custom_scps(run_id, sub, event, invoked_by)
     return _get(run_id, sub)

@@ -3,8 +3,8 @@ import type { Theme } from "../theme";
 export type Nav = "dashboard" | "runs" | "new";
 const ITEMS: [Nav, string, string, string][] = [
   ["dashboard", "#/dashboard", "◧", "Dashboard"],
-  ["runs", "#/runs", "▶", "Runs"],
-  ["new", "#/new", "+", "New run"],
+  ["runs", "#/runs", "▶", "Projects"],
+  ["new", "#/new", "+", "New project"],
 ];
 /** App frame: sidebar, breadcrumb bar with theme switch, content. */
 export function Shell({ nav, crumb, email, theme, onTheme, onSignOut, children }: {

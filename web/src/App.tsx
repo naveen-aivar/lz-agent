@@ -5,9 +5,8 @@ import { createClient } from "./api/client";
 import { loadConfig } from "./config";
 import type { Config } from "./config";
 import { DashboardPage } from "./components/DashboardPage";
-import { DeployDialog } from "./components/DeployDialog";
 import { NewRunPage } from "./components/NewRunPage";
-import { RunPage } from "./components/RunPage";
+import { RunRoute } from "./components/RunRoute";
 import { RunsPage } from "./components/RunsPage";
 import { Shell } from "./components/Shell";
 import { applyTheme, initialTheme } from "./theme";
@@ -15,12 +14,12 @@ import type { Theme } from "./theme";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
 import { ToastProvider } from "./ui/Toasts";
 
-type Route = { page: "dashboard" | "runs" | "run" | "new"; runId: string | null };
+type Route = { page: "dashboard" | "runs" | "run" | "new"; runId: string | null; step: string | null };
 const routeOf = (): Route => {
-  const run = (location.hash.match(/^#\/run\/([0-9a-f]+)$/) ?? [])[1];
-  if (run) return { page: "run", runId: run };
-  if (location.hash === "#/new") return { page: "new", runId: null };
-  return { page: location.hash === "#/runs" ? "runs" : "dashboard", runId: null };
+  const m = location.hash.match(/^#\/run\/([0-9a-f]+)(?:\/([a-z]+))?$/);
+  if (m) return { page: "run", runId: m[1]!, step: m[2] ?? null };
+  if (location.hash === "#/new") return { page: "new", runId: null, step: null };
+  return { page: location.hash === "#/runs" ? "runs" : "dashboard", runId: null, step: null };
 };
 
 export function App() {
@@ -31,7 +30,6 @@ export function App() {
   const [route, setRoute] = useState(routeOf());
   const [runCrumb, setRunCrumb] = useState("");
   const [theme, setTheme] = useState<Theme>(initialTheme);
-  const [deployFor, setDeployFor] = useState<string | null>(null);
   useEffect(() => applyTheme(theme), [theme]);
 
   useEffect(() => {
@@ -84,26 +82,23 @@ export function App() {
       </main>
     );
   }
-  const crumbs = { dashboard: "Dashboard", runs: "Runs", new: "New design run", run: runCrumb || "Run" };
+  const crumbs = { dashboard: "Dashboard", runs: "Projects", new: "New project", run: runCrumb || "Project" };
   const open = (id: string) => { location.hash = `#/run/${id}`; };
   return (
     <ToastProvider>
       <Shell nav={route.page === "run" ? "runs" : route.page} crumb={crumbs[route.page]} email={claims.email} theme={theme} onTheme={setTheme} onSignOut={() => logout(cfg)}>
         <ErrorBoundary key={`${route.page}:${route.runId}`}>
           {route.page === "run" && route.runId ? (
-            <RunPage key={route.runId} runId={route.runId} api={api} canAnswer={canAnswerTransform(claims)} userSub={claims.sub ?? ""}
-              theme={theme} onCrumb={setRunCrumb} onDeploy={setDeployFor} />
+            <RunRoute key={route.runId} runId={route.runId} step={route.step} api={api} canAnswer={canAnswerTransform(claims)} userSub={claims.sub ?? ""}
+              theme={theme} onCrumb={setRunCrumb} onStep={(designId, step) => { location.hash = `#/run/${designId}/${step}`; }} />
           ) : route.page === "runs" ? (
-            <RunsPage api={api} onOpen={open} />
+            <RunsPage api={api} />
           ) : route.page === "new" ? (
             <NewRunPage api={api} onStarted={open} />
           ) : (
             <DashboardPage api={api} />
           )}
         </ErrorBoundary>
-        {deployFor && route.page === "run" && (
-          <DeployDialog designRunId={deployFor} api={api} onCancel={() => setDeployFor(null)} onStarted={(id) => { setDeployFor(null); open(id); }} />
-        )}
       </Shell>
     </ToastProvider>
   );

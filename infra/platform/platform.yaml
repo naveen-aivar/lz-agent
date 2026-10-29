@@ -836,6 +836,9 @@ Resources:
   RouteStopRun:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref Api, RouteKey: "POST /runs/{runId}/stop", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
+  RouteEditCustomScps:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "POST /runs/{runId}/custom-scps", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
   RouteAnswerRun:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref Api, RouteKey: "POST /runs/{runId}/answer", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}

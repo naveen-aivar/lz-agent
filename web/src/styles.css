@@ -202,3 +202,18 @@ summary { cursor: pointer; color: var(--dim); font-weight: 600; font-size: 13px;
 @keyframes spin { to { transform: rotate(360deg); } }
 .md > :last-child { margin-bottom: 0; } .md p { margin-bottom: 8px; } .md ul, .md ol { padding-left: 20px; margin-bottom: 8px; }
 .md h1, .md h2, .md h3, .md h4 { font-size: 13px; margin: 10px 0 4px; } .md table { margin: 8px 0; } .md pre { margin: 8px 0; }
+/* guided project flow */
+.stepper { list-style: none; display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 18px; padding: 0; }
+.stp button { font: inherit; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; cursor: pointer; background: var(--panel); border: 1px solid var(--border); color: var(--dim); border-radius: 999px; padding: 6px 14px 6px 8px; }
+.stp button:disabled { cursor: not-allowed; opacity: .5; }
+.stp button:hover:not(:disabled) { border-color: var(--blue); color: var(--ink); }
+.stp-n { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--card-h); font-size: 12px; }
+.stp.current button { background: var(--blue); border-color: var(--blue); color: #fff; } .stp.current .stp-n { background: rgba(255,255,255,.25); }
+.stp.done .stp-n { background: var(--green); color: #fff; }
+.row.next { margin: 16px 0 0; }
+.fold > summary { font-size: 14px; color: var(--ink); } .fold[open] > summary { margin-bottom: 12px; }
+.notice-ok { background: var(--green-bg); color: var(--green-ink); border-color: var(--green-bd); }
+.sub-title { font-size: 16px; font-weight: 700; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 4px; }
+.fields { display: grid; gap: 12px; margin-top: 12px; max-width: 560px; }
+textarea.code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; min-height: 200px; }
+.errtext.small { font-size: 12px; margin: 2px 0 0; }

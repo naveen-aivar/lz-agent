@@ -185,6 +185,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/runs/{runId}/custom-scps": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Save values and edits for a DELIVERED design run's custom SCPs. The delivered bundles are updated; nothing is applied to AWS. */
+        post: operations["editCustomScps"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/runs/{runId}/audit": {
         parameters: {
             query?: never;
@@ -429,6 +446,22 @@ export interface components {
         };
         AuditData: {
             audit: components["schemas"]["AuditItem"][];
+        };
+        EditCustomScpsRequest: {
+            /** @description The `sha` of the scope the edits were made on. A different current sha answers 409. */
+            baseSha: string;
+            edits: {
+                /** @description Id of an existing custom SCP. */
+                id: string;
+                /** @description Replaces the policy template. Keep the placeholder (two curly braces, NAME, two curly braces) where a value is still to be entered. Deny-only, at most 5120 characters. */
+                policy?: {
+                    [key: string]: unknown;
+                };
+                /** @description Input name to the text that replaces its placeholder. An empty string clears it. */
+                values?: {
+                    [key: string]: string;
+                };
+            }[];
         };
         ScopeData: {
             scope: {
@@ -849,6 +882,35 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+        };
+    };
+    editCustomScps: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                runId: components["parameters"]["runId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EditCustomScpsRequest"];
+            };
+        };
+        responses: {
+            /** @description Saved. The body is the new scope. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScopeEnvelope"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
         };
     };
     getAudit: {

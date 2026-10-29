@@ -68,16 +68,26 @@ class FakeTable:
                     ConditionExpression=None):
         names, values = ExpressionAttributeNames or {}, ExpressionAttributeValues or {}
         item = self.items.setdefault(self._k(Key), dict(Key))
+        def at(path, create=False):
+            """(container, last key) for a dotted path such as artifacts.intake.sha."""
+            parts = [names.get(p, p) for p in path.split(".")]
+            node = item
+            for part in parts[:-1]:
+                node = node.setdefault(part, {}) if create else node.get(part, {})
+            return node, parts[-1]
         if ConditionExpression:
-            m = re.fullmatch(r"(#?\w+) = (:\w+)", ConditionExpression)
-            assert m, f"fake supports only 'a = :v' conditions, got {ConditionExpression!r}"
-            if item.get(names.get(m.group(1), m.group(1))) != values[m.group(2)]:
-                raise ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": "x"}}, "UpdateItem")
+            for clause in ConditionExpression.split(" AND "):
+                m = re.fullmatch(r"([#\w.]+) = (:\w+)", clause)
+                assert m, f"fake supports only 'a = :v' conditions joined by AND, got {ConditionExpression!r}"
+                node, last = at(m.group(1))
+                if node.get(last) != values[m.group(2)]:
+                    raise ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": "x"}}, "UpdateItem")
         set_part, _, remove_part = UpdateExpression.partition(" REMOVE ")
         assert set_part.startswith("SET "), UpdateExpression
         for assignment in set_part[4:].split(", "):
             name, val = (s.strip() for s in assignment.split(" = "))
-            item[names.get(name, name)] = copy.deepcopy(values[val])
+            node, last = at(name, create=True)
+            node[last] = copy.deepcopy(values[val])
         for name in filter(None, (s.strip() for s in remove_part.split(","))):
             item.pop(names.get(name, name), None)
         return {}
@@ -914,6 +924,142 @@ def _json_schema(node):
         if "enum" in out and None not in out["enum"]:
             out["enum"] = out["enum"] + [None]
     return out
+
+
+
+class BlobS3(FakeS3):
+    """FakeS3 that keeps object bodies."""
+    def __init__(self):
+        super().__init__()
+        self.data = {}
+    def put_object(self, **kw):
+        super().put_object(**kw)
+        self.data[kw["Key"]] = kw["Body"]
+    def get_object(self, Bucket, Key):
+        return {"Body": io.BytesIO(self.data[Key])}
+
+
+class EditCustomScpsTests(_Base):
+    SOW = ("The customer, Acme Corp, requires a Control Tower landing zone in eu-west-1 and eu-central-1 only. "
+           "Logs must be retained for 7 years. Workloads and Shared OUs are required. Block root user usage. "
+           "Protect KMS keys from deletion.")
+
+    def setUp(self):
+        super().setUp()
+        from lzcore import render, scope as scopelib
+        self.render, self.s3b = render, BlobS3()
+        p = mock.patch.object(common, "_s3", self.s3b)
+        p.start(); self.addCleanup(p.stop)
+        g = {
+            "schemaVersion": "1", "customer": {"orgName": "Acme Corp"},
+            "regions": {"home": "eu-west-1", "governed": ["eu-west-1", "eu-central-1"], "extraAllowed": [], "explicitDeny": [], "enforceDeny": True},
+            "logging": {"retentionDays": 2555, "accessLogRetentionDays": 365, "logArchiveAccountId": "111111111111", "auditAccountId": "222222222222"},
+            "evidence": {"regions.home": {"basis": "explicit", "source": "landing zone in eu-west-1 and eu-central-1 only"},
+                         "regions.governed": {"basis": "explicit", "source": "eu-west-1 and eu-central-1 only"},
+                         "logging.retentionDays": {"basis": "explicit", "source": "retained for 7 years"}},
+            "ous": [{"name": "Workloads", "basis": "explicit", "source": "Workloads and Shared OUs are required"},
+                    {"name": "Shared", "basis": "explicit", "source": "Workloads and Shared OUs are required"}],
+            "scps": [], "controls": [], "unsupported": [], "assumptions": [], "openQuestions": [],
+            "customScps": [{"id": "protect-kms", "title": "Protect KMS keys", "targets": ["Workloads"], "basis": "explicit",
+                            "source": "Protect KMS keys from deletion",
+                            "policy": {"Version": "2012-10-17", "Statement": [{
+                                "Effect": "Deny", "Action": ["kms:ScheduleKeyDeletion"], "Resource": "*",
+                                "Condition": {"ArnNotLike": {"aws:PrincipalArn": ["arn:aws:iam::*:role/{{ADMIN_ROLE_NAME}}"]}}}]},
+                            "inputs": [{"name": "ADMIN_ROLE_NAME", "description": "Role allowed to delete keys"}]}],
+        }
+        self.scope, errs = scopelib.validate(g, self.SOW)
+        self.assertEqual(errs, [])
+        self.base = json.dumps(self.scope, indent=2, sort_keys=True).encode()
+        self.s3b.data["runs/d/sow.txt"] = self.SOW.encode()
+        self.s3b.data["runs/d/intake/scope.json"] = self.base
+        arts = {"sow": {"key": "runs/d/sow.txt", "sha": "x"}, "intake": {"key": "runs/d/intake/scope.json", "sha": "old"}}
+        for fmt, files in self.render.render_all(self.scope).items():
+            files = {**files, "reports/SUMMARY.md": "scan ok"}
+            key = f"runs/d/{fmt}.zip"
+            self.s3b.data[key] = self.render.zip_bytes(files, fmt)
+            arts[fmt] = {"key": key, "sha": "z"}
+        self.table.items[(f"RUN#{DESIGN_ID}", "META")]["artifacts"] = arts
+
+    def edit(self, edits, base="old", **kw):
+        return self.api("POST /runs/{runId}/custom-scps", {"baseSha": base, "edits": edits}, run_id=DESIGN_ID, **kw)
+
+    def test_values_are_saved_and_reach_the_scope_and_both_delivered_zips(self):
+        import zipfile
+        code, res = self.edit([{"id": "protect-kms", "values": {"ADMIN_ROLE_NAME": "MT-Administrator"}}])
+        self.assertEqual(code, 200, res)
+        _validate(self.raw, "ScopeEnvelope")
+        self.assertEqual(res["scope"]["customScps"][0]["inputs"][0]["value"], "MT-Administrator")
+        self.assertIn("filledSha256", res["scope"]["customScps"][0])
+        for fmt in ("terraform", "cloudformation"):
+            z = zipfile.ZipFile(io.BytesIO(self.s3b.data[f"runs/d/{fmt}.zip"]))
+            policy = z.read(f"{fmt}/custom-scps/protect-kms.json").decode()
+            self.assertIn("role/MT-Administrator", policy)
+            self.assertNotIn("{{", policy)
+            self.assertEqual(z.read(f"{fmt}/reports/SUMMARY.md"), b"scan ok")  # the scan reports are untouched
+            self.assertIn(fmt + "/README.md", z.namelist())
+            self.assertTrue(json.loads(z.read(f"{fmt}/custom-scps/index.json"))["policies"][0]["filled"])
+        meta = self.table.meta(DESIGN_ID)
+        self.assertEqual(meta["artifacts"]["intake"]["sha"], res["sha"])
+        self.assertEqual(meta["artifacts"]["terraform"]["sha"], __import__("hashlib").sha256(self.s3b.data["runs/d/terraform.zip"]).hexdigest())
+        detail = json.loads(self.table.audit(DESIGN_ID, "scope.custom_scps_edited")[0]["detail"])
+        self.assertEqual((detail["baseSha"], detail["newSha"], detail["filled"]), ("old", res["sha"], {"protect-kms": True}))
+        # the saved scope is what GET /scope returns next
+        self.assertEqual(self.api("GET /runs/{runId}/scope", run_id=DESIGN_ID)[1]["sha"], res["sha"])
+
+    def test_editing_the_policy_json_keeps_inputs_in_step_with_the_placeholders(self):
+        policy = json.loads(self.base)["customScps"][0]["policy"]
+        policy["Statement"][0]["Condition"]["ArnNotLike"]["aws:PrincipalArn"] = ["arn:aws:iam::*:role/{{OTHER_ROLE}}"]
+        code, res = self.edit([{"id": "protect-kms", "policy": policy}])
+        self.assertEqual(code, 200, res)
+        self.assertEqual([i["name"] for i in res["scope"]["customScps"][0]["inputs"]], ["OTHER_ROLE"])
+        policy["Statement"][0]["Condition"]["ArnNotLike"]["aws:PrincipalArn"] = ["arn:aws:iam::*:role/Admin"]
+        code, res = self.edit([{"id": "protect-kms", "policy": policy}], base=res["sha"])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(res["scope"]["customScps"][0]["inputs"], [])
+        self.assertIn("filledSha256", res["scope"]["customScps"][0])
+
+    def test_bad_edits_are_refused_with_the_reason_and_change_nothing(self):
+        before = dict(self.s3b.data)
+        bad = [
+            ([{"id": "nope", "values": {}}], "unknown policy id"),
+            ([{"id": "protect-kms", "values": {"ADMIN_ROLE_NAME": "{{X}}"}}], "must not contain"),
+            ([{"id": "protect-kms", "values": {"ADMIN_ROLE_NAME": "x" * 201}}], "longer than"),
+            ([{"id": "protect-kms", "values": {"OTHER": "x"}}], "not an input"),
+            ([{"id": "protect-kms", "values": {"ADMIN_ROLE_NAME": "a\nb"}}], "control characters"),
+            ([{"id": "protect-kms", "policy": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}}], "Deny"),
+            ([{"id": "protect-kms", "policy": "{not json"}], "not valid JSON"),
+        ]
+        for edits, text in bad:
+            code, res = self.edit(edits)
+            self.assertEqual(code, 400, edits)
+            self.assertIn(text, res["error"])
+            _validate(self.raw, "ErrorEnvelope")
+        self.assertEqual(self.s3b.data, before)
+        self.assertEqual(self.table.audit(DESIGN_ID, "scope.custom_scps_edited"), [])
+
+    def test_a_value_cannot_break_out_of_the_json(self):
+        code, res = self.edit([{"id": "protect-kms", "values": {"ADMIN_ROLE_NAME": 'x"], "Effect": "Allow'}}])
+        self.assertEqual(code, 200, res)
+        stmt = json.loads(self.s3b.data["runs/d/terraform.zip"] and __import__("zipfile").ZipFile(io.BytesIO(self.s3b.data["runs/d/terraform.zip"])).read("terraform/custom-scps/protect-kms.json"))["Statement"][0]
+        self.assertEqual(stmt["Effect"], "Deny")
+        self.assertEqual(len(stmt["Condition"]["ArnNotLike"]["aws:PrincipalArn"]), 1)
+
+    def test_a_stale_base_a_running_deploy_and_other_states_are_conflicts(self):
+        code, res = self.edit([{"id": "protect-kms", "values": {}}], base="stale")
+        self.assertEqual(code, 409); self.assertEqual(res["sha"], "old")
+        self.table.put_item({"PK": "RUN#" + "e" * 32, "SK": "META", "runId": "e" * 32, "requester": USER, "runKind": "deploy",
+                             "designRunId": DESIGN_ID, "status": "RUNNING", "artifacts": {}})
+        code, res = self.edit([{"id": "protect-kms", "values": {"ADMIN_ROLE_NAME": "A"}}])
+        self.assertEqual(code, 409); self.assertIn("stop it", res["error"])
+        self.table.items[("RUN#" + "e" * 32, "META")]["status"] = "FAILED"
+        self.table.items[(f"RUN#{DESIGN_ID}", "META")]["status"] = "RUNNING"
+        self.assertEqual(self.edit([{"id": "protect-kms", "values": {}}])[0], 409)
+
+    def test_only_the_owner_and_only_a_design_run(self):
+        self.assertEqual(self.edit([{"id": "protect-kms", "values": {}}], sub="someone-else")[0], 404)
+        self.table.items[(f"RUN#{DESIGN_ID}", "META")]["runKind"] = "deploy"
+        self.assertEqual(self.edit([{"id": "protect-kms", "values": {}}])[0], 400)
+        self.assertEqual(self.api("POST /runs/{runId}/custom-scps", {"baseSha": "old", "edits": []}, run_id=DESIGN_ID)[0], 400)
 
 
 OPENAPI = yaml.safe_load((ROOT / "docs" / "openapi.yaml").read_text())

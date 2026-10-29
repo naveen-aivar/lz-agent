@@ -38,49 +38,54 @@ export function buildDeployRequest(f: {
   return body;
 }
 
-export function DeployDialog({ designRunId, api, onStarted, onCancel }: {
+/** The deploy settings for a delivered design: the target account and the SCP choice up front, the rest under Advanced. */
+export function DeployForm({ designRunId, api, onStarted }: {
   designRunId: string;
   api: Pick<Client, "startDeploy" | "verifyDeployTarget">;
   onStarted: (runId: string) => void;
-  onCancel: () => void;
 }) {
   const [f, setF] = useState({ method: "role" as Method, accountId: "", roleArn: "", externalId: "", accessKeyId: "",
     secretAccessKey: "", sessionToken: "", accountEmail: "", mapAgreement: "", targetRegion: "", applyScps: true });
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [failed, setFailed] = useState(false);
   const set = (k: keyof typeof f) => (e: { target: { value: string } }) => setF({ ...f, [k]: e.target.value });
-
   async function run(kind: "verify" | "start") {
     setBusy(true);
     setMessage("");
+    setFailed(false);
     try {
       const body = buildDeployRequest(f);
       if (kind === "verify") {
         if (!body.deployTarget) throw new Error("Choose the role or keys method to test a connection");
         const r = await api.verifyDeployTarget({ designRunId, deployTarget: body.deployTarget });
+        setFailed(!r.ok);
         setMessage(r.ok ? String(r.message ?? "Connection OK") : `Failed: ${String(r.error ?? "unknown error")}`);
       } else {
         const r = await api.startDeploy(designRunId, body);
         onStarted(r.runId);
       }
     } catch (e) {
+      setFailed(true);
       setMessage(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
   }
-
   return (
-    <div className="modal"><div className="dialog" role="dialog" aria-modal="true" aria-label="Deploy target account">
-      <h2>Deploy target</h2>
-      <label>Auth method
+    <form className="panel panel-pad form" aria-label="Deploy settings" onSubmit={(e) => { e.preventDefault(); void run("start"); }}>
+      <div>
+        <h2>Where should the landing zone be built?</h2>
+        <p className="hint">AWS Transform builds it from the design you reviewed. You approve anything that creates or changes AWS resources.</p>
+      </div>
+      <label>How do we connect to the AWS account?
         <select value={f.method} onChange={set("method")}>
-          <option value="role">IAM role (AssumeRole)</option>
-          <option value="keys">Access keys (session)</option>
-          <option value="platform">Platform account only</option>
+          <option value="role">IAM role (recommended)</option>
+          <option value="keys">Access keys</option>
+          <option value="platform">This platform's own account</option>
         </select>
       </label>
-      {f.method !== "platform" && <label>Target account ID<input value={f.accountId} onChange={set("accountId")} inputMode="numeric" /></label>}
+      {f.method !== "platform" && <label>AWS account ID<input value={f.accountId} onChange={set("accountId")} inputMode="numeric" placeholder="12 digits" /></label>}
       {f.method === "role" && (<>
         <label>Role ARN<input value={f.roleArn} onChange={set("roleArn")} /></label>
         <label>External ID<input value={f.externalId} onChange={set("externalId")} autoComplete="off" /></label>
@@ -88,28 +93,34 @@ export function DeployDialog({ designRunId, api, onStarted, onCancel }: {
       {f.method === "keys" && (<>
         <label>Access key ID<input value={f.accessKeyId} onChange={set("accessKeyId")} autoComplete="off" /></label>
         <label>Secret access key<input type="password" value={f.secretAccessKey} onChange={set("secretAccessKey")} autoComplete="off" /></label>
-        <label>Session token (optional)<input value={f.sessionToken} onChange={set("sessionToken")} autoComplete="off" /></label>
       </>)}
-      <label>Account email (optional)
-        <span className="hint">prefix@domain for the new accounts, without a +. Transform adds +account-name.</span>
-        <input type="email" value={f.accountEmail} onChange={set("accountEmail")} />
-      </label>
-      <label className="check">
-        <input type="checkbox" checked={f.applyScps} onChange={(e) => setF({ ...f, applyScps: e.target.checked })} />
-        Apply SCPs
-      </label>
-      <span className="hint">Ticked: the agent stages the Service Control Policies and controls AWS Transform recommends for the Workloads OUs. Unticked: it skips them.</span>
-      <label>MAP agreement (optional)
-        <span className="hint">none, or the full MAP tag such as mig12345. The agent answers Transform's MAP question from it.</span>
-        <input value={f.mapAgreement} onChange={set("mapAgreement")} placeholder="none" />
-      </label>
-      <label>Control Tower Region override (optional)<input value={f.targetRegion} onChange={set("targetRegion")} placeholder="us-east-1" /></label>
-      {message && <p role="status" className="hint">{message}</p>}
-      <div className="row">
-        <button type="button" className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
-        {f.method !== "platform" && <button type="button" className="btn" onClick={() => run("verify")} disabled={busy}>Test connection</button>}
-        <button type="button" className="btn btn-primary" onClick={() => run("start")} disabled={busy}>Start deploy run</button>
+      <div>
+        <label className="check">
+          <input type="checkbox" checked={f.applyScps} onChange={(e) => setF({ ...f, applyScps: e.target.checked })} />
+          Apply the recommended service control policies
+        </label>
+        <span className="hint">Ticked: the agent stages the policies and controls AWS Transform recommends for the Workloads OUs. Unticked: it skips them.</span>
       </div>
-    </div></div>
+      <details>
+        <summary>Advanced</summary>
+        <div className="form" style={{ marginTop: 10 }}>
+          {f.method === "keys" && <label>Session token (optional)<input value={f.sessionToken} onChange={set("sessionToken")} autoComplete="off" /></label>}
+          <label>Account email (optional)
+            <span className="hint">prefix@domain for the new accounts, without a +. Transform adds +account-name.</span>
+            <input type="email" value={f.accountEmail} onChange={set("accountEmail")} />
+          </label>
+          <label>MAP agreement (optional)
+            <span className="hint">none, or the full MAP tag such as mig12345. The agent answers Transform's MAP question from it.</span>
+            <input value={f.mapAgreement} onChange={set("mapAgreement")} placeholder="none" />
+          </label>
+          <label>Control Tower Region (optional)<input value={f.targetRegion} onChange={set("targetRegion")} placeholder="the design's home Region" /></label>
+        </div>
+      </details>
+      {message && <p role="status" className={failed ? "errtext" : "hint"}>{message}</p>}
+      <div className="row">
+        <button type="submit" className="btn btn-primary" disabled={busy}>Start deploy</button>
+        {f.method !== "platform" && <button type="button" className="btn" onClick={() => void run("verify")} disabled={busy}>Test connection</button>}
+      </div>
+    </form>
   );
 }

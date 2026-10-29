@@ -4,7 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { Client, RunSummary } from "../api/client";
 import { DashboardPage } from "./DashboardPage";
 import { RunsPage } from "./RunsPage";
-import { RunsTable } from "./RunsTable";
+import { groupProjects } from "../logic/projects";
+import { ProjectsTable } from "./ProjectsTable";
 
 const now = Date.now() / 1000;
 const runs: RunSummary[] = [
@@ -14,41 +15,31 @@ const runs: RunSummary[] = [
 ];
 const api = (r: RunSummary[] = runs) => ({ listRuns: vi.fn().mockResolvedValue({ runs: r }) }) as unknown as Client;
 
-describe("RunsTable", () => {
-  it("words state and type and links every run", () => {
-    render(<RunsTable runs={runs} />);
+describe("ProjectsTable", () => {
+  it("shows one row per project with where it is and the next action", () => {
+    render(<ProjectsTable projects={groupProjects(runs)} />);
     const rows = screen.getAllByRole("row").slice(1);
-    expect(within(rows[0]!).getByText("In progress")).toBeInTheDocument();
-    expect(within(rows[0]!).getByText("Deploy")).toBeInTheDocument();
+    expect(rows).toHaveLength(3);  // the two deploy runs have no design run in this list, so each is its own project
+    expect(within(rows[0]!).getByText("Deploying")).toBeInTheDocument();
     expect(within(rows[0]!).getByText("Getsetyo Tech")).toHaveAttribute("href", `#/run/${"a".repeat(32)}`);
-    expect(within(rows[1]!).getByText("Failed")).toBeInTheDocument();
+    expect(within(rows[1]!).getByText("Deploy stopped")).toBeInTheDocument();
     expect(within(rows[1]!).getByText(/Stopped by user/)).toBeInTheDocument();
-    expect(within(rows[2]!).getByText("Ready to download")).toBeInTheDocument();
-    expect(within(rows[2]!).getByText("Design")).toBeInTheDocument();
-    expect(within(rows[2]!).getByText("cccccccc")).toBeInTheDocument();
+    expect(within(rows[2]!).getByText("Ready to review")).toBeInTheDocument();
+    expect(within(rows[2]!).getByRole("link", { name: "Review →" })).toHaveAttribute("href", `#/run/${"c".repeat(32)}`);
   });
-  it("offers Deploy only for a delivered design run", async () => {
-    const onDeploy = vi.fn();
-    render(<RunsTable runs={runs} onDeploy={onDeploy} />);
-    const buttons = screen.getAllByRole("button", { name: "Deploy" });
-    expect(buttons).toHaveLength(1);
-    await userEvent.setup().click(buttons[0]!);
-    expect(onDeploy).toHaveBeenCalledWith("c".repeat(32));
-  });
-  it("says so when there are no runs", () => {
-    render(<RunsTable runs={[]} />);
-    expect(screen.getByText(/No runs yet/)).toBeInTheDocument();
+  it("says so when there is nothing to show", () => {
+    render(<ProjectsTable projects={[]} />);
+    expect(screen.getByText(/Nothing here yet/)).toBeInTheDocument();
   });
 });
-
 describe("DashboardPage", () => {
   it("shows the counts, the success rate and the latest runs", async () => {
     render(<DashboardPage api={api()} />);
     expect(await screen.findByText("Runs (30 days)")).toBeInTheDocument();
     expect(screen.getByText("1 delivered · 1 failed")).toBeInTheDocument();
     expect(screen.getByText("50.0%")).toBeInTheDocument();
-    expect(screen.getByText("Recent runs")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "All runs →" })).toHaveAttribute("href", "#/runs");
+    expect(screen.getByText("Recent projects")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "All projects →" })).toHaveAttribute("href", "#/runs");
   });
   it("shows a dash before any run has finished", async () => {
     render(<DashboardPage api={api([runs[0]!])} />);
@@ -62,9 +53,9 @@ describe("DashboardPage", () => {
 });
 
 describe("RunsPage", () => {
-  it("is the run history", async () => {
-    render(<RunsPage api={api()} onOpen={() => {}} />);
-    expect(await screen.findByRole("heading", { name: "Runs" })).toBeInTheDocument();
+  it("lists projects", async () => {
+    render(<RunsPage api={api()} />);
+    expect(await screen.findByRole("heading", { name: "Projects" })).toBeInTheDocument();
     expect(screen.getAllByRole("row")).toHaveLength(4);
   });
 });
@@ -76,22 +67,22 @@ describe("RunsPage paging", () => {
   const big = () => ({ listRuns: vi.fn().mockResolvedValue({ runs: many, total: 60 }) }) as unknown as Client;
 
   it("shows 25 runs, then 25 more on request, and says how many there are", async () => {
-    render(<RunsPage api={big()} onOpen={() => {}} />);
-    expect(await screen.findByTestId("run-count")).toHaveTextContent("Showing 25 of 60 matching runs (60 in total)");
+    render(<RunsPage api={big()} />);
+    expect(await screen.findByTestId("run-count")).toHaveTextContent("Showing 25 of 60 matching projects");
     expect(screen.getAllByRole("row")).toHaveLength(26);
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Show 25 more" }));
-    expect(screen.getByTestId("run-count")).toHaveTextContent("Showing 50 of 60 matching runs (60 in total)");
+    expect(screen.getByTestId("run-count")).toHaveTextContent("Showing 50 of 60 matching projects");
     await user.click(screen.getByRole("button", { name: "Show 10 more" }));
-    expect(screen.getByTestId("run-count")).toHaveTextContent("Showing 60 of 60 matching runs (60 in total)");
+    expect(screen.getByTestId("run-count")).toHaveTextContent("Showing 60 of 60 matching projects");
     expect(screen.getAllByRole("row")).toHaveLength(61);
     expect(screen.queryByRole("button", { name: /Show .* more/ })).toBeNull();
   });
 
   it("says when the API list is shorter than the number of runs", async () => {
     const cut = { listRuns: vi.fn().mockResolvedValue({ runs: many.slice(0, 30), total: 900 }) } as unknown as Client;
-    render(<RunsPage api={cut} onOpen={() => {}} />);
-    expect(await screen.findByTestId("run-count")).toHaveTextContent("Showing 25 of 30 matching runs (900 in total); only the newest 30 can be listed");
+    render(<RunsPage api={cut} />);
+    expect(await screen.findByTestId("run-count")).toHaveTextContent("Showing 25 of 30 matching projects; only the newest 30 runs can be listed (900 in total)");
   });
 
   it("counts the dashboard over every run, not the first page", async () => {

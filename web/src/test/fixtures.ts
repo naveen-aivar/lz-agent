@@ -16,3 +16,9 @@ export const task = (over: Partial<PendingHumanInput> = {}): PendingHumanInput =
 export const run = (pending?: PendingHumanInput, over: Partial<Run> = {}): Run => ({
   runId: "a".repeat(32), runKind: "deploy", status: "RUNNING", customerId: "acme", pendingHumanInput: pending, ...over,
 });
+export const SCOPE = {
+  customer: { orgName: "Acme" }, regions: { home: "us-east-1", governed: ["us-east-1"], extraAllowed: [], denied: [], enforceDeny: false },
+  logging: { retentionDays: 365, accessLogRetentionDays: 90 }, ous: [{ name: "Security", basis: "explicit" }], accounts: [{ name: "Audit", kind: "audit", ou: "Security" }],
+  scps: [], controls: [], customScps: [], unsupported: [], assumptions: [], openQuestions: ["Which email?"], missingRequired: ["root email for Audit"],
+  summary: { ous: 1, accounts: 1, controls: 0, controlAttachments: 0, scps: 0 },
+};
