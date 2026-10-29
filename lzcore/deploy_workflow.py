@@ -109,3 +109,42 @@ def evaluate_deployment_outcome(
             f"Post-deploy missing OUs={post_missing_ous}, accounts={post_missing_accts}"
         )
     return "fail", reasons
+
+
+def verify_landing_zone(scope: dict, boto_session, region: str) -> dict[str, Any]:
+    """Whether the target account holds the approved landing zone: every design OU and account exists, every design
+    account is ACTIVE, and a Control Tower landing zone in ``region`` is ACTIVE.
+
+    Returns {"ok", "problems": [...], "missingOus", "missingAccountsByName", "inactiveAccounts", "controlTower"}.
+    Raises when it cannot read the account (an unreadable answer is not "not built"): Organizations discovery errors,
+    Control Tower read errors, and more than one landing zone in the Region.
+    """
+    if not region:
+        raise ValueError("verify_landing_zone needs the Control Tower Region (the run's targetRegion or the design's home)")
+    snapshot, gaps = collect_snapshot_and_gaps(scope, boto_session)
+    problems: list[str] = []
+    if gaps["missingOus"]:
+        problems.append(f"organizational units not found: {', '.join(gaps['missingOus'])}")
+    if gaps["missingAccountsByName"]:
+        problems.append(f"accounts not found: {', '.join(gaps['missingAccountsByName'])}")
+    expected = {a.get("name") for a in scope.get("accounts") or [] if a.get("name")}
+    inactive = sorted(f"{a['name']} ({a.get('status')})" for a in snapshot.get("accounts") or []
+                      if a.get("name") in expected and a.get("status") != "ACTIVE")
+    if inactive:
+        problems.append(f"accounts not ACTIVE: {', '.join(inactive)}")
+    ct = boto_session.client("controltower", region_name=region)
+    arns: list[str] = []
+    for page in ct.get_paginator("list_landing_zones").paginate():
+        arns.extend(z["arn"] for z in page.get("landingZones", []))
+    ct_state: dict[str, Any] = {"region": region, "landingZones": len(arns)}
+    if not arns:
+        problems.append(f"no Control Tower landing zone in {region}")
+    elif len(arns) > 1:
+        raise RuntimeError(f"{len(arns)} Control Tower landing zones in {region}; expected one: {arns}")
+    else:
+        lz = ct.get_landing_zone(landingZoneIdentifier=arns[0]).get("landingZone") or {}
+        ct_state.update(arn=arns[0], status=lz.get("status"), version=lz.get("version"))
+        if lz.get("status") != "ACTIVE":
+            problems.append(f"Control Tower landing zone {arns[0]} is {lz.get('status')!r}, not ACTIVE")
+    return {"ok": not problems, "problems": problems, "missingOus": gaps["missingOus"],
+            "missingAccountsByName": gaps["missingAccountsByName"], "inactiveAccounts": inactive, "controlTower": ct_state}

@@ -105,6 +105,7 @@ export interface paths {
          *     Only the task in `pendingHumanInput` with category TOOL_APPROVAL can be decided. The deploy agent has no
          *     path to this route.
          */
+        
         post: operations["decideTask"];
         delete?: never;
         options?: never;

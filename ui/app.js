@@ -379,7 +379,7 @@ function deployStepsHtml(run, audit) {
   const waitingOnPerson = run.status === "RUNNING" && (run.awaitingHitl === true || (!!run.pendingHumanInput && !isUpdateOnly(run.pendingHumanInput)));
   const has = (a) => audit.some((x) => x.action === a);
   const hasTool = (name) => audit.some((x) => x.action === name);
-  const jobDone = audit.some((x) => x.action === "tool.transform_poll_analyze_job" && parseAuditDetail(x).done === true);
+  const jobDone = audit.some((x) => (x.action === "tool.transform_poll_analyze_job" && parseAuditDetail(x).done === true) || x.action === "transform.job_closed");
   const done = [
     hasTool("tool.run_pre_discover") || hasTool("tool.run_pre_discover.failed"),
     jobDone,
@@ -806,6 +806,10 @@ function securityPanel(rep) {
 }
 
 const ACTIONS = {
+  "transform.build_reported_complete": "Deploy agent: Transform reports the landing zone deployed",
+  "transform.build_verified": "Landing zone verified against the design",
+  "transform.build_verification_failed": "Landing zone not complete yet",
+  "transform.job_closed": "Transform job closed after verification",
   "run.created": "Run created",
   "run.started": "Analysis started",
   "sow.extracted": "SOW text extracted",

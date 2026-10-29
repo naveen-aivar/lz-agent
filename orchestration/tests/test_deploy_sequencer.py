@@ -470,6 +470,11 @@ class FakeTransformOps:
             "job": {"statusDetails": {"status": status}},
         }
 
+    job_status_after_stop = "STOPPED"
+
+    def job_status_now(self, job_id, workspace=None):
+        return self.job_status_after_stop
+
     def stop_job(self, job_id, workspace_id):
         self.stopped.append((job_id, workspace_id))
         if self.stop_error is not None:
@@ -484,6 +489,10 @@ class FakeOrgSession:
         self.account_id = account_id
         self.org_error = org_error
         self.clients: list[str] = []
+        self.landing_zones: list[dict] = []  # [{"arn", "status"}] Control Tower returns for the Region asked
+        self.ct_regions: list = []
+        self.account_status = "ACTIVE"
+        self.extra_ous: list[str] = []
 
     def client(self, name, **kw):
         self.clients.append(name)
@@ -497,7 +506,13 @@ class FakeOrgSession:
         if name == "organizations":
             return _FakeOrganizations(self)
         if name == "controltower":
-            return _FakePaged({"list_landing_zones": lambda **k: {"landingZones": []}})
+            self.ct_regions.append(kw.get("region_name"))
+            by_arn = {z["arn"]: z for z in self.landing_zones}
+            return _FakePaged({
+                "list_landing_zones": lambda **k: {"landingZones": [{"arn": z["arn"]} for z in self.landing_zones]},
+                "get_landing_zone": lambda landingZoneIdentifier, **k: {"landingZone": {
+                    "arn": landingZoneIdentifier, "status": by_arn[landingZoneIdentifier]["status"], "version": "3.3"}},
+            })
         raise AssertionError(f"FakeOrgSession: unexpected client {name!r}")
 
 
@@ -528,12 +543,13 @@ class _FakeOrganizations(_FakePaged):
 
         def list_ous(ParentId, **k):
             if ParentId == "r-test":
-                return {"OrganizationalUnits": [{"Id": "ou-test-workloads", "Name": "Workloads"}]}
+                return {"OrganizationalUnits": [{"Id": "ou-test-workloads", "Name": "Workloads"}]
+                        + [{"Id": f"ou-x-{n}", "Name": n} for n in session.extra_ous]}
             return {"OrganizationalUnits": []}
 
         accounts = [
             {"Id": session.account_id, "Name": "acme-management", "Status": "ACTIVE"},
-            {"Id": "333333333333", "Name": "acme-prod", "Status": "ACTIVE"},
+            {"Id": "333333333333", "Name": "acme-prod", "Status": session.account_status},
         ]
         super().__init__({
             "describe_organization": describe_organization,
@@ -1628,7 +1644,7 @@ class TransformConversation(_SequencerCaseBase):
 
         self.assertEqual(_REAL_CONVERSE_AGENT("prompt"), "ok")
         self.assertEqual({_tool_name(t) for t in captured["tools"]},
-                         {"answer_transform_question", "no_reply_needed", "escalate_to_human"})
+                         {"answer_transform_question", "no_reply_needed", "report_build_complete", "escalate_to_human"})
         self.assertEqual(captured["system_prompt"], app.CONVERSE_SYSTEM)
         self.assertIn("Approval gates", app.CONVERSE_SYSTEM)
         # Starting execution ("Proceed") is an approval gate the agent must always hand to a person.
@@ -2525,3 +2541,191 @@ class ResumedRun(_SequencerCaseBase):
         self.assertEqual(result["status"], "continue")
         q = self.table.item("AGENTQ#message:msg-0001")
         self.assertEqual((q["status"], q["turns"]), ("escalated", 1))  # one turn, not the 4th of the old epoch
+
+
+# --------------------------------------------------------------------------------------
+# Build complete: the agent reports it, the platform verifies the account, then closes the job
+# --------------------------------------------------------------------------------------
+FINAL = {**MESSAGE, "messageId": "msg-final", "title": "Transform is asking for a reply", "options": [], "choices": [],
+         "jobAwaitingInput": False, "text": "Your landing zone is complete, and everything in it is now deployed."}
+LZ_ARN = "arn:aws:controltower:us-east-1:111111111111:landingzone/LZ1"
+
+
+def _report_complete(basis=("scope:/ous", "scope:/accounts"), expect="Recorded"):
+    def turn(prompt):
+        out = conv.report_build_complete("Transform says the landing zone is deployed.", list(basis))
+        assert out.startswith(expect), out
+        return out
+    return turn
+
+
+class BuildComplete(_SequencerCaseBase):
+    def _env(self, polls=6, lz_status="ACTIVE", **meta):
+        org = FakeOrgSession()
+        if lz_status:
+            org.landing_zones = [{"arn": LZ_ARN, "status": lz_status}]
+        self._make_env(transform_ops=FakeTransformOps(poll_script=[("EXECUTING", FINAL)] * polls),
+                       meta_extra={"transformAnalyzeJobId": ANALYZE_JOB, "targetRegion": "us-east-1",
+                                   "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}, **meta},
+                       org_session=org)
+        self._seed_foundation()
+        self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
+        self.s3.put_json(f"{DEPLOYMENT}/transform-poll-analyze.json", {"status": "EXECUTING"})
+        return org
+
+    def _q(self):
+        return self.table.item("AGENTQ#message:msg-final")
+
+    def test_a_matching_account_closes_the_job_and_the_run_moves_on(self):
+        org = self._env()
+        self._set_converse(_report_complete())
+
+        first = self._invoke()
+
+        self.assertEqual(first["status"], "continue")
+        self.assertEqual(self._stage(), "transform_build_verified")
+        self.assertEqual(self.fake_ops.stopped, [])  # verified first, closed on the next invoke
+        self.assertEqual(org.ct_regions[-1], "us-east-1")  # Control Tower read in the run's Region
+        q = self._q()
+        self.assertEqual((q["status"], q["verified"], q["checks"]), ("build_complete", True, 1))
+        self.assertIn("transform.build_reported_complete", self.table.actions())
+        self.assertIn("transform.build_verified", self.table.actions())
+
+        self._set_model([])  # the judgment step runs after the merge; this test stops before it matters
+        self._invoke()
+
+        self.assertEqual(self.fake_ops.stopped, [(ANALYZE_JOB, WORKSPACE)])
+        (closed,) = self.table.audit_of("transform.job_closed")
+        self.assertEqual(json.loads(closed["detail"])["how"], "stopped by the platform")
+        self.assertIn(self._stage(), ("transform_merged", "transform_analyze_done"))
+        self.assertIn("tool.transform_merge_discovery", self.table.actions())
+
+    def test_a_missing_account_is_rechecked_without_the_model_and_never_closes_the_job(self):
+        org = self._env(polls=4)
+        org.account_status = "SUSPENDED"
+        self._set_converse(_report_complete())  # one model turn only: re-checks do not ask the model again
+
+        result = self._invoke()
+
+        self.assertIs(result["awaitingHitl"], False)
+        note = result["pendingHumanInput"]["agentNote"]
+        self.assertTrue(note["informational"])
+        self.assertIn("acme-prod (SUSPENDED)", note["reason"])
+        self.assertEqual(self._stage(), "transform_analyze_waiting")
+        org.account_status = "ACTIVE"  # the account finishes provisioning
+        self._invoke()
+        self.assertEqual(self._stage(), "transform_build_verified")
+        self.assertEqual(self._q()["checks"], 2)
+        self.assertEqual(self.fake_ops.stopped, [])
+
+    def test_after_the_limit_a_mismatch_goes_to_a_person_with_what_is_missing(self):
+        self._env(polls=dwt.MAX_BUILD_VERIFICATIONS + 1, lz_status=None)
+        self._set_converse(_report_complete())
+
+        results = [self._invoke() for _ in range(dwt.MAX_BUILD_VERIFICATIONS)]
+
+        last = results[-1]
+        self.assertIs(last["awaitingHitl"], True)
+        note = last["pendingHumanInput"]["agentNote"]
+        self.assertNotIn("informational", note)
+        self.assertIn("no Control Tower landing zone in us-east-1", note["reason"])
+        self.assertIn(f"after {dwt.MAX_BUILD_VERIFICATIONS} checks", note["reason"])
+        self.assertEqual(self._q()["status"], "escalated")
+        self.assertEqual(self.fake_ops.stopped, [])
+        self.assertEqual(len(self.table.audit_of("transform.build_verification_failed")), dwt.MAX_BUILD_VERIFICATIONS)
+
+    def test_a_landing_zone_that_is_not_active_is_not_done(self):
+        self._env(lz_status="PROCESSING")
+        self._set_converse(_report_complete())
+        result = self._invoke()
+        self.assertIn("is 'PROCESSING', not ACTIVE", result["pendingHumanInput"]["agentNote"]["reason"])
+        self.assertEqual(self._stage(), "transform_analyze_waiting")
+
+    def test_an_unreadable_account_is_a_named_error_not_a_mismatch(self):
+        org = self._env()
+        org.org_error = _orgs_not_in_use()
+        self._set_converse(_report_complete())
+        self._assert_error(self._invoke(), "transform_converse failed")
+        self.assertEqual(self.fake_ops.stopped, [])
+
+    def test_a_failed_stop_moves_on_only_when_the_job_is_closed(self):
+        self._env()
+        self._set_converse(_report_complete())
+        self._invoke()
+        self.fake_ops.stop_error = RuntimeError("ConflictException: job is not running")
+        self.fake_ops.job_status_after_stop = "EXECUTING"
+        self._assert_error(self._invoke(), "transform_close_job failed", ANALYZE_JOB, "still EXECUTING")
+        self.assertEqual(self._stage(), "transform_build_verified")
+
+        self.fake_ops.job_status_after_stop = "STOPPED"  # e.g. Transform or a person closed it meanwhile
+        self._set_model([])
+        self._invoke()
+        (closed,) = self.table.audit_of("transform.job_closed")
+        self.assertEqual(json.loads(closed["detail"])["how"], "already STOPPED")
+
+    def test_the_tool_refuses_questions_tasks_waits_and_unsupported_claims(self):
+        for pending, expect in ((MESSAGE, "only a message without options"), (PENDING, "only a message without options"),
+                                ({**FINAL, "jobAwaitingInput": True}, "AWAITING_HUMAN_INPUT")):
+            with self.subTest(expect=expect, kind=pending["kind"]):
+                self._make_env(transform_ops=FakeTransformOps(poll_script=[("EXECUTING", pending)]),
+                               meta_extra={"transformAnalyzeJobId": ANALYZE_JOB,
+                                           "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}})
+                self._seed_foundation()
+                self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
+                self._set_converse(lambda prompt, e=expect: (_report_complete(expect=f"REFUSED: {e}")(prompt),
+                                                             _escalate("Not finished.")(prompt)))
+                self._invoke()
+                self.assertEqual(self.fake_ops.stopped, [])
+        self._env()
+        self._set_converse(lambda prompt: (_report_complete(basis=("context:runPurpose",), expect="REFUSED: basis must")(prompt),
+                                           _report_complete(basis=("scope:/ous/9",), expect="REFUSED: these basis")(prompt),
+                                           _report_complete(basis=(), expect="REFUSED: basis must")(prompt),
+                                           _escalate("Cannot say what was built.")(prompt)))
+        self._invoke()
+        self.assertEqual(self._stage(), "transform_analyze_waiting")
+
+    def test_the_conversation_prompt_says_the_agent_closes_nothing(self):
+        self.assertIn("report_build_complete", app.CONVERSE_SYSTEM)
+        self.assertIn("You close nothing", app.CONVERSE_SYSTEM)
+
+
+class VerifyLandingZone(unittest.TestCase):
+    SCOPE = {"ous": [{"name": "Workloads"}], "accounts": [{"name": "acme-management"}, {"name": "acme-prod"}]}
+
+    def verify(self, org):
+        from lzcore.deploy_workflow import verify_landing_zone
+        return verify_landing_zone(self.SCOPE, org, "us-east-1")
+
+    def org(self, lzs=({"arn": LZ_ARN, "status": "ACTIVE"},)):
+        o = FakeOrgSession()
+        o.landing_zones = list(lzs)
+        return o
+
+    def test_a_complete_landing_zone_passes(self):
+        out = self.verify(self.org())
+        self.assertEqual((out["ok"], out["problems"]), (True, []))
+        self.assertEqual(out["controlTower"]["status"], "ACTIVE")
+
+    def test_each_kind_of_gap_is_named(self):
+        o = self.org([])
+        o.account_status = "PENDING_CLOSURE"
+        out = self.verify(o)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["problems"], ["accounts not ACTIVE: acme-prod (PENDING_CLOSURE)", "no Control Tower landing zone in us-east-1"])
+        out = self.verify(self.org())
+        scope = {**self.SCOPE, "ous": [{"name": "Workloads"}, {"name": "Production"}], "accounts": [*self.SCOPE["accounts"], {"name": "Staging"}]}
+        from lzcore.deploy_workflow import verify_landing_zone
+        out = verify_landing_zone(scope, self.org(), "us-east-1")
+        self.assertEqual(out["problems"], ["organizational units not found: Production", "accounts not found: Staging"])
+
+    def test_extra_ous_or_accounts_do_not_block_completion(self):
+        o = self.org()
+        o.extra_ous = ["Sandbox"]
+        self.assertTrue(self.verify(o)["ok"])
+
+    def test_two_landing_zones_or_no_region_raise(self):
+        with self.assertRaisesRegex(RuntimeError, "2 Control Tower landing zones"):
+            self.verify(self.org([{"arn": "a", "status": "ACTIVE"}, {"arn": "b", "status": "ACTIVE"}]))
+        from lzcore.deploy_workflow import verify_landing_zone
+        with self.assertRaises(ValueError):
+            verify_landing_zone(self.SCOPE, self.org(), "")

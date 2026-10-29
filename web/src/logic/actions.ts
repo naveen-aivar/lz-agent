@@ -1,5 +1,9 @@
 /** Event wording, copied from the classic UI (ui/app.js ACTIONS) so both UIs say the same thing. */
 export const ACTIONS: Record<string, string> = {
+  "transform.build_reported_complete": "Deploy agent: Transform reports the landing zone deployed",
+  "transform.build_verified": "Landing zone verified against the design",
+  "transform.build_verification_failed": "Landing zone not complete yet",
+  "transform.job_closed": "Transform job closed after verification",
   "run.created": "Run created",
   "run.started": "Analysis started",
   "sow.extracted": "SOW text extracted",

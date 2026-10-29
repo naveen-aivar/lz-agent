@@ -24,6 +24,7 @@ from strands import tool
 
 from lzcore import transform_ops
 from lzcore.deploy_render import render_deploy_iac
+from lzcore.deploy_workflow import verify_landing_zone
 from lzcore.deploy_transform import (
     init_transform,
     merge_transform_into_foundation,
@@ -49,6 +50,10 @@ _IAC_CHANGE_PLAN = "iac-change-plan.json"
 # Model turns at transform_merged that may end without both judgment artifacts (any yield included)
 # before the run fails.
 MAX_JUDGMENT_ATTEMPTS = 3
+# Account checks after the agent reports the build complete, before the claim goes to a person (about 20 s each).
+MAX_BUILD_VERIFICATIONS = 15
+# Job statuses that mean the Transform job is closed (ours or Transform's own).
+_JOB_CLOSED = frozenset({"STOPPED", "CANCELLED", "CANCELED", "COMPLETED", "COMPLETE", "SUCCEEDED", "SUCCESS", "DONE"})
 # Longest conversation-turn error kept on the AGENTQ# item and in the final failure.
 _CONVERSE_ERROR_LIMIT = 1000
 
@@ -552,6 +557,33 @@ def _poll_analyze_step() -> None:
     _execute_transform_poll_analyze_once()
 
 
+def _execute_close_verified_job() -> None:
+    """The account matched the design (transform_build_verified): close the Transform job and move on.
+
+    The job is closed with StopJob. If StopJob fails, the job's status decides: already closed (a retry after a crash,
+    or Transform closed it itself) moves on; still open raises naming the job.
+    """
+    cp = read_checkpoint() or {}
+    job_id, ws = cp.get("jobId"), _run_meta().get("transformWorkspaceId")
+    if not job_id or not ws:
+        raise RuntimeError(f"transform_build_verified checkpoint has no jobId/workspace ({job_id!r}, {ws!r})")
+    try:
+        transform_ops.stop_job(job_id, ws)
+        how = "stopped by the platform"
+    except Exception as e:  # noqa: BLE001 - decided by the job's own status below, never assumed
+        status = transform_ops.job_status_now(job_id, ws)
+        if status not in _JOB_CLOSED:
+            raise RuntimeError(
+                f"the landing zone matched the design, but closing Transform job {job_id} failed "
+                f"({type(e).__name__}: {e}) and the job is still {status}; stop it in the Transform console, then resume"
+            ) from e
+        how = f"already {status}"
+    base.log_tool_event("transform.job_closed", {"jobId": job_id, "how": how,
+                                                 "verification": cp.get("verification")})
+    _save_checkpoint("transform_analyze_done", jobId=job_id, closedAfterVerification=True,
+                     verification=cp.get("verification"))
+
+
 # stage -> (step name, executor, is_poll). transform_merged (judgment) is handled inline.
 _STEPS: dict[str | None, tuple[str, Callable[[], object], bool]] = {
     None: ("run_pre_discover", _execute_pre_discover_step, False),
@@ -559,6 +591,8 @@ _STEPS: dict[str | None, tuple[str, Callable[[], object], bool]] = {
     "transform_init_done": ("transform_start_analyze", _execute_transform_start_analyze, False),
     "transform_analyze_started": ("transform_poll_analyze_job", _poll_analyze_step, True),
     "transform_analyze_waiting": ("transform_poll_analyze_job", _poll_analyze_step, True),
+    # The agent reported the build complete and the account matched the design: close the job, then merge.
+    "transform_build_verified": ("transform_close_job", _execute_close_verified_job, False),
     "transform_analyze_done": ("transform_merge_discovery", _execute_merge, False),
     "judgment_done": ("render_iac_bundles", _execute_render, False),
     # The Transform job has already applied the landing zone; check the org it left behind.
@@ -785,6 +819,49 @@ def _handle_connector_task(cp: dict, pending: dict, qkey: str, item: dict) -> di
     return _escalated(cp, pending, stored)
 
 
+def _verify_build(cp: dict, pending: dict, qkey: str, item: dict) -> dict:
+    """The agent says Transform reports the landing zone deployed. Check the account; never take the claim on trust.
+
+    Match: record the result (transform_build_verified) and continue; the next step closes the Transform job.
+    No match: show what is missing and check again on the next poll (Transform may still be finishing), up to
+    MAX_BUILD_VERIFICATIONS; then hand it to a person with the missing items, without closing anything.
+    A failed read of the account is a step error: an unreadable account is not "not built".
+    """
+    meta = _run_meta()
+    scope = _design_scope()
+    region = conv.effective_region(meta, scope)
+    if not region:
+        raise RuntimeError("cannot verify the landing zone: no Control Tower Region (run targetRegion or design home)")
+    result = verify_landing_zone(scope, base.deploy_boto_session(), region)
+    checks = int(item.get("checks") or 0) + 1
+    base.log_tool_event("transform.build_verified" if result["ok"] else "transform.build_verification_failed",
+                        {"jobId": pending.get("jobId"), "check": checks, "limit": MAX_BUILD_VERIFICATIONS,
+                         "problems": result["problems"][:10], "controlTower": result["controlTower"]})
+    fields = {k: v for k, v in item.items() if k not in ("PK", "SK", "updatedAt")}
+    if result["ok"]:
+        conv.put_question(qkey, **{**fields, "status": "build_complete", "checks": checks, "verified": True,
+                                   "reason": "AWS Transform reports the landing zone deployed, and the target account "
+                                             "matches the approved design. Closing the Transform job."})
+        _save_checkpoint("transform_build_verified", jobId=cp.get("jobId") or pending.get("jobId"),
+                         verification={"checks": checks, "controlTower": result["controlTower"]})
+        return _continue("landing zone verified against the design; closing the Transform job", read_checkpoint() or {})
+    missing = "; ".join(result["problems"])
+    if checks >= MAX_BUILD_VERIFICATIONS:
+        item = conv.put_question(qkey, **{**fields, "status": "escalated", "checks": checks, "informational": False,
+                                          "suggestion": None, "suggestionType": None,
+                                          "reason": f"AWS Transform says the landing zone is deployed, but the target "
+                                                    f"account does not match the approved design after {checks} checks: "
+                                                    f"{missing}. Check the account and reply to Transform."})
+        base.log_tool_event("transform.agent_escalated", {"jobId": pending.get("jobId"), "kind": "message",
+                                                          "title": pending.get("title"), "reason": item["reason"][:500],
+                                                          "suggestion": None, "suggestionType": None})
+        return _escalated(cp, pending, item)
+    item = conv.put_question(qkey, **{**fields, "status": "build_complete", "checks": checks,
+                                      "reason": f"AWS Transform reports the landing zone deployed. Check {checks} of "
+                                                f"{MAX_BUILD_VERIFICATIONS}: not there yet ({missing}). Checking again."})
+    return _clear_pending(cp, pending, item)
+
+
 def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
     """Give the pending Transform question to the conversation agent once, then report the wait.
 
@@ -810,6 +887,8 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
                                  lastError="you judged this message progress-only, but Transform now waits for a reply to it")
         base.log_tool_event("transform.informational_reopened", {"question": qkey, "jobId": pending.get("jobId")})
         status = "deciding"
+    if status == "build_complete":
+        return _verify_build(cp, pending, qkey, item)
     if status == "informational":
         return _clear_pending(cp, pending, item)
     if status == "escalated":
@@ -870,6 +949,8 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
             return _escalated(cp, pending, item)
         if decided == "informational":
             return _clear_pending(cp, pending, item)
+        if decided == "build_complete":
+            return _verify_build(cp, pending, qkey, item)
         return _continue_from(cp)
 
     error = error or "the model ended the turn without answering or escalating"

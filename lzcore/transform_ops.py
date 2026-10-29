@@ -400,6 +400,17 @@ def stop_job(job_id: str, workspace_id: str) -> None:
     _run(_go())
 
 
+def job_status_now(job_id: str, workspace: Optional[str] = None) -> str:
+    """The job's current status, whatever it is (including STOPPED). For the platform's job close only."""
+    ws = workspace or workspace_id()
+    _ensure_connected()
+
+    async def _go():
+        return job_status(await _get_job(ws, job_id), job_id)
+
+    return _run(_go())
+
+
 def job_status(job: dict, job_id: str) -> str:
     """Job state from a GetJob ``job``: ``statusDetails.status`` (JobStatus enum) only.
 

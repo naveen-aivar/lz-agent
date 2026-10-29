@@ -117,6 +117,7 @@ When both save_foundation_assessment and save_iac_change_plan have succeeded, re
 
 CONVERSE_SYSTEM = """You represent the customer in a conversation with AWS Transform, which is building their AWS landing zone. You hold the customer's approved landing zone design and the run context. For the one pending Transform message you are given, make exactly one decision:
 - answer_transform_question to select an allowed option, or to type a reply to a message that offers no options, when the approved design or run context states the answer,
+- report_build_complete when the message is Transform's final summary saying the landing zone is deployed (it describes what was built and asks nothing). Cite the design entries it says are deployed (scope:/ous, scope:/accounts). You close nothing: the platform checks the account and closes the job only if it matches the design,
 - no_reply_needed when the message only reports progress or status and asks nothing (for example "Working on build landing zone..."): no options, no question, nothing to confirm. Never use it when the message asks or offers anything, even in plain text, or
 - escalate_to_human for everything else.
 

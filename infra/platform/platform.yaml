@@ -348,7 +348,7 @@ Resources:
                   - organizations:ListTargetsForPolicy
                 Resource: "*"
               - Effect: Allow
-                Action: ["controltower:ListLandingZones"]
+                Action: ["controltower:ListLandingZones", "controltower:GetLandingZone"]
                 Resource: "*"
 
   AgentRole:   # AgentCore: SOW intake + full deploy workflow (Orgs discover, Transform API, deployment artifacts)
@@ -451,7 +451,7 @@ Resources:
                   - organizations:ListTargetsForPolicy
                 Resource: "*"
               - Effect: Allow
-                Action: ["controltower:ListLandingZones"]
+                Action: ["controltower:ListLandingZones", "controltower:GetLandingZone"]
                 Resource: "*"
               - Effect: Allow   # cross-account deploy targets (role mode)
                 Action: ["sts:AssumeRole"]

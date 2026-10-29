@@ -55,6 +55,10 @@ describe("deploySteps", () => {
     const steps = deploySteps(run({ status: "FAILED" }), [row("tool.run_pre_discover", 1)]);
     expect(steps[1]).toMatchObject({ state: "failed", sub: "Stopped here" });
   });
+  it("counts the build as done once the platform closed the job after verifying it", () => {
+    const steps = deploySteps(run(), [row("tool.run_pre_discover", 1), row("transform.job_closed", 2)]);
+    expect(steps.map((s) => s.state)).toEqual(["done", "done", "active", ""]);
+  });
   it("completes every step for a delivered run", () => {
     const steps = deploySteps(run({ status: "DELIVERED" }), [row("tool.run_pre_discover", 1), row("tool.transform_poll_analyze_job", 2, { done: true }),
       row("tool.save_iac_change_plan", 3), row("phase.completed", 4)]);

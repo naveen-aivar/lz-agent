@@ -13,6 +13,9 @@ In one model turn the agent makes exactly one decision with one of three tools:
 * no_reply_needed: the message only reports progress or status and asks nothing (no options, no
   question). Nothing is sent to Transform and the person is not asked; the model, not a text rule,
   decides this.
+* report_build_complete: the message is Transform's summary that the landing zone is built and deployed. The agent
+  claims it; it closes nothing. The platform then checks the target account against the approved design and closes
+  the Transform job only if they match (deploy_workflow_tools._verify_build).
 * escalate_to_human: anything else. Approval gates (deploying, creating or deleting resources),
   facts the design does not hold (MAP ids), Transform tasks with their own form, and anything the
   model is unsure about. The reason and an optional typed suggestion are shown to the person in the UI
@@ -25,7 +28,7 @@ reply review; every basis entry must resolve in the design or the run context. E
 escalated.
 
 Per-question state lives in DynamoDB at RUN#<runId> / AGENTQ#<questionKey>:
-    {status: deciding | answered | escalated | informational | superseded, turns, kind, title, reason, suggestion,
+    {status: deciding | answered | escalated | informational | build_complete | superseded, turns, kind, title, reason, suggestion,
      category, rationale, basis, option, text, lastError, updatedAt}
 """
 from __future__ import annotations
@@ -439,6 +442,43 @@ def escalate_to_human(reason: str, suggestion: str = "", suggestion_type: str = 
 
 
 @tool
+def report_build_complete(reason: str, basis: list[str]) -> str:
+    """Report that the pending Transform message says the landing zone is built and deployed (a final summary).
+
+    Use it only when the message states the deployment is complete, offers no options and asks nothing. You do not
+    close or stop anything: the platform checks the target account against the approved design and closes the
+    Transform job only if every OU, account and the Control Tower landing zone are there.
+    reason: one or two sentences quoting what the message says is complete.
+    basis: the approved-design entries it claims are deployed, as "scope:<JSON pointer>" (for example scope:/ous).
+    """
+    refused = _refuse_unless_open()
+    if refused:
+        return refused
+    pending = _turn["pending"]
+    if pending.get("kind") != "message" or pending.get("options"):
+        return "REFUSED: only a message without options can report the build complete. Answer it or escalate it."
+    if pending.get("jobAwaitingInput"):
+        return ("REFUSED: the Transform job reports AWAITING_HUMAN_INPUT, so it is waiting on a reply, not finished. "
+                "Answer it or escalate it.")
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > NOTE_LIMIT:
+        return f"REFUSED: reason must be 1-{NOTE_LIMIT} characters."
+    if not isinstance(basis, list) or not basis or not all(isinstance(b, str) and b.startswith("scope:") for b in basis):
+        return "REFUSED: basis must list the scope:<pointer> entries of the approved design that the message says are deployed."
+    bad = _invalid_basis(basis)
+    if bad:
+        return f"REFUSED: these basis entries do not resolve in the approved design: {bad}."
+    put_question(_turn["qkey"], status="build_complete", kind=pending["kind"], title=pending.get("title"),
+                 turns=_turn.get("turns"), informational=True, basis=basis, claim=reason.strip(), checks=0,
+                 reason="AWS Transform reports the landing zone is deployed. The platform is checking the target "
+                        "account against the approved design before closing the Transform job.")
+    base.log_tool_event("transform.build_reported_complete", {"jobId": pending.get("jobId"),
+                                                              "messageId": pending.get("messageId"),
+                                                              "reason": reason.strip()[:300], "basis": basis[:20]})
+    _turn["decided"] = "build_complete"
+    return "Recorded. The platform will verify the account. Reply with one sentence and stop."
+
+
+@tool
 def no_reply_needed(reason: str) -> str:
     """Record that the pending Transform message only reports progress and needs no reply.
 
@@ -467,7 +507,7 @@ def no_reply_needed(reason: str) -> str:
 
 
 def converse_tools() -> list:
-    return [answer_transform_question, no_reply_needed, escalate_to_human]
+    return [answer_transform_question, no_reply_needed, report_build_complete, escalate_to_human]
 
 
 # ---- independent review of typed replies -------------------------------------------------------------------

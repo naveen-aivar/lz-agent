@@ -21,7 +21,8 @@ export function deploySteps(run: Run, audit: AuditItem[]): Step[] {
   const p = run.pendingHumanInput;
   const waitingOnPerson = run.status === "RUNNING" && (run.awaitingHitl === true || (!!p && !isUpdateOnly(p)));
   const has = (action: string) => audit.some((x) => x.action === action);
-  const jobDone = audit.some((x) => x.action === "tool.transform_poll_analyze_job" && detailOf(x).done === true);
+  // Done when Transform reports the job finished, or when the platform closed it after verifying the account.
+  const jobDone = audit.some((x) => (x.action === "tool.transform_poll_analyze_job" && detailOf(x).done === true) || x.action === "transform.job_closed");
   const done = [
     has("tool.run_pre_discover") || has("tool.run_pre_discover.failed"),
     jobDone,

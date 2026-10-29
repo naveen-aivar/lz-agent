@@ -189,3 +189,14 @@ Drop the `sts:ExternalId` condition only if `TransformExternalId` is empty. The 
 * **Typed replies**: only for a message that offers no options, with facts from the approved design or run context, each citing its basis. A separate reviewer model call (`REVIEW_SYSTEM`, one tool `report_reply_review`) must say the reply approves nothing irreversible; an error, no verdict or an unsure verdict refuses the reply. The reviewer is a model check, not a code rule: tasks and the option list above are the code-enforced part.
 * **Suggestions** are typed: `option` and `approval` must equal an offered label (a person confirms before it is sent), `text` is a typed reply for a message without options, `steps` is for a task. Explanations go in `reason`.
 * **Account email**: `accountEmail` (`prefix@domain`, no `+`) on the deploy request is stored as `META.accountEmailBase` and offered to the agent as `context:accountEmailBase`. Without it the email question goes to a person.
+
+## When Transform says the build is done
+
+AWS Transform can post its final summary ("Your landing zone is complete…") and still report the job as `EXECUTING`. The run would then wait forever. The split of work:
+
+* **The conversation agent** recognises the summary and calls `report_build_complete(reason, basis)`, citing the design entries it says are deployed. It closes nothing; it has no tool that stops or changes a job.
+* **The platform** (`_verify_build`) checks the target account with `lzcore.deploy_workflow.verify_landing_zone`: every design OU and account exists, every design account is `ACTIVE`, and one Control Tower landing zone in the run's Region (`targetRegion`, else the design's home Region) is `ACTIVE`. An unreadable account is a step error, never "not built".
+* **Match:** the checkpoint becomes `transform_build_verified`; the next step (`transform_close_job`) calls `StopJob` and moves to `transform_analyze_done`, and the run continues with merge, judgment, render and attestation. If `StopJob` fails, the job's own status decides: already closed moves on, still open fails naming the job.
+* **No match:** the UI shows what is missing as an update and the platform checks again on each poll (Transform may still be finishing), up to `MAX_BUILD_VERIFICATIONS` (15). Then it is handed to a person with the missing items, and nothing is closed.
+
+Audit events: `transform.build_reported_complete`, `transform.build_verified`, `transform.build_verification_failed`, `transform.job_closed`. A deploy role in role mode needs `controltower:ListLandingZones` and `controltower:GetLandingZone` for this check.
