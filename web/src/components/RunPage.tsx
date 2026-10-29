@@ -3,6 +3,7 @@ import type { AuditItem, Client, Run, Schemas } from "../api/client";
 import { AuditFeed } from "./AuditFeed";
 import { DesignPanel } from "./DesignPanel";
 import { QuestionPanel } from "./QuestionPanel";
+import { ResumePanel } from "./ResumePanel";
 
 type Tab = "activity" | "design" | "details";
 const DONE = new Set(["DELIVERED", "FAILED"]);
@@ -68,6 +69,9 @@ export function RunPage({ runId, api, canAnswer, userSub, pollMs = 4000 }: {
         ) : (
           <button type="button" className="btn btn-sm" onClick={() => setConfirmStop(true)}>Stop run</button>
         )
+      )}
+      {run.runKind === "deploy" && run.status === "FAILED" && (
+        <ResumePanel run={run} api={api} onResumed={() => void load()} />
       )}
       {pending && (
         <QuestionPanel key={`${pending.jobId}:${pending.messageId ?? pending.taskId ?? pending.title}`} run={run}

@@ -149,6 +149,8 @@ components:
         targetRegion: {type: string}
         accountEmailBase: {type: string}
         mapAgreement: {type: string}
+        resumable: {type: boolean, description: "FAILED deploy runs only: the run has a checkpoint and can be resumed."}
+        resumeCount: {type: integer}
         deployTarget: {type: object, additionalProperties: true}
         artifacts: {type: object, additionalProperties: true}
     AuditItem:
@@ -191,6 +193,10 @@ components:
           type: string
           description: 'none, or the full AWS MAP tag with its prefix (for example mig12345). The agent answers Transform''s MAP question from it.'
           pattern: "^(none|(mig_ec2_|comm_ec2_|mig|sap|oracle|comm)[A-Za-z0-9]{1,40})$"
+    ResumeRequest:
+      type: object
+      properties:
+        deployTarget: {$ref: "#/components/schemas/DeployTargetRequest"}
     AnswerRequest:
       type: object
       required: [jobId, messageId]
@@ -362,6 +368,22 @@ paths:
         "200": {description: Submitted., content: {application/json: {schema: {$ref: "#/components/schemas/PendingDecisionEnvelope"}}}}
         "400": {$ref: "#/components/responses/BadRequest"}
         "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "502": {$ref: "#/components/responses/Upstream"}
+  /runs/{runId}/resume:
+    post:
+      operationId: resumeRun
+      summary: Continue a FAILED deploy run from where it stopped.
+      description: |
+        The run keeps its id, checkpoint, Transform job and recorded decisions; a new execution continues it. A run
+        that used access keys needs new keys for the same account (they are deleted when a run stops). Roles and the
+        platform account need no body. 409 when the run is not FAILED or failed before recording any progress.
+      parameters: [{$ref: "#/components/parameters/runId"}]
+      requestBody: {required: false, content: {application/json: {schema: {$ref: "#/components/schemas/ResumeRequest"}}}}
+      responses:
+        "202": {description: Resumed., content: {application/json: {schema: {$ref: "#/components/schemas/RunIdEnvelope"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
         "404": {$ref: "#/components/responses/NotFound"}
         "409": {$ref: "#/components/responses/Conflict"}
         "502": {$ref: "#/components/responses/Upstream"}

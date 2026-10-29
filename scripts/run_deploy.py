@@ -23,6 +23,10 @@ Usage:
   TARGET_ACCESS_KEY_ID=... TARGET_SECRET_ACCESS_KEY=... \\
     python3 scripts/run_deploy.py --design-run <design-run-id> --account <target-account-id>
 
+Resume a run that stopped or failed (same run, same Transform job, from its checkpoint). A run that used access keys
+needs new keys for the same account, because the stored ones are deleted when a run stops:
+  TARGET_ACCESS_KEY_ID=... TARGET_SECRET_ACCESS_KEY=... python3 scripts/run_deploy.py --resume <deploy-run-id> --account <account-id>
+  python3 scripts/run_deploy.py --resume <deploy-run-id>     # role or platform-account runs
 Exit code: 0 when the deploy run SUCCEEDED, 1 on failure/abort/timeout. Ctrl-C stops following
 only; the deploy run keeps going in Step Functions.
 """
@@ -119,8 +123,9 @@ def _print_new_audit(ddb, table: str, run_id: str, seen: set) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--design-run", required=True, help="DELIVERED design run id")
-    ap.add_argument("--account", required=True, help="12-digit target account id")
+    ap.add_argument("--design-run", help="DELIVERED design run id (starts a new deploy run)")
+    ap.add_argument("--resume", metavar="RUN_ID", help="continue this FAILED deploy run from where it stopped")
+    ap.add_argument("--account", help="12-digit target account id (required to start; with --resume only when sending new keys or a role)")
     ap.add_argument("--role-arn", help="target-account role to assume instead of access keys")
     ap.add_argument("--external-id", help="sts:ExternalId required by the target role (required with --role-arn)")
     ap.add_argument("--stack", default="ingram-landing-zone", help="platform CloudFormation stack name (also the resource name prefix)")
@@ -135,6 +140,10 @@ def main() -> None:
                     "Transform's MAP question from it.")
     ap.add_argument("--no-follow", action="store_true", help="start the run and exit")
     args = ap.parse_args()
+    if bool(args.design_run) == bool(args.resume):
+        _fail("give exactly one of --design-run (start a new deploy run) or --resume RUN_ID (continue a failed one)")
+    if args.design_run and not args.account:
+        _fail("--account is required to start a deploy run")
 
     region = args.region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
     if not region:
@@ -147,6 +156,23 @@ def main() -> None:
     ui_url = (args.ui_url or _stack_output(session.client("cloudformation"), args.stack, "UiUrl")).rstrip("/")
     fn, table = f"{args.stack}-api-runs", f"{args.stack}-state"
 
+    if args.resume:
+        run = ddb.get_item(TableName=table, Key={"PK": {"S": f"RUN#{args.resume}"}, "SK": {"S": "META"}}).get("Item")
+        if not run:
+            _fail(f"deploy run {args.resume} not found in {table}")
+        print(f"Deploy run {args.resume}: {run.get('status', {}).get('S')}. {run.get('error', {}).get('S', '')[:200]}")
+        body: dict = {}
+        if args.role_arn or os.environ.get("TARGET_ACCESS_KEY_ID", "").strip():
+            if not args.account:
+                _fail("--account is required with new keys or a role")
+            body["deployTarget"] = _target_from_args(args)
+        code, res = _invoke_api(lam, fn, "POST /runs/{runId}/resume", run["requester"]["S"], invoked_by, body,
+                                run_id=args.resume)
+        if code != 202:
+            _fail(f"resume returned HTTP {code}: {res.get('error') or res}")
+        run_id = args.resume
+        print(f"\nDeploy run resumed: {run_id}\nUI: {ui_url}/#/run/{run_id}\n")
+        return _follow(args, ddb, sfn, caller, region, table, run_id, ui_url)
     design = ddb.get_item(TableName=table, Key={"PK": {"S": f"RUN#{args.design_run}"}, "SK": {"S": "META"}}).get("Item")
     if not design:
         _fail(f"design run {args.design_run} not found in {table}")
@@ -184,6 +210,10 @@ def main() -> None:
     if not run_id:
         _fail(f"deploy start response has no run id: {res}")
     print(f"\nDeploy run started: {run_id}\nUI: {ui_url}/#/run/{run_id}\n")
+    return _follow(args, ddb, sfn, caller, region, table, run_id, ui_url)
+
+
+def _follow(args, ddb, sfn, caller, region, table, run_id, ui_url) -> None:
     if args.no_follow:
         return
 

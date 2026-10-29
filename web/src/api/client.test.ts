@@ -44,6 +44,14 @@ describe("api client", () => {
     await expect(unauthorised.client.listRuns()).rejects.toBeInstanceOf(SessionExpired);
     expect(unauthorised.onExpired).toHaveBeenCalled();
   });
+  it("posts a resume with an empty body by default", async () => {
+    const f = vi.fn(() => reply(202, { data: { runId: "r1" } }));
+    const { client } = make(f as unknown as typeof fetch);
+    expect(await client.resumeRun("r1")).toEqual({ runId: "r1" });
+    const [url, init] = f.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.example/runs/r1/resume");
+    expect(JSON.parse(String(init.body))).toEqual({});
+  });
   it("encodes path parameters", async () => {
     const f = vi.fn(() => reply(200, { data: { audit: [] } }));
     const { client } = make(f as unknown as typeof fetch);

@@ -629,7 +629,7 @@ function renderDeployRun() {
     ? ` · Design run <a href="#/run/${esc(run.designRunId)}"><code>${esc(run.designRunId.slice(0, 8))}</code></a>`
     : "";
   const failure = run.status === "FAILED"
-    ? `<div class="notice notice-err" role="alert"><strong>Deploy failed.</strong> ${esc(run.error || "No reason was recorded.")}<br>Open the Activity tab or deployment report for details.</div>`
+    ? `<div class="notice notice-err" role="alert"><strong>Deploy failed.</strong> ${esc(run.error || "No reason was recorded.")}<br>Open the Activity tab or deployment report for details.${run.resumable ? `<br><button class="btn btn-primary btn-sm" type="button" data-resume-run style="margin-top:8px">Resume this run</button> <span class="hint">Continues the same run from where it stopped, with the same AWS Transform job.</span>` : ` <span class="hint">This run recorded no progress, so start a new deploy run.</span>`}</div>`
     : "";
   const waiting = !isDone(run)
     ? `<div class="card"><div class="card-head"><h2><span class="spin"></span> Deploy agent running</h2></div><p class="meta" style="color:var(--dim)">Transform and discovery can take a while. This page refreshes every few seconds. You can leave and come back from Runs.</p></div>`
@@ -920,12 +920,49 @@ async function testDeployCredentials() {
   }
 }
 
+// The same dialog starts a deploy run and, for a run that used access keys, asks for new keys to resume it.
+let pendingResumeRunId = null;
+function setDeployDialogMode(resume) {
+  document.querySelectorAll("[data-deploy-only]").forEach((el) => { el.hidden = resume; });
+  $("deployForm").accountId.readOnly = resume;
+  $("deployDlgTitle").textContent = resume ? "Resume run: new access keys" : "Deploy target";
+  $("deploySubmit").textContent = resume ? "Resume run" : "Start deploy run";
+}
 function openDeployDialog(designRunId) {
   pendingDeployDesignId = designRunId;
+  pendingResumeRunId = null;
   const f = $("deployForm");
   f.reset();
+  setDeployDialogMode(false);
   f.authMethod.value = "role";
   deployAuthFields();
+  $("deployDlg").showModal();
+}
+async function resumeRun(runId, body) {
+  try {
+    await api(`/runs/${runId}/resume`, { method: "POST", body: JSON.stringify(body) });
+    toast("Run resumed from where it stopped");
+    await openRun(runId);
+    loadRuns().catch(() => {});
+  } catch (e) {
+    if (e.message !== "session expired") toast(e.message, "bad");
+  }
+}
+function openResumeDialog(run) {
+  const t = run.deployTarget || {};
+  if (t.mode !== "keys") {  // a role or the platform account: nothing to send
+    if (confirm("Resume this run from where it stopped? It keeps its progress and its AWS Transform job.")) resumeRun(run.runId, {});
+    return;
+  }
+  pendingDeployDesignId = null;
+  pendingResumeRunId = run.runId;
+  const f = $("deployForm");
+  f.reset();
+  setDeployDialogMode(true);
+  f.authMethod.value = "keys";
+  deployAuthFields();
+  f.accountId.value = t.accountId || "";
+  $("testDeployCreds").hidden = true;
   $("deployDlg").showModal();
 }
 
@@ -996,6 +1033,7 @@ function onView(e) {
   if (row && !e.target.closest("a,button")) { location.hash = `#/run/${row.dataset.open}`; return; }
   const deployBtn = e.target.closest("[data-deploy]");
   if (deployBtn) { openDeployDialog(deployBtn.dataset.deploy); return; }
+  if (e.target.closest("[data-resume-run]")) { const r = S.data && S.data.run; if (r) openResumeDialog(r); return; }
   const stopBtn = e.target.closest("[data-stop-run]");
   if (stopBtn) { stopRun(stopBtn.dataset.stopRun); return; }
   const opt = e.target.closest("[data-answer-option]");
@@ -1063,6 +1101,16 @@ async function start() {
   $("testDeployCreds").onclick = () => testDeployCredentials();
   $("deployForm").onsubmit = async (e) => {
     e.preventDefault();
+    if (pendingResumeRunId) {
+      try {
+        const body = deployTargetFromForm();
+        $("deployDlg").close();
+        await resumeRun(pendingResumeRunId, body);
+      } catch (err) {
+        toast(err.message, "bad");
+      }
+      return;
+    }
     if (!pendingDeployDesignId) return;
     try {
       const body = deployPayloadFromForm();

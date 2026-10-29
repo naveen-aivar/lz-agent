@@ -2467,3 +2467,61 @@ class SuggestionTypes(_SequencerCaseBase):
         result = self._invoke()
         note = result["pendingHumanInput"]["agentNote"]
         self.assertEqual((note["suggestion"], note["suggestionType"]), ("Connect account 222222222222.", "steps"))
+
+
+# --------------------------------------------------------------------------------------
+# Resume: a resumed run continues from its checkpoint with a fresh set of turns
+# --------------------------------------------------------------------------------------
+class ResumedRun(_SequencerCaseBase):
+    def test_judgment_gets_fresh_attempts_after_a_resume_but_not_within_one(self):
+        self._make_env()
+        self._seed_foundation()
+        self._seed_checkpoint("transform_merged")
+        self._seed_judgment(plan=False)
+        model = self._set_model([])
+        for _ in range(3):
+            self._invoke()
+        self._assert_error(self._invoke(), "deploy_judgment failed", "3 model turns used")  # the bound holds in this epoch
+        self.assertEqual(model.calls, 3)
+        self.assertEqual(self._checkpoint()["judgmentEpoch"], 0)
+
+        self.table.meta["resumeCount"] = 1  # POST /runs/{id}/resume
+        model = self._set_model([lambda: self.s3.put_json(PLAN_KEY, _valid_plan())])
+        result = self._invoke()
+
+        self._assert_continue(result)
+        self.assertEqual(model.calls, 1)
+        cp = self._checkpoint()
+        self.assertEqual((cp["stage"], cp["judgmentAttempts"], cp["judgmentEpoch"]), ("judgment_done", 1, 1))
+
+    def test_a_yield_inside_a_resumed_epoch_still_counts_against_it(self):
+        self._make_env()
+        self._seed_foundation()
+        self._seed_checkpoint("transform_merged", judgmentAttempts=3, judgmentEpoch=0)
+        self._seed_judgment(plan=False)
+        self.table.meta["resumeCount"] = 1
+        self._set_model([lambda: dwt.yield_for_orchestrator("thinking")] * 3)
+        for attempt in (1, 2):
+            self._invoke()
+            self.assertEqual(self._checkpoint()["judgmentAttempts"], attempt)
+            self.assertEqual(self._checkpoint()["judgmentEpoch"], 1)
+        self._assert_error(self._invoke(), "deploy_judgment failed", "3 model turns")
+
+    def test_a_question_the_agent_gave_up_on_is_decided_again_after_a_resume(self):
+        pending = {**MESSAGE, "createdAtMs": 1_793_248_000_000}
+        self._make_env(transform_ops=FakeTransformOps(poll_script=[("EXECUTING", pending)] * 6),
+                       meta_extra={"transformAnalyzeJobId": ANALYZE_JOB,
+                                   "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}})
+        self._seed_foundation()
+        self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
+        self._set_converse(*([_no_decision] * conv.MAX_TURNS_PER_QUESTION))
+        results = [self._invoke() for _ in range(conv.MAX_TURNS_PER_QUESTION)]
+        self._assert_error(results[-1], "transform_converse failed", "without answering or escalating")
+
+        self.table.meta["resumeCount"] = 1
+        self._set_converse(_escalate("A person must choose."))
+        result = self._invoke()
+
+        self.assertEqual(result["status"], "continue")
+        q = self.table.item("AGENTQ#message:msg-0001")
+        self.assertEqual((q["status"], q["turns"]), ("escalated", 1))  # one turn, not the 4th of the old epoch

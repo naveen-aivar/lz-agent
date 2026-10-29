@@ -261,11 +261,11 @@ dialog.deploy .hint { font-size:12px; color:var(--faint); font-weight:400; line-
 
 <dialog class="full" id="full" aria-label="Organization structure"><div class="bar"><span>Organization structure</span><button class="btn btn-sm" type="button" id="closeFull">Close</button></div><div class="body" id="fullBody"></div></dialog>
 <dialog class="deploy" id="deployDlg" aria-label="Deploy target account">
-  <div class="bar"><span>Deploy target</span><button class="btn btn-sm" type="button" id="closeDeployDlg">Cancel</button></div>
+  <div class="bar"><span id="deployDlgTitle">Deploy target</span><button class="btn btn-sm" type="button" id="closeDeployDlg">Cancel</button></div>
   <form class="body" id="deployForm">
     <p class="hint">Discover and attest against the target AWS account. Use a cross-account IAM role (recommended) or temporary access keys. AWS Transform still runs from the platform account until your workspace is bound to the target org.</p>
     <label>Target account ID<input name="accountId" inputmode="numeric" pattern="[0-9]{12}" placeholder="123456789012" required /></label>
-    <label>Auth method<select name="authMethod"><option value="role">IAM role (AssumeRole)</option><option value="keys">Access keys (session)</option><option value="platform">Platform account only</option></select></label>
+    <label data-deploy-only>Auth method<select name="authMethod"><option value="role">IAM role (AssumeRole)</option><option value="keys">Access keys (session)</option><option value="platform">Platform account only</option></select></label>
     <div id="deployRoleFields">
       <label>Role ARN<span class="hint">Trust the platform ApiRole and AgentRole in the target account; the name must match the stack's DeployAssumeRoleArn pattern</span><input name="roleArn" placeholder="arn:aws:iam::123456789012:role/IngramLandingZoneDeploy" /></label>
       <label>External ID<span class="hint">Required. Same value as the sts:ExternalId condition in the role's trust policy (not a secret)</span><input name="externalId" autocomplete="off" /></label>
@@ -276,13 +276,13 @@ dialog.deploy .hint { font-size:12px; color:var(--faint); font-weight:400; line-
       <label>Secret access key<input name="secretAccessKey" type="password" autocomplete="off" /></label>
       <label>Session token (optional)<input name="sessionToken" autocomplete="off" /></label>
     </div>
-    <label>Account email (optional)<span class="hint">prefix@domain for the new accounts, without a +. Transform adds +account-name. The agent answers its email question from this.</span><input name="accountEmail" type="email" autocomplete="off" placeholder="aws-admin@example.com" /></label>
-    <label>MAP agreement (optional)<span class="hint">Type none, or the full MAP tag such as mig12345. The agent answers Transform's MAP question from this.</span><input name="mapAgreement" autocomplete="off" placeholder="none" /></label>
+    <label data-deploy-only>Account email (optional)<span class="hint">prefix@domain for the new accounts, without a +. Transform adds +account-name. The agent answers its email question from this.</span><input name="accountEmail" type="email" autocomplete="off" placeholder="aws-admin@example.com" /></label>
+    <label data-deploy-only>MAP agreement (optional)<span class="hint">Type none, or the full MAP tag such as mig12345. The agent answers Transform's MAP question from this.</span><input name="mapAgreement" autocomplete="off" placeholder="none" /></label>
     <div id="deployVerifyBox" class="deploy-verify" hidden role="status" aria-live="polite"></div>
     <div class="actions">
       <button class="btn" type="button" id="cancelDeployDlg">Cancel</button>
       <button class="btn" type="button" id="testDeployCreds" hidden>Test connection</button>
-      <button class="btn btn-primary" type="submit">Start deploy run</button>
+      <button class="btn btn-primary" type="submit" id="deploySubmit">Start deploy run</button>
     </div>
   </form>
 </dialog>

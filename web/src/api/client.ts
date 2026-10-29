@@ -11,6 +11,7 @@ export type PendingDecision = Schemas["PendingDecision"];
 export type DeployRequest = Schemas["DeployRequest"];
 export type AnswerRequest = Schemas["AnswerRequest"];
 export type VerifyData = Schemas["VerifyData"];
+export type ResumeRequest = Schemas["ResumeRequest"];
 
 /** An error envelope from the API: {error: {code, message, details?}}. */
 export class ApiError extends Error {
@@ -77,6 +78,8 @@ export function createClient({ apiUrl, getToken, onExpired, fetchImpl = fetch }:
     startDeploy: (designRunId: string, body: DeployRequest) =>
       request<Schemas["RunIdData"]>("POST", `/runs/${enc(designRunId)}/deploy`, body),
     stopRun: (runId: string) => request<Schemas["StoppedData"]>("POST", `/runs/${enc(runId)}/stop`),
+    resumeRun: (runId: string, body: ResumeRequest = {}) =>
+      request<Schemas["RunIdData"]>("POST", `/runs/${enc(runId)}/resume`, body),
     answerQuestion: (runId: string, body: AnswerRequest) =>
       request<Schemas["PendingAnswerData"]>("POST", `/runs/${enc(runId)}/answer`, body),
     decideTask: (runId: string, body: Schemas["DecisionRequest"]) =>

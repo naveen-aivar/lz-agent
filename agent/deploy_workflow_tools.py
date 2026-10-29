@@ -458,6 +458,7 @@ def yield_for_orchestrator(reason: str) -> str:
         pendingHumanInput=None,
         # Carry the judgment counters so a pause can never reset the attempt bound.
         judgmentAttempts=int(cp.get("judgmentAttempts") or 0),
+        judgmentEpoch=int(cp.get("judgmentEpoch") or 0),
     )
     base.log_tool_event("tool.yield_for_orchestrator", {"reason": reason})
     return f"PAUSED: {reason}. Do not call more tools this turn; reply in one sentence."
@@ -624,7 +625,10 @@ def _run_judgment(run_model: Callable[[], object], cp: dict) -> dict:
     invoke, so no destructive step shares an invoke with a model turn), continue for an accepted
     HITL yield or an incomplete attempt below the bound, or a named error.
     """
-    attempts = int(cp.get("judgmentAttempts") or 0)
+    # Attempts count per resume epoch (META.resumeCount): a resumed run gets a fresh set of turns, a yield or a
+    # crash inside one epoch still counts against that epoch's bound.
+    epoch = int(_run_meta().get("resumeCount") or 0)
+    attempts = int(cp.get("judgmentAttempts") or 0) if int(cp.get("judgmentEpoch") or 0) == epoch else 0
     if attempts >= MAX_JUDGMENT_ATTEMPTS:
         # A previous invoke used the last attempt and did not record an outcome (e.g. it died).
         return _named_error(
@@ -634,7 +638,7 @@ def _run_judgment(run_model: Callable[[], object], cp: dict) -> dict:
         )
     attempts += 1
     # Persist before the model runs so a crashed or timed-out turn still counts.
-    _save_checkpoint("transform_merged", judgmentAttempts=attempts)
+    _save_checkpoint("transform_merged", judgmentAttempts=attempts, judgmentEpoch=epoch)
     base.log_tool_event("deploy.sequencer.step", {"step": "deploy_judgment", "attempt": attempts})
     try:
         run_model()
@@ -643,7 +647,7 @@ def _run_judgment(run_model: Callable[[], object], cp: dict) -> dict:
 
     missing = _judgment_missing()
     if not missing:
-        _save_checkpoint("judgment_done", judgmentAttempts=attempts)
+        _save_checkpoint("judgment_done", judgmentAttempts=attempts, judgmentEpoch=epoch)
         base.log_tool_event("tool.deploy_judgment", {"attempts": attempts})
         return _continue(
             "deploy_judgment complete; render and post-deploy discover run on the next invoke",
@@ -658,7 +662,7 @@ def _run_judgment(run_model: Callable[[], object], cp: dict) -> dict:
             f"(limit {MAX_JUDGMENT_ATTEMPTS}): missing {key}",
         )
     # A plain return or a yield: counted like any other turn; retry on the next invoke.
-    _save_checkpoint("transform_merged", judgmentAttempts=attempts)
+    _save_checkpoint("transform_merged", judgmentAttempts=attempts, judgmentEpoch=epoch)
     return _continue(
         f"deploy_judgment attempt {attempts}/{MAX_JUDGMENT_ATTEMPTS} incomplete: {step} missing {key}",
         read_checkpoint() or {},
@@ -817,7 +821,9 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
     ):
         return _continue_from(cp)  # a person answered it from the UI
 
-    turns = int(item.get("turns") or 0)
+    # Turns count per resume epoch, like the judgment attempts: a resumed run gets a fresh set.
+    epoch = int(_run_meta().get("resumeCount") or 0)
+    turns = int(item.get("turns") or 0) if int(item.get("epoch") or 0) == epoch else 0
     if turns >= conv.MAX_TURNS_PER_QUESTION:
         return _named_error(
             "transform.agent_converse_failed",
@@ -826,7 +832,7 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
             f"last error: {item.get('lastError')}",
         )
     turns += 1
-    conv.put_question(qkey, status="deciding", turns=turns, kind=pending["kind"], title=pending.get("title"),
+    conv.put_question(qkey, status="deciding", turns=turns, epoch=epoch, kind=pending["kind"], title=pending.get("title"),
                       lastError=item.get("lastError"))
     base.log_tool_event("deploy.sequencer.step", {"step": "transform_converse", "question": qkey, "turn": turns})
 
@@ -867,7 +873,7 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
         return _continue_from(cp)
 
     error = error or "the model ended the turn without answering or escalating"
-    conv.put_question(qkey, status="deciding", turns=turns, kind=pending["kind"], title=pending.get("title"),
+    conv.put_question(qkey, status="deciding", turns=turns, epoch=epoch, kind=pending["kind"], title=pending.get("title"),
                       lastError=error)
     base.log_tool_event("transform.agent_turn_failed", {"question": qkey, "turn": turns,
                                                          "limit": conv.MAX_TURNS_PER_QUESTION, "error": error[:500]})

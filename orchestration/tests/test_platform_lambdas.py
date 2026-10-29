@@ -116,6 +116,10 @@ class FakeS3:
         self.puts.append(kw)
         self.objects.setdefault(kw["Key"], []).append(f"v{len(self.puts)}")
 
+    def head_object(self, Bucket, Key):
+        if Key not in self.objects:
+            raise ClientError({"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject")
+        return {}
     def list_object_versions(self, Bucket, Prefix, **_):
         return {"Versions": [{"Key": k, "VersionId": v} for k, vs in self.objects.items() if k.startswith(Prefix) for v in vs],
                 "IsTruncated": False}
@@ -589,6 +593,154 @@ class EnvelopeTests(_Base):
                  "pathParameters": {"runId": DESIGN_ID, "name": "bogus"}}
         out = api_artifacts.handler(event, None)
         self.assertEqual(json.loads(out["body"]), {"error": {"code": "bad_request", "message": "unknown artifact"}})
+
+
+class ResumeTests(_Base):
+    """A FAILED deploy run continues from its checkpoint instead of starting over."""
+    RUN = "9" * 32
+    KEYS = {"mode": "keys", "accountId": ACCOUNT, "credentialsKey": f"deploy-target-credentials/{'9' * 32}.json"}
+    ROLE = {"mode": "role", "accountId": ACCOUNT, "roleArn": f"arn:aws:iam::{ACCOUNT}:role/LzDeploy", "externalId": "ext"}
+    NEW_KEYS = {"deployTarget": {"accountId": ACCOUNT, "accessKeyId": "AKIAEXAMPLE", "secretAccessKey": "secret"}}
+
+    def seed(self, target="keys", status="FAILED", checkpoint=True, **extra):
+        item = {"PK": f"RUN#{self.RUN}", "SK": "META", "runId": self.RUN, "runKind": "deploy", "status": status,
+                "requester": USER, "error": "Stopped by user.", "awaitingHitl": False, "designRunId": DESIGN_ID,
+                "pendingHumanInput": pending(), "createdAt": 1}
+        if target:
+            item["deployTarget"] = dict({"keys": self.KEYS, "role": self.ROLE}[target])
+        item.update(extra)
+        self.table.put_item(item)
+        if checkpoint:
+            self.s3.objects[f"runs/{self.RUN}/deployment/agent-checkpoint.json"] = ["v1"]
+
+    def resume(self, body=None, **kw):
+        return self.api("POST /runs/{runId}/resume", body, run_id=self.RUN, **kw)
+
+    def test_a_run_that_used_keys_continues_with_new_keys_under_the_same_id(self):
+        self.seed("keys")
+        code, out = self.resume(self.NEW_KEYS)
+        self.assertEqual((code, out["runId"]), (202, self.RUN))
+        meta = self.table.meta(self.RUN)
+        self.assertEqual((meta["status"], meta["error"], meta["resumeCount"], meta["awaitingHitl"]), ("RUNNING", "", 1, False))
+        self.assertNotIn("pendingHumanInput", meta)
+        self.assertEqual(meta["deployTarget"]["credentialsKey"], self.KEYS["credentialsKey"])
+        (put,) = self.s3.puts
+        self.assertEqual((put["Key"], put["ServerSideEncryption"]), (self.KEYS["credentialsKey"], "aws:kms"))
+        (started,) = self.sfn.started
+        self.assertEqual(started["name"], f"{self.RUN}-r1")
+        self.assertEqual(json.loads(started["input"]), {"runId": self.RUN, "progressCount": 0, "hitlCount": 0})
+        self.assertTrue(meta["executionArn"].endswith(f"{self.RUN}-r1"))
+        (row,) = self.table.audit(self.RUN, "run.resumed")
+        self.assertEqual(json.loads(row["detail"])["newKeys"], True)
+
+    def test_keys_are_required_again_because_they_were_deleted_when_the_run_stopped(self):
+        self.seed("keys")
+        code, out = self.resume()
+        self.assertEqual(code, 400)
+        self.assertIn("deleted when it stopped", out["error"])
+        self.assertEqual(self.sfn.started, [])
+        self.assertEqual(self.table.meta(self.RUN)["status"], "FAILED")
+
+    def test_roles_and_the_platform_account_resume_without_a_body(self):
+        for target in ("role", None):
+            with self.subTest(target):
+                self.sfn.started.clear()
+                self.seed(target)
+                code, _ = self.resume()
+                self.assertEqual(code, 202)
+                self.assertEqual(self.table.meta(self.RUN).get("deployTarget"), self.ROLE if target else None)
+                self.assertEqual(self.s3.puts, [])
+                self.assertEqual(len(self.sfn.started), 1)
+
+    def test_the_account_cannot_change_mid_run(self):
+        self.seed("keys")
+        other = {"deployTarget": {**self.NEW_KEYS["deployTarget"], "accountId": "999999999999"}}
+        code, out = self.resume(other)
+        self.assertEqual(code, 400)
+        self.assertIn(ACCOUNT, out["error"])
+        self.seed(None)
+        self.assertEqual(self.resume(self.NEW_KEYS)[0], 400)
+        self.assertEqual(self.sfn.started, [])
+
+    def test_only_the_owners_failed_deploy_runs_with_progress_can_resume(self):
+        self.seed("role", status="RUNNING")
+        self.assertEqual(self.resume()[0], 409)
+        self.seed("role", status="DELIVERED")
+        self.assertEqual(self.resume()[0], 409)
+        self.seed("role")
+        self.assertEqual(self.resume(sub=OTHER_USER)[0], 404)
+        self.table.meta(self.RUN)["runKind"] = "design"
+        self.assertEqual(self.resume()[0], 400)
+        self.seed("role", checkpoint=False)
+        self.s3.objects.clear()
+        code, out = self.resume()
+        self.assertEqual(code, 409)
+        self.assertIn("before it recorded any progress", out["error"])
+        self.assertEqual(self.sfn.started, [])
+
+    def test_resuming_twice_is_refused_and_a_second_failure_numbers_the_execution(self):
+        self.seed("role")
+        self.assertEqual(self.resume()[0], 202)
+        code, out = self.resume()
+        self.assertEqual(code, 409)
+        self.assertIn("only FAILED", out["error"])
+        self.table.meta(self.RUN)["status"] = "FAILED"
+        self.assertEqual(self.resume()[0], 202)
+        self.assertEqual([e["name"] for e in self.sfn.started], [f"{self.RUN}-r1", f"{self.RUN}-r2"])
+        self.assertEqual(self.table.meta(self.RUN)["resumeCount"], 2)
+
+    def test_a_race_that_loses_removes_the_keys_it_just_stored(self):
+        self.seed("keys")
+        stale = dict(self.table.meta(self.RUN))
+        real_get = common.get_run
+
+        def get_then_flip(run_id):
+            run = real_get(run_id)
+            self.table.meta(run_id)["status"] = "RUNNING"  # someone else resumed between the read and the write
+            return run
+
+        with mock.patch.object(api_runs, "get_run", get_then_flip):
+            code, out = self.resume(self.NEW_KEYS)
+        self.assertEqual(code, 409)
+        self.assertIn("already have been resumed", out["error"])
+        self.assertEqual(self.s3.objects, {f"runs/{self.RUN}/deployment/agent-checkpoint.json": ["v1"]})  # keys deleted again
+        self.assertEqual(self.sfn.started, [])
+        del stale
+
+    def test_a_workflow_that_will_not_start_puts_the_run_back_and_removes_the_keys(self):
+        self.seed("keys")
+        self.sfn.fail_start = True
+        code, out = self.resume(self.NEW_KEYS)
+        self.assertEqual(code, 502)
+        self.assertIn("StartExecution failed", out["error"])
+        meta = self.table.meta(self.RUN)
+        self.assertEqual(meta["status"], "FAILED")
+        self.assertIn("resume could not start the workflow", meta["error"])
+        self.assertNotIn(self.KEYS["credentialsKey"], self.s3.objects)
+        self.assertEqual(len(self.table.audit(self.RUN, "run.resume_failed")), 1)
+
+    def test_the_run_page_says_whether_a_failed_run_can_continue(self):
+        self.seed("role")
+        _, out = self.api("GET /runs/{runId}", run_id=self.RUN)
+        self.assertIs(out["run"]["resumable"], True)
+        self.s3.objects.clear()
+        _, out = self.api("GET /runs/{runId}", run_id=self.RUN)
+        self.assertIs(out["run"]["resumable"], False)
+        self.table.meta(self.RUN)["status"] = "RUNNING"
+        _, out = self.api("GET /runs/{runId}", run_id=self.RUN)
+        self.assertNotIn("resumable", out["run"])
+
+    def test_stop_then_resume_continues_the_same_run(self):
+        code, res = self.deploy_keys()
+        self.assertEqual(code, 202)
+        run_id = res["runId"]
+        self.s3.objects[f"runs/{run_id}/deployment/agent-checkpoint.json"] = ["v1"]
+        self.assertEqual(self.api("POST /runs/{runId}/stop", run_id=run_id)[0], 200)
+        self.assertEqual(self.table.meta(run_id)["status"], "FAILED")
+        code, _ = self.api("POST /runs/{runId}/resume", self.NEW_KEYS, run_id=run_id)
+        self.assertEqual(code, 202)
+        self.assertEqual(self.table.meta(run_id)["status"], "RUNNING")
+        self.assertEqual(self.sfn.started[-1]["name"], f"{run_id}-r1")
 
 
 class DecisionTests(_Base):

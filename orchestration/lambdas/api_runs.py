@@ -180,6 +180,27 @@ _ACCOUNT_EMAIL = re.compile(r"[A-Za-z0-9._-]{1,64}@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{
 _MAP_AGREEMENT = re.compile(r"none|(?:mig_ec2_|comm_ec2_|mig|sap|oracle|comm)[A-Za-z0-9]{1,40}")
 
 
+def _put_credentials(key: str, payload: bytes) -> None:
+    s3().put_object(
+        Bucket=ARTIFACT_BUCKET,
+        Key=key,
+        Body=payload,
+        ServerSideEncryption="aws:kms",
+        SSEKMSKeyId=os.environ["DATA_KEY_ARN"],  # the stack CMK, never aws/s3 (bucket policy enforces it)
+    )
+
+
+def _has_checkpoint(run_id: str) -> bool:
+    """True when the deploy agent has recorded progress for the run (its checkpoint object exists)."""
+    try:
+        s3().head_object(Bucket=ARTIFACT_BUCKET, Key=f"runs/{run_id}/deployment/agent-checkpoint.json")
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+
+
 def _deploy(design_run_id, sub, event, invoked_by):
     design, err = _deliverable_design_run(design_run_id, sub)
     if err:
@@ -193,15 +214,6 @@ def _deploy(design_run_id, sub, event, invoked_by):
 
     deploy_id = uuid.uuid4().hex
     body = json.loads(event.get("body") or "{}")
-
-    def _put_credentials(key: str, payload: bytes) -> None:
-        s3().put_object(
-            Bucket=ARTIFACT_BUCKET,
-            Key=key,
-            Body=payload,
-            ServerSideEncryption="aws:kms",
-            SSEKMSKeyId=os.environ["DATA_KEY_ARN"],  # the stack CMK, never aws/s3 (bucket policy enforces it)
-        )
 
     # Optional operator override of the Control Tower home / connector Region for this run only (the approved
     # design is not changed). Needed when the target account's IAM Identity Center is in another Region.
@@ -289,7 +301,10 @@ def _get(run_id, sub):
     if not meta or not _can_view(meta, sub):
         return _resp(404, {"error": "not found"})
     meta.pop("requirements", None)
-    return _resp(200, {"run": _public_run(meta)})
+    out = _public_run(meta)
+    if meta.get("runKind") == "deploy" and meta.get("status") == "FAILED":
+        out["resumable"] = _has_checkpoint(run_id)  # the same run can continue from its checkpoint
+    return _resp(200, {"run": out})
 
 
 def _audit(run_id, sub):
@@ -402,6 +417,97 @@ def _find_transform_reply(*, pending: dict):
             "wait for the next poll"
         )
     return transform_ops.user_reply_since(pending["jobId"], since, pending.get("workspaceId"))
+
+
+def _resume(run_id, sub, event, invoked_by):
+    """Continue a FAILED (stopped, errored or timed-out) deploy run from where it stopped.
+
+    The run keeps its id, its checkpoint, its Transform job and its recorded decisions; a new Step Functions
+    execution (``<runId>-r<n>``) picks it up and the agent continues from the checkpoint. Stopping or failing a run
+    deletes stored access keys, so a run that used keys needs new keys for the same account in this request. Roles
+    and the platform account need no body. A run that failed before it recorded any progress has nothing to
+    continue; start a new deploy run for it.
+    """
+    run = get_run(run_id)
+    if not run or not _can_view(run, sub):
+        return _resp(404, {"error": "not found"})
+    if run.get("runKind") != "deploy":
+        return _resp(400, {"error": "only deploy runs can be resumed"})
+    if run.get("status") != "FAILED":
+        return _resp(409, {"error": f"run is {run.get('status')}; only FAILED deploy runs can be resumed"})
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "body must be JSON"})
+    if not isinstance(body, dict):
+        return _resp(400, {"error": "body must be a JSON object"})
+    sm = os.environ.get("DEPLOY_STATE_MACHINE_ARN")
+    if not sm:
+        return _resp(503, {"error": "deploy workflow not configured"})
+    if not _has_checkpoint(run_id):
+        return _resp(409, {"error": "this run failed before it recorded any progress; start a new deploy run"})
+
+    old = run.get("deployTarget")
+    new_target = None
+    if body.get("deployTarget") is not None:
+        if not old:
+            return _resp(400, {"error": "this run used the platform account; it takes no deployTarget"})
+        try:
+            new_target = parse_deploy_target_from_request(body, deploy_id=run_id, put_credentials=_put_credentials)
+        except ValueError as e:
+            return _resp(400, {"error": str(e)})
+        if not new_target or new_target.get("accountId") != old.get("accountId"):
+            return _resp(400, {"error": f"deployTarget must be for the run's account {old.get('accountId')}"})
+    elif old and old.get("mode") == "keys":
+        return _resp(400, {"error": "this run used access keys, which were deleted when it stopped; send deployTarget "
+                                    f"with new keys for account {old.get('accountId')}"})
+
+    count = int(run.get("resumeCount") or 0) + 1
+    values = {":run": "RUNNING", ":failed": "FAILED", ":empty": "", ":no": False, ":n": count, ":at": now()}
+    update = "SET #s = :run, #e = :empty, awaitingHitl = :no, resumeCount = :n, resumedAt = :at"
+    if new_target:
+        update += ", deployTarget = :dt"
+        values[":dt"] = new_target
+    try:
+        table().update_item(
+            Key={"PK": f"RUN#{run_id}", "SK": "META"},
+            UpdateExpression=update + " REMOVE pendingHumanInput",
+            ConditionExpression="#s = :failed",
+            ExpressionAttributeNames={"#s": "status", "#e": "error"},
+            ExpressionAttributeValues=values,
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        if new_target and new_target.get("mode") == "keys":
+            delete_run_credentials({**run, "deployTarget": new_target}, sub)
+        return _resp(409, {"error": "run is no longer FAILED (it may already have been resumed)"})
+    try:
+        ex = sfn.start_execution(
+            stateMachineArn=sm, name=f"{run_id}-r{count}",
+            input=json.dumps({"runId": run_id, "progressCount": 0, "hitlCount": 0}),
+        )
+    except Exception as e:  # noqa: BLE001 - put the run back as FAILED, remove the keys just stored, say so
+        table().update_item(
+            Key={"PK": f"RUN#{run_id}", "SK": "META"},
+            UpdateExpression="SET #s = :failed, #e = :msg",
+            ConditionExpression="#s = :run",
+            ExpressionAttributeNames={"#s": "status", "#e": "error"},
+            ExpressionAttributeValues={":failed": "FAILED", ":run": "RUNNING",
+                                       ":msg": f"resume could not start the workflow: {type(e).__name__}: {str(e)[:300]}"},
+        )
+        if new_target and new_target.get("mode") == "keys":
+            delete_run_credentials({**run, "deployTarget": new_target}, sub)
+        audit(run_id, sub, "run.resume_failed", {"error": f"{type(e).__name__}: {str(e)[:300]}"})
+        return _resp(502, {"error": f"starting the workflow failed: {type(e).__name__}: {str(e)[:300]}"})
+    table().update_item(
+        Key={"PK": f"RUN#{run_id}", "SK": "META"},
+        UpdateExpression="SET executionArn = :e",
+        ExpressionAttributeValues={":e": ex["executionArn"]},
+    )
+    audit(run_id, sub, "run.resumed", {"resumeCount": count, "invokedBy": invoked_by,
+                                       "newKeys": bool(new_target and new_target.get("mode") == "keys")})
+    return _resp(202, {"runId": run_id})
 
 
 def _send_transform_decision(**kwargs):
@@ -586,6 +692,8 @@ def handler(event, _ctx):
         return _answer(run_id, sub, event, invoked_by)
     if route.endswith("/decision"):
         return _decide_task(run_id, sub, event, invoked_by)
+    if route.endswith("/resume"):
+        return _resume(run_id, sub, event, invoked_by)
     if route.endswith("/audit"):
         return _audit(run_id, sub)
     if route.endswith("/scope"):

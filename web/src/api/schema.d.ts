@@ -112,6 +112,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/runs/{runId}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Continue a FAILED deploy run from where it stopped.
+         * @description The run keeps its id, checkpoint, Transform job and recorded decisions; a new execution continues it. A run
+         *     that used access keys needs new keys for the same account (they are deleted when a run stops). Roles and the
+         *     platform account need no body. 409 when the run is not FAILED or failed before recording any progress.
+         */
+        post: operations["resumeRun"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/deploy-target/verify": {
         parameters: {
             query?: never;
@@ -308,6 +330,9 @@ export interface components {
             targetRegion?: string;
             accountEmailBase?: string;
             mapAgreement?: string;
+            /** @description FAILED deploy runs only: the run has a checkpoint and can be resumed. */
+            resumable?: boolean;
+            resumeCount?: number;
             deployTarget?: {
                 [key: string]: unknown;
             };
@@ -350,6 +375,9 @@ export interface components {
             accountEmail?: string;
             /** @description none, or the full AWS MAP tag with its prefix (for example mig12345). The agent answers Transform's MAP question from it. */
             mapAgreement?: string;
+        };
+        ResumeRequest: {
+            deployTarget?: components["schemas"]["DeployTargetRequest"];
         };
         /** @description Exactly one of option or text. */
         AnswerRequest: {
@@ -692,6 +720,36 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            502: components["responses"]["Upstream"];
+        };
+    };
+    resumeRun: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                runId: components["parameters"]["runId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResumeRequest"];
+            };
+        };
+        responses: {
+            /** @description Resumed. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunIdEnvelope"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             502: components["responses"]["Upstream"];
