@@ -124,6 +124,8 @@ def main() -> None:
     ap.add_argument("--timeout-min", type=int, default=120, help="stop following after N minutes (run keeps going)")
     ap.add_argument("--target-region", help="Control Tower home / connector Region for this run, overriding the design's "
                     "home Region (use when IAM Identity Center in the target account is in another Region)")
+    ap.add_argument("--account-email", help="prefix@domain for the new accounts' email addresses (no '+'); Transform "
+                    "adds '+account-name'. The agent answers Transform's email question from it.")
     ap.add_argument("--no-follow", action="store_true", help="start the run and exit")
     args = ap.parse_args()
 
@@ -163,6 +165,8 @@ def main() -> None:
     start_body = {"deployTarget": target}
     if args.target_region:
         start_body["targetRegion"] = args.target_region
+    if args.account_email:
+        start_body["accountEmail"] = args.account_email
     code, res = _invoke_api(lam, fn, "POST /runs/{runId}/deploy", sub, invoked_by, start_body,
                             run_id=args.design_run)
     if code not in (200, 201, 202):

@@ -171,6 +171,10 @@ def _deliverable_design_run(design_run_id, sub):
     return design, None
 
 
+# prefix@domain for the new accounts' email addresses; no "+" because Transform appends "+account-name".
+_ACCOUNT_EMAIL = re.compile(r"[A-Za-z0-9._-]{1,64}@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}")
+
+
 def _deploy(design_run_id, sub, event, invoked_by):
     design, err = _deliverable_design_run(design_run_id, sub)
     if err:
@@ -204,6 +208,11 @@ def _deploy(design_run_id, sub, event, invoked_by):
         # invoke, recorded by IAM ARN) and approver-group members only.
         return _resp(403, {"error": f"only members of the {_approver_group()!r} group or an operator can set targetRegion"})
 
+    account_email = body.get("accountEmail")
+    if account_email is not None and (not isinstance(account_email, str) or not _ACCOUNT_EMAIL.fullmatch(account_email)):
+        return _resp(400, {"error": "accountEmail must look like prefix@domain, without a '+' (Transform adds "
+                                    "'+account-name' for each new account)"})
+
     try:
         deploy_target = parse_deploy_target_from_request(
             body, deploy_id=deploy_id, put_credentials=_put_credentials
@@ -229,6 +238,8 @@ def _deploy(design_run_id, sub, event, invoked_by):
         item["deployTarget"] = deploy_target
     if target_region:
         item["targetRegion"] = target_region
+    if account_email:
+        item["accountEmailBase"] = account_email
     if invoked_by:
         item["invokedBy"] = invoked_by
     try:

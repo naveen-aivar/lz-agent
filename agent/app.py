@@ -16,7 +16,7 @@ from strands import Agent
 from strands.models import BedrockModel
 
 import tools
-from prompts import CONVERSE_SYSTEM, DEPLOY_PROMPT, DEPLOY_SYSTEM, INTAKE_PROMPT, SYSTEM
+from prompts import CONVERSE_SYSTEM, DEPLOY_PROMPT, DEPLOY_SYSTEM, INTAKE_PROMPT, REVIEW_SYSTEM, SYSTEM
 from deploy_workflow_tools import run_deploy_invoke
 import transform_conversation
 from transform_mcp import transform_tools
@@ -56,6 +56,16 @@ def _converse_agent(prompt: str):
     return agent(prompt)
 
 
+def _review_agent(prompt: str):
+    """One independent review turn on a typed reply: a separate model call whose only tool reports the verdict."""
+    agent = Agent(
+        model=BedrockModel(model_id=MODEL_ID, max_tokens=1024),
+        system_prompt=REVIEW_SYSTEM,
+        tools=transform_conversation.reviewer_tools(),
+    )
+    return agent(prompt)
+
+
 @app.entrypoint
 def invoke(payload, context):
     bedrock_auth.configure_bedrock_api_key()
@@ -74,6 +84,7 @@ def invoke(payload, context):
             return _complete(artifact_key, out)
         elif phase == "deploy":
             tools.set_deploy_run(run_id)
+            transform_conversation.set_reply_reviewer(lambda prompt: _review_agent(prompt))
             return run_deploy_invoke(
                 lambda: _deploy_agent(DEPLOY_PROMPT.format(run_id=run_id)),
                 lambda prompt: _converse_agent(prompt),

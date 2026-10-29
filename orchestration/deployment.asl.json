@@ -1,5 +1,5 @@
 {
-  "Comment": "Deploy agent loop with two budgets. phase_invoke counts cycles: progressCount (awaitingHitl=false, 60 s waits, limit 240 = about 4 h of polling) and hitlCount (awaitingHitl=true, 60 s waits, limit 1440 = about 24 h waiting on a human in AWS Transform). History: each cycle is Task (5 events) + Choice (2) + Wait (2) = 9 events; worst case (240 + 1440) cycles x 9 = 15,120 events plus about 10 start/end events, well under the 25,000-event limit. Wall time: 1680 cycles x (60 s + invoke time) is about 42 h at 30 s per invoke, inside the 72 h execution timeout. Attestation runs inside phase_invoke when the agent returns ok; MarkDelivered/MarkFailed update DynamoDB and delete deploy-target keys.",
+  "Comment": "Deploy agent loop with two budgets. phase_invoke counts cycles: progressCount (awaitingHitl=false, 15 s waits, limit 960 = about 4 h of polling) and hitlCount (awaitingHitl=true, 30 s waits, limit 1440 = about 12 h waiting on a human in AWS Transform). History: each cycle is Task (5 events) + Choice (2) + Wait (2) = 9 events; worst case (960 + 1440) cycles x 9 = 21,600 events plus about 10 start/end events, under the 25,000-event limit. Wall time: about 4 h + 12 h plus invoke time, inside the 72 h execution timeout. Attestation runs inside phase_invoke when the agent returns ok; MarkDelivered/MarkFailed update DynamoDB and delete deploy-target keys.",
   "TimeoutSeconds": 259200,
   "StartAt": "RunDeployAgent",
   "States": {
@@ -33,7 +33,7 @@
       "Type": "Choice",
       "Choices": [
         {"Variable": "$.agentContinue", "BooleanEquals": false, "Next": "MarkDelivered"},
-        {"Variable": "$.progressCount", "NumericGreaterThanEquals": 240, "Next": "MarkFailedProgressBudget"},
+        {"Variable": "$.progressCount", "NumericGreaterThanEquals": 960, "Next": "MarkFailedProgressBudget"},
         {"Variable": "$.hitlCount", "NumericGreaterThanEquals": 1440, "Next": "MarkFailedHitlBudget"}
       ],
       "Default": "DeployAgentWait"
@@ -59,7 +59,7 @@
         "runId.$": "$.runId",
         "error": {
           "Error": "DeployProgressPollBudgetExceeded",
-          "Cause.$": "States.Format('Progress-poll budget exhausted: {} polls (60 s apart, limit 240) without the deploy finishing. Last reason: {}', $.progressCount, $.lastReason)"
+          "Cause.$": "States.Format('Progress-poll budget exhausted: {} polls (15 s apart, limit 960, about 4 h) without the deploy finishing. Last reason: {}', $.progressCount, $.lastReason)"
         }
       },
       "Next": "MarkFailed"
@@ -70,7 +70,7 @@
         "runId.$": "$.runId",
         "error": {
           "Error": "DeployHitlWaitBudgetExceeded",
-          "Cause.$": "States.Format('Human-input wait budget exhausted: {} waits (60 s apart, limit 1440, about 24 h) for an answer in AWS Transform. Last reason: {}. Pending input: {}', $.hitlCount, $.lastReason, $.pendingSummary)"
+          "Cause.$": "States.Format('Human-input wait budget exhausted: {} waits (30 s apart, limit 1440, about 12 h) for an answer in AWS Transform. Last reason: {}. Pending input: {}', $.hitlCount, $.lastReason, $.pendingSummary)"
         }
       },
       "Next": "MarkFailed"

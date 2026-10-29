@@ -893,6 +893,15 @@ function openDeployDialog(designRunId) {
 }
 
 function deployPayloadFromForm() {
+  const body = deployTargetFromForm();
+  const email = $("deployForm").accountEmail.value.trim();
+  if (email) {
+    if (/\+/.test(email) || !/^[A-Za-z0-9._-]{1,64}@([A-Za-z0-9-]+\.)+[A-Za-z]{2,63}$/.test(email)) throw new Error("Account email must look like prefix@domain, without a +");
+    body.accountEmail = email;
+  }
+  return body;
+}
+function deployTargetFromForm() {
   const f = $("deployForm");
   const method = f.authMethod.value;
   if (method === "platform") return {};

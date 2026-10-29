@@ -22,7 +22,12 @@ from botocore.config import Config
 from common import audit, get_run, record_artifact, table
 from phase_attest import handler as attest_handler
 
-WAIT_SECONDS = 60  # both progress polls and HITL waits; the budgets live in deployment.asl.json
+# Seconds between cycles. Each cycle costs 9 Step Functions history events of the 25,000 allowed, so the shorter
+# the wait, the smaller its budget in deployment.asl.json: 960 progress polls x 15 s (4 h) and 1440 human waits
+# x 30 s (12 h) = 21,600 events.
+PROGRESS_WAIT_SECONDS = 15
+HITL_WAIT_SECONDS = 30
+_SUGGESTION_TYPES = ("option", "approval", "text", "steps")
 _REASON_MAX = 500
 _SUMMARY_MAX = 600
 
@@ -110,10 +115,12 @@ def _validate_pending(pending, run_id: str) -> dict | None:
         and (note.get("suggestion") is None or isinstance(note.get("suggestion"), str))
         and (note.get("link") is None or (isinstance(note.get("link"), str) and _CONSOLE_LINK.match(note["link"])))
         and (note.get("informational") is None or note.get("informational") is True)
+        and (note.get("suggestionType") is None or note.get("suggestionType") in _SUGGESTION_TYPES)
     ):
         raise RuntimeError(
             f"agent continue payload for {run_id}: pendingHumanInput.agentNote must be "
-            "{reason: str, suggestion: str | null, link?: AWS console https URL, informational?: true} or absent"
+            "{reason: str, suggestion: str | null, suggestionType?: option|approval|text|steps, "
+            "link?: AWS console https URL, informational?: true} or absent"
         )
     return pending
 
@@ -215,7 +222,7 @@ def _deploy_result(run_id, *, cont, awaiting, progress, hitl, reason, summary):
         "runId": run_id,
         "agentContinue": cont,
         "awaitingHitl": awaiting,
-        "waitSeconds": WAIT_SECONDS,
+        "waitSeconds": HITL_WAIT_SECONDS if awaiting else PROGRESS_WAIT_SECONDS,
         "progressCount": progress,
         "hitlCount": hitl,
         "lastReason": reason[:_REASON_MAX],

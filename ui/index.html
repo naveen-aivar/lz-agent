@@ -276,6 +276,7 @@ dialog.deploy .hint { font-size:12px; color:var(--faint); font-weight:400; line-
       <label>Secret access key<input name="secretAccessKey" type="password" autocomplete="off" /></label>
       <label>Session token (optional)<input name="sessionToken" autocomplete="off" /></label>
     </div>
+    <label>Account email (optional)<span class="hint">prefix@domain for the new accounts, without a +. Transform adds +account-name. The agent answers its email question from this.</span><input name="accountEmail" type="email" autocomplete="off" placeholder="aws-admin@example.com" /></label>
     <div id="deployVerifyBox" class="deploy-verify" hidden role="status" aria-live="polite"></div>
     <div class="actions">
       <button class="btn" type="button" id="cancelDeployDlg">Cancel</button>

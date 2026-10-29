@@ -839,16 +839,12 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
         gaps=_get_json(f"{deployment}/gap-analysis.json"),
         scope=scope,
     )
-    prompt = conv.build_prompt(
-        pending=pending,
-        scope=scope,
-        context=context,
-        conversation=transform_ops.recent_conversation(
-            pending["jobId"], pending.get("workspaceId"), limit=conv.CONVERSATION_MESSAGES
-        ),
-        prior=item,
+    conversation = transform_ops.recent_conversation(
+        pending["jobId"], pending.get("workspaceId"), limit=conv.CONVERSATION_MESSAGES
     )
-    conv.begin_turn(qkey=qkey, pending=pending, scope=scope, context=context, turns=turns)
+    prompt = conv.build_prompt(pending=pending, scope=scope, context=context, conversation=conversation, prior=item)
+    conv.begin_turn(qkey=qkey, pending=pending, scope=scope, context=context, turns=turns,
+                    conversation=conversation)
     error = None
     try:
         converse(prompt)
