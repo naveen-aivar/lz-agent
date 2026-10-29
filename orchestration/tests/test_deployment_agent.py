@@ -36,7 +36,7 @@ class DeploymentAgentTests(unittest.TestCase):
         asl_path = Path(__file__).resolve().parents[1] / "deployment.asl.json"
         doc = json.loads(asl_path.read_text(encoding="utf-8"))
         rules = {r["Variable"]: r for r in doc["States"]["DeployAgentChoice"]["Choices"]}
-        self.assertEqual(rules["$.progressCount"]["NumericGreaterThanEquals"], 240)
+        self.assertEqual(rules["$.progressCount"]["NumericGreaterThanEquals"], 960)
         self.assertEqual(rules["$.progressCount"]["Next"], "MarkFailedProgressBudget")
         self.assertEqual(rules["$.hitlCount"]["NumericGreaterThanEquals"], 1440)
         self.assertEqual(rules["$.hitlCount"]["Next"], "MarkFailedHitlBudget")

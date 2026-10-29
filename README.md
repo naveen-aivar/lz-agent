@@ -37,7 +37,7 @@ API creates deploy run (runKind=deploy, links designRunId)
           → foundation assessment + iac-change-plan → render bundles
           → post-discover → finish_deploy_workflow
         if Transform still running: SFN waits 60 s and re-invokes the same session
-          progress budget 240 cycles (~4 h); HITL budget 1440 cycles (~24 h) while Transform waits on a person
+          progress budget 960 cycles x 15 s (~4 h); HITL budget 1440 cycles x 30 s (~12 h) while Transform waits on a person
           (the question is shown in the UI: "AWS Transform needs your input")
   → on agent ok: attestation in phase_invoke (deployment-report.json, rule-based pass/fail)
   → phase_deploy → DELIVERED or FAILED (stored target keys deleted; /stop deletes them too)

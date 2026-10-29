@@ -263,6 +263,18 @@ class ApiRunsTests(_Base):
             self.assertIn("targetRegion", res["error"])
         code, res = self.deploy_keys()
         self.assertNotIn("targetRegion", self.table.meta(res["runId"]))
+    def test_account_email_is_validated_and_stored_on_the_run(self):
+        target = {"accountId": ACCOUNT, "accessKeyId": "AKIAEXAMPLE", "secretAccessKey": "secret"}
+        code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "accountEmail": "billu.naveen@aivar.tech"},
+                             run_id=DESIGN_ID)
+        self.assertEqual(code, 202, res)
+        self.assertEqual(self.table.meta(res["runId"])["accountEmailBase"], "billu.naveen@aivar.tech")
+        for bad in ("billu.naveen+audit@aivar.tech", "no-at-sign", "a@b", "x" * 70 + "@aivar.tech", 7, "", "a b@c.com"):
+            code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "accountEmail": bad}, run_id=DESIGN_ID)
+            self.assertEqual(code, 400, bad)
+            self.assertIn("accountEmail", res["error"])
+        code, res = self.deploy_keys()
+        self.assertNotIn("accountEmailBase", self.table.meta(res["runId"]))
 
     def test_role_mode_requires_external_id(self):
         code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": {"accountId": ACCOUNT, "roleArn": ROLE}},
@@ -543,7 +555,7 @@ class PhaseInvokeTests(_Base):
         out, _ = self.invoke([cont(True, pending())], progress=3, hitl=7)
         self.assertEqual(out["progressCount"], 3)
         self.assertEqual(out["hitlCount"], 8)
-        self.assertEqual(out["waitSeconds"], 60)
+        self.assertEqual(out["waitSeconds"], 30)  # waiting on a person: 30 s
         self.assertTrue(out["agentContinue"] and out["awaitingHitl"])
         self.assertIn("Approve the OU changes?", out["pendingSummary"])
         meta = self.table.meta(self.RUN)
@@ -603,6 +615,20 @@ class PhaseInvokeTests(_Base):
         with self.assertRaisesRegex(RuntimeError, "createdAtMs must be an integer"):
             self.invoke([cont(True, {**pending(), "createdAtMs": 1793248000.5})])
 
+    def test_suggestion_type_is_validated(self):
+        for kind in ("option", "approval", "text", "steps"):
+            note = {"reason": "r", "suggestion": "Proceed", "suggestionType": kind}
+            self.invoke([cont(True, {**pending(title=kind), "agentNote": note})])
+            self.assertEqual(self.table.meta(self.RUN)["pendingHumanInput"]["agentNote"]["suggestionType"], kind)
+        for bad in ("free", 3, ["text"]):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RuntimeError, "agentNote must be"):
+                self.invoke([cont(True, {**pending(), "agentNote": {"reason": "r", "suggestion": "x", "suggestionType": bad}})])
+
+    def test_wait_is_15_seconds_while_running_and_30_while_waiting_on_a_person(self):
+        out, _ = self.invoke([cont(False)])
+        self.assertEqual(out["waitSeconds"], 15)
+        out, _ = self.invoke([cont(True, pending())])
+        self.assertEqual(out["waitSeconds"], 30)
     def test_agent_note_link_must_be_an_aws_console_url(self):
         ok = {"reason": "Approve it.", "suggestion": None,
               "link": "https://ap-south-1.console.aws.amazon.com/transform/connector/c-1/configure?region=ap-south-1"}
@@ -659,7 +685,7 @@ class PhaseInvokeTests(_Base):
     def test_ok_returns_every_selector_key(self):
         with mock.patch.object(phase_invoke, "attest_handler"), mock.patch.object(phase_invoke, "record_artifact"):
             out, _ = self.invoke([{"status": "ok"}], progress=4, hitl=2)
-        self.assertEqual(out, {"runId": self.RUN, "agentContinue": False, "awaitingHitl": False, "waitSeconds": 60,
+        self.assertEqual(out, {"runId": self.RUN, "agentContinue": False, "awaitingHitl": False, "waitSeconds": 15,
                                "progressCount": 4, "hitlCount": 2, "lastReason": "", "pendingSummary": "none"})
 
     def test_region_comes_from_lambda_environment(self):
@@ -764,7 +790,8 @@ def run_deploy_sfn(lambda_fn, max_steps=100_000):
                     break
             state_name = nxt
         elif st["Type"] == "Wait":
-            assert _path(doc, st["SecondsPath"]) == 60
+            wait = _path(doc, st["SecondsPath"])
+            assert wait == (30 if doc["awaitingHitl"] else 15), (wait, doc["awaitingHitl"])
             state_name = st["Next"]
         elif st["Type"] == "Pass":
             doc, state_name = _resolve(st["Parameters"], doc), st["Next"]
@@ -793,26 +820,28 @@ class DeployStateMachineTests(_Base):
 
         return run_deploy_sfn(fn)
 
-    def test_progress_budget_is_240_polls_and_names_itself(self):
-        final, payload, _ = self.drive([cont(False, reason=f"poll {i}") for i in range(240)])
+    def test_progress_budget_is_960_polls_and_names_itself(self):
+        final, payload, _ = self.drive([cont(False, reason=f"poll {i}") for i in range(960)])
         self.assertEqual(final, "MarkFailed")
         self.assertEqual(payload["error"]["Error"], "DeployProgressPollBudgetExceeded")
-        self.assertIn("240 polls", payload["error"]["Cause"])
-        self.assertIn("poll 239", payload["error"]["Cause"])
+        self.assertIn("960 polls", payload["error"]["Cause"])
+        self.assertIn("15 s apart", payload["error"]["Cause"])
+        self.assertIn("poll 959", payload["error"]["Cause"])
 
     def test_hitl_budget_is_separate_1440_waits_and_carries_the_question(self):
         results = [cont(False)] * 200 + [cont(True, pending())] * 1440
         final, payload, _ = self.drive(results)
         self.assertEqual(payload["error"]["Error"], "DeployHitlWaitBudgetExceeded")
         self.assertIn("1440 waits", payload["error"]["Cause"])
+        self.assertIn("30 s apart", payload["error"]["Cause"])
         self.assertIn("Approve the OU changes?", payload["error"]["Cause"])
         self.assertIn("https://example.transform.aws/jobs/job-1", payload["error"]["Cause"])
 
     def test_worst_case_history_stays_well_under_25k_events(self):
-        results = [cont(False)] * 239 + [cont(True, pending())] * 1439 + [{"status": "ok"}]
+        results = [cont(False)] * 959 + [cont(True, pending())] * 1439 + [{"status": "ok"}]
         final, payload, events = self.drive(results)
         self.assertEqual((final, payload["status"]), ("MarkDelivered", "DELIVERED"))
-        self.assertLess(events, 16_000)  # documented: (240 + 1440) x 9 + start/end ~= 15.1k of 25k
+        self.assertLess(events, 22_000)  # documented: (960 + 1440) x 9 + start/end ~= 21.6k of 25k
 
 
 # ---------------------------------------------------------------- platform.yaml invariants

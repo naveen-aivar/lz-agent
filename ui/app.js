@@ -438,6 +438,20 @@ function deployContinueNotice(audit, run) {
 // Index of the offered option the suggestion names (same label, ignoring case and outer spaces), or -1.
 const suggestedOptionIndex = (p, sug) => (Array.isArray(p.options) ? p.options : [])
   .findIndex((o) => typeof o === "string" && o.trim().toLowerCase() === String(sug || "").trim().toLowerCase());
+// The agent's suggestion is typed: "option" and "approval" name an offered option (a person confirms before it is
+// sent), "text" is a typed reply, "steps" is instructions for a task. A note without a type (a run started by an
+// older release) keeps the earlier behaviour: an exact option label selects it, anything else becomes a draft reply.
+const suggestionLabel = (note) => ({ option: "Suggested option", approval: "Suggested approval", text: "Suggested reply", steps: "Suggested steps" })[note.suggestionType] || "Suggested";
+function suggestionButton(p, note, answered) {
+  if (!note.suggestion || answered || p.kind !== "message" || !p.messageId || !canAnswerTransform()) return "";
+  const type = note.suggestionType || "";
+  if (type === "steps") return "";
+  const isOption = type ? type === "option" || type === "approval" : suggestedOptionIndex(p, note.suggestion) >= 0;
+  if (isOption && suggestedOptionIndex(p, note.suggestion) < 0) return "";  // not on offer any more
+  const label = type === "approval" ? "Select this option to approve" : isOption ? "Select this option" : "Use this as my reply";
+  const hint = type === "approval" ? "This approves or starts something in AWS. You confirm before it is sent." : isOption ? "You confirm before it is sent." : "You can edit it before sending.";
+  return `<div style="margin-top:8px"><button class="btn btn-sm${type === "approval" ? " btn-primary" : ""}" type="button" data-answer-use-suggestion>${label}</button> <span class="hint">${hint}</span></div>`;
+}
 const isUpdateOnly = (p) => !!(p && p.agentNote && p.agentNote.informational === true);
 const questionKey = (p) => (p ? `${p.jobId}:${p.messageId || p.taskId || p.title}` : "");
 function answerState(p) {
@@ -511,11 +525,7 @@ function humanInputBanner(run, audit = []) {
     <div class="hitl-head"><span class="pulse" aria-hidden="true"></span><h2 id="hitl-heading">${answered ? "Answer sent to AWS Transform" : isUpdateOnly(p) ? "Update from AWS Transform" : "AWS Transform needs your input"}</h2>
       ${asked && !isUpdateOnly(p) ? `<span class="hint" style="margin:0">asked ${esc(ago(asked))}</span>` : ""}<span class="hitl-link">${openLink}</span></div>
     ${p.title && p.kind === "task" ? `<p style="margin:0 0 8px"><strong>${esc(p.title)}</strong></p>` : ""}
-    ${question}${note && !answered ? `<div class="agent-note" role="note"><strong>${isUpdateOnly(p) ? "Deploy agent (no reply needed):" : "Deploy agent:"}</strong> ${esc(note.reason)}${note.suggestion ? `<div class="hint">Suggested: ${esc(note.suggestion)}</div>` : ""}${note.suggestion && p.kind === "message" && p.messageId && canAnswerTransform() && !answered
-      ? (suggestedOptionIndex(p, note.suggestion) >= 0
-        ? `<div style="margin-top:8px"><button class="btn btn-sm" type="button" data-answer-use-suggestion>Select this option</button> <span class="hint">You confirm before it is sent.</span></div>`
-        : `<div style="margin-top:8px"><button class="btn btn-sm" type="button" data-answer-use-suggestion>Use this as my reply</button> <span class="hint">You can edit it before sending.</span></div>`)
-      : ""}${typeof note.link === "string" && /^https:\/\/[a-z0-9-]+\.console\.aws\.amazon\.com\//.test(note.link) ? `<div style="margin-top:8px"><a class="btn btn-sm btn-primary" href="${esc(note.link)}" target="_blank" rel="noopener noreferrer">Approve in the AWS console ↗<span class="sr-only"> (opens in a new tab)</span></a></div>` : ""}</div>` : ""}${action}
+    ${question}${note && !answered ? `<div class="agent-note" role="note"><strong>${isUpdateOnly(p) ? "Deploy agent (no reply needed):" : "Deploy agent:"}</strong> ${esc(note.reason)}${note.suggestion ? `<div class="hint">${esc(suggestionLabel(note))}: ${esc(note.suggestion)}</div>` : ""}${suggestionButton(p, note, answered)}${typeof note.link === "string" && /^https:\/\/[a-z0-9-]+\.console\.aws\.amazon\.com\//.test(note.link) ? `<div style="margin-top:8px"><a class="btn btn-sm btn-primary" href="${esc(note.link)}" target="_blank" rel="noopener noreferrer">Approve in the AWS console ↗<span class="sr-only"> (opens in a new tab)</span></a></div>` : ""}</div>` : ""}${action}
     <p class="hint" style="margin-top:12px">Transform job <code>${esc(p.jobId || "")}</code>. ${isUpdateOnly(p)
       ? "Transform is still working; the deploy continues on its own. Reply only if this message actually asks you something."
       : "The deploy resumes on its own once Transform has your answer. It fails if no answer arrives within about 24 hours."}</p></section>`;
@@ -968,7 +978,7 @@ function onView(e) {
   if (e.target.closest("[data-answer-use-suggestion]")) {
     const p = S.data && S.data.run && S.data.run.pendingHumanInput;
     const sug = p && p.agentNote && typeof p.agentNote.suggestion === "string" ? p.agentNote.suggestion : "";
-    const k = p ? suggestedOptionIndex(p, sug) : -1;
+    const k = p && !(p.agentNote && p.agentNote.suggestionType === "text") ? suggestedOptionIndex(p, sug) : -1;
     if (k >= 0) { S.answer.selected = p.options[k]; S.answer.reply = false; renderRun(); return; }  // the option, not typed text
     if (sug) { S.answer.draft = sug.slice(0, 4000); S.answer.reply = true; S.answer.selected = null; renderRun(); const t = $("answer-text"); if (t) t.focus(); }
     return;

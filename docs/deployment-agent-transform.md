@@ -24,7 +24,7 @@ There are no separate discover / transform / render Lambdas in the deploy state 
 flowchart TD
   A[RunDeployAgent phase_invoke deploy] --> B{agentContinue?}
   B -->|no| G[MarkDelivered phase_deploy_status]
-  B -->|yes| P{progressCount >= 240?}
+  B -->|yes| P{progressCount >= 960?}
   P -->|yes| FP[MarkFailedProgressBudget]
   P -->|no| H{hitlCount >= 1440?}
   H -->|yes| FH[MarkFailedHitlBudget]
@@ -35,8 +35,8 @@ flowchart TD
   A -->|Lambda error| F
 ```
 
-- **Two budgets.** `phase_invoke` maps the agent's continue payload (contract C3: `reason`, `awaitingHitl`, `jobId`, `pendingHumanInput`) and counts the cycle: `awaitingHitl: false` increments `progressCount` (progress polls, limit 240 ≈ 4 h), `awaitingHitl: true` increments `hitlCount` (waiting on a person in AWS Transform, limit 1440 ≈ 24 h). Both wait 60 s. Each limit fails with its own error, `DeployProgressPollBudgetExceeded` or `DeployHitlWaitBudgetExceeded`, and the cause carries the last reason (and, for HITL, the pending question and console URL).
-- **History budget.** One cycle is Task (5 events) + Choice (2) + Wait (2) = 9 events. The worst case, (240 + 1440) × 9 = 15,120 events plus about 10 start/end events, stays well under the 25,000-event Step Functions limit. The counters live in the Lambda payload so the loop needs no Pass states.
+- **Two budgets.** `phase_invoke` maps the agent's continue payload (contract C3: `reason`, `awaitingHitl`, `jobId`, `pendingHumanInput`) and counts the cycle: `awaitingHitl: false` increments `progressCount` (progress polls, limit 960 × 15 s ≈ 4 h), `awaitingHitl: true` increments `hitlCount` (waiting on a person in AWS Transform, limit 1440 × 30 s ≈ 12 h). Progress cycles wait 15 s, human waits 30 s. Each limit fails with its own error, `DeployProgressPollBudgetExceeded` or `DeployHitlWaitBudgetExceeded`, and the cause carries the last reason (and, for HITL, the pending question and console URL).
+- **History budget.** One cycle is Task (5 events) + Choice (2) + Wait (2) = 9 events. The worst case, (960 + 1440) × 9 = 21,600 events plus about 10 start/end events, stays well under the 25,000-event Step Functions limit. The counters live in the Lambda payload so the loop needs no Pass states.
 - **Wall time.** 1680 cycles × (60 s + invoke time) is about 42 h at 30 s per invoke, inside the 72 h execution timeout. An execution that hits the timeout ends without `MarkFailed`, so META stays `RUNNING`; the artifact bucket's lifecycle rule (4 days) is the backstop for stored target keys.
 - **Pending human input.** When `awaitingHitl` is true and Transform returned the question, `phase_invoke` writes `META.pendingHumanInput` (`{source, jobId, workspaceId, kind, taskId, title, text, options, consoleUrl}`) and `META.awaitingHitl`, and audits `phase.awaiting_human` (title, text, options, consoleUrl) when the question first appears or changes. The next non-waiting result removes it and audits `phase.human_input_resolved`. `MarkDelivered`, `MarkFailed` and `/stop` clear it too. The UI shows an "AWS Transform needs your input" banner with a link to the job.
 - **Attestation** runs inside **`phase_invoke`** when the agent returns `status: ok` (not a separate SFN state).
@@ -167,8 +167,8 @@ Drop the `sts:ExternalId` condition only if `TransformExternalId` is empty. The 
 | Guardrail | Value |
 |-----------|--------|
 | SFN execution timeout | 72 hours |
-| Progress-poll budget | **240** cycles × 60 s (`awaitingHitl: false`), ASL `DeployAgentChoice` |
-| HITL wait budget | **1440** cycles × 60 s ≈ 24 h (`awaitingHitl: true`), ASL `DeployAgentChoice` |
+| Progress-poll budget | **960** cycles × 15 s ≈ 4 h (`awaitingHitl: false`), ASL `DeployAgentChoice` |
+| HITL wait budget | **1440** cycles × 30 s ≈ 12 h (`awaitingHitl: true`), ASL `DeployAgentChoice` |
 | Artifact contract | `lzcore/deploy_artifacts.py` (includes `iac-manifest.json`, post-discover, final Transform job poll) |
 | `phase_invoke` timeout | 900s (agent + attest in one Lambda) |
 
@@ -181,3 +181,11 @@ Drop the `sts:ExternalId` condition only if `TransformExternalId` is empty. The 
 | `orchestration/lambdas/phase_attest.py` | Report builder |
 | `lzcore/deploy_workflow.py` | `evaluate_deployment_outcome` |
 | `agent/app.py` | Runtime entry (`intake`, `deploy`) |
+
+
+## Conversation agent: what it sends and what a person sends
+
+* **Options it selects itself** (`AGENT_ANSWERABLE_OPTIONS`, enforced in code, fails closed): Landing Zone, Custom structure, My own structure, Get started, Create a Control Tower landing zone (recommended), Recommend additional SCPs, None (skip). Everything else (Proceed, Continue, Deploy for me, any new label) goes to a person.
+* **Typed replies**: only for a message that offers no options, with facts from the approved design or run context, each citing its basis. A separate reviewer model call (`REVIEW_SYSTEM`, one tool `report_reply_review`) must say the reply approves nothing irreversible; an error, no verdict or an unsure verdict refuses the reply. The reviewer is a model check, not a code rule: tasks and the option list above are the code-enforced part.
+* **Suggestions** are typed: `option` and `approval` must equal an offered label (a person confirms before it is sent), `text` is a typed reply for a message without options, `steps` is for a task. Explanations go in `reason`.
+* **Account email**: `accountEmail` (`prefix@domain`, no `+`) on the deploy request is stored as `META.accountEmailBase` and offered to the agent as `context:accountEmailBase`. Without it the email question goes to a person.

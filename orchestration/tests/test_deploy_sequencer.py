@@ -707,6 +707,7 @@ class _SequencerCaseBase(unittest.TestCase):
             (app, "transform_tools", _fake_transform_tools),
             (app, "_deploy_agent", self._model_not_scripted),
             (app, "_converse_agent", self._converse_not_scripted),
+            (app, "_review_agent", self._review_not_scripted),
         ):
             p = mock.patch.object(target, attr, value)
             p.start()
@@ -724,6 +725,9 @@ class _SequencerCaseBase(unittest.TestCase):
 
     def _model_not_scripted(self, prompt):
         raise AssertionError("judgment model invoked but the test did not script it")
+
+    def _review_not_scripted(self, prompt):
+        raise AssertionError("reply reviewer invoked but the test did not script it")
 
     def _converse_not_scripted(self, prompt):
         raise AssertionError("conversation model invoked but the test did not script it")
@@ -1335,9 +1339,13 @@ def _answer(option="Landing Zone", category="workflow", basis=("context:runPurpo
     return turn
 
 
-def _escalate(reason="Needs a person.", suggestion=""):
+def _escalate(reason="Needs a person.", suggestion="", stype=None):
     def turn(prompt):
-        out = conv.escalate_to_human(reason, suggestion)
+        kind = stype
+        if suggestion and kind is None:
+            offered = [str(o).lower() for o in conv._turn["pending"].get("options") or []]
+            kind = "option" if suggestion.lower() in offered else ("text" if not offered else "steps")
+        out = conv.escalate_to_human(reason, suggestion, kind or "")
         assert out.startswith("Handed"), out
         return out
     return turn
@@ -1400,17 +1408,18 @@ class TransformConversation(_SequencerCaseBase):
         self._assert_continue(result, awaiting=True, pending=MESSAGE)
         self.assertEqual(len(self.fake_ops.answers), 1)
 
-    def test_typed_replies_are_refused_and_go_to_a_person_as_a_suggestion(self):
+    def test_typed_reply_on_a_message_with_options_is_refused_and_the_option_goes_to_a_person(self):
         self._env([("EXECUTING", MESSAGE)])
         self._set_converse(lambda prompt: (
             _answer(option="", text="Use the OU Workloads.", category="design", basis=("scope:/ous/0/name",),
                     expect="REFUSED")(prompt),
-            _escalate("Transform needs the structure typed in.", "Use the OU Workloads.")(prompt)))
+            _escalate("Pick the workflow.", "End-to-End Migration")(prompt)))
 
         result = self._invoke()
 
         self.assertEqual(self.fake_ops.answers, [])
-        self.assertEqual(result["pendingHumanInput"]["agentNote"]["suggestion"], "Use the OU Workloads.")
+        note = result["pendingHumanInput"]["agentNote"]
+        self.assertEqual((note["suggestion"], note["suggestionType"]), ("End-to-End Migration", "option"))
 
     def test_unresolvable_basis_and_approval_category_are_refused(self):
         self._env([("EXECUTING", MESSAGE)])
@@ -1428,7 +1437,7 @@ class TransformConversation(_SequencerCaseBase):
         self.assertEqual(self.fake_ops.answers, [])
         self.assertIsNone(self.table.item("ANSWER#msg-0001"))
         self.assertEqual(result["pendingHumanInput"]["agentNote"],
-                         {"reason": "Pick the workflow.", "suggestion": "Landing Zone"})
+                         {"reason": "Pick the workflow.", "suggestion": "Landing Zone", "suggestionType": "option"})
         self.assertIn("transform.agent_escalated", self.table.actions())
 
     PROGRESS = {**MESSAGE, "messageId": "msg-progress", "text": "Working on build landing zone...",
@@ -1996,6 +2005,7 @@ class JudgmentAgentTools(_SequencerCaseBase):
 
 _REAL_DEPLOY_AGENT = app._deploy_agent
 _REAL_CONVERSE_AGENT = app._converse_agent
+_REAL_REVIEW_AGENT = app._review_agent
 
 
 if __name__ == "__main__":
@@ -2043,7 +2053,7 @@ class V26ReviewFixes(_SequencerCaseBase):
                 self.assertEqual(self.fake_ops.answers, [])
 
     def test_a_full_length_suggestion_is_accepted_and_a_longer_one_refused(self):
-        self._env([("EXECUTING", MESSAGE)])
+        self._env([("EXECUTING", {**MESSAGE, "options": [], "choices": []})])
         long_ok = "x" * conv.SUGGESTION_LIMIT
         self._set_converse(lambda prompt: (
             self.assertTrue(conv.escalate_to_human("r", long_ok + "y").startswith("REFUSED")),
@@ -2185,3 +2195,245 @@ class V26ConnectorResume(_SequencerCaseBase):
         self.assertEqual(self.table.item("AGENTQ#message:msg-before")["status"], "superseded")
         self.assertIsNone(self.table.item("AGENTQ#message:msg-next-question"))
         self.assertEqual(self.table.item("AGENTQ#task:task-0001")["status"], "answered")
+
+
+# --------------------------------------------------------------------------------------
+# Phase 1: structured suggestions, typed replies with an independent reviewer, wider option list, account email
+# --------------------------------------------------------------------------------------
+NO_OPTIONS = {**MESSAGE, "messageId": "msg-text", "text": "What email prefix and domain should the accounts use?",
+              "options": [], "choices": [], "title": "Transform is asking for a reply"}
+
+
+def _verdict(approves, why="gives requested facts only"):
+    def review(prompt):
+        out = conv.report_reply_review(approves, why)
+        assert out.startswith("Recorded"), out
+    return review
+
+
+class TypedReplies(_SequencerCaseBase):
+    def _env(self, pending=NO_OPTIONS, **meta):
+        self._make_env(transform_ops=FakeTransformOps(poll_script=[("EXECUTING", pending)]),
+                       meta_extra={"transformAnalyzeJobId": ANALYZE_JOB,
+                                   "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}, **meta})
+        self._seed_foundation()
+        self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
+
+    def _set_reviewer(self, *turns):
+        script, prompts = list(turns), []
+
+        def review(prompt):
+            prompts.append(prompt)
+            if not script:
+                raise AssertionError("reviewer invoked more times than scripted")
+            return script.pop(0)(prompt)
+
+        p = mock.patch.object(app, "_review_agent", review)
+        p.start()
+        self.addCleanup(p.stop)
+        return prompts
+
+    def _type(self, text="Use prefix billu.naveen and domain aivar.tech.", expect="SENT",
+              basis=("context:accountEmailBase",), category="design"):
+        def turn(prompt):
+            out = conv.answer_transform_question(category=category, rationale="The operator gave the email base.",
+                                                 basis=list(basis), text=text)
+            assert out.startswith(expect), out
+            return out
+        return turn
+
+    def test_a_reviewed_typed_reply_is_sent_and_audited(self):
+        self._env(accountEmailBase="billu.naveen@aivar.tech")
+        prompts = self._set_reviewer(_verdict(False))
+        self._set_converse(self._type())
+
+        self._invoke()
+
+        (sent,) = self.fake_ops.answers
+        self.assertEqual((sent["option"], sent["text"]), (None, "Use prefix billu.naveen and domain aivar.tech."))
+        self.assertEqual(self.table.item("ANSWER#msg-text")["by"], "agent")
+        (rev,) = self.table.audit_of("transform.reply_reviewed")
+        self.assertIs(json.loads(rev["detail"])["approvesIrreversibleAction"], False)
+        (row,) = self.table.audit_of("transform.answer_sent")
+        self.assertEqual(json.loads(row["detail"])["text"], "Use prefix billu.naveen and domain aivar.tech.")
+        # The reviewer saw the question and the reply, and its own system prompt is separate.
+        self.assertIn("What email prefix and domain", prompts[0])
+        self.assertIn("proposed_reply", prompts[0])
+
+    def test_a_reply_the_reviewer_says_approves_something_is_refused(self):
+        self._env(accountEmailBase="billu.naveen@aivar.tech")
+        self._set_reviewer(_verdict(True, "agrees to start the deployment"))
+        self._set_converse(lambda prompt: (
+            self._type("Yes, go ahead.", expect="REFUSED: the independent reviewer")(prompt),
+            _escalate("A person must answer this.", "Yes, go ahead.")(prompt)))
+
+        result = self._invoke()
+
+        self.assertEqual(self.fake_ops.answers, [])
+        self.assertIsNone(self.table.item("ANSWER#msg-text"))
+        self.assertEqual(self.table.meta.get("agentAnswerCount", 0), 0)
+        self.assertEqual(result["pendingHumanInput"]["agentNote"]["suggestionType"], "text")
+
+    def test_a_reviewer_error_or_missing_verdict_refuses_the_reply(self):
+        for name, review in (("error", lambda prompt: (_ for _ in ()).throw(RuntimeError("Bedrock throttled"))),
+                             ("no verdict", lambda prompt: "I think it is fine")):
+            with self.subTest(name):
+                self._env(accountEmailBase="billu.naveen@aivar.tech")
+                self._set_reviewer(review)
+                self._set_converse(lambda prompt: (
+                    self._type(expect="REFUSED: the independent reply review")(prompt),
+                    _escalate("Reviewer unavailable.", "Use prefix billu.naveen.")(prompt)))
+                self._invoke()
+                self.assertEqual(self.fake_ops.answers, [])
+                self.assertIn("transform.reply_review_failed", self.table.actions())
+
+    def test_a_verdict_that_is_not_a_boolean_is_not_recorded(self):
+        self._env(accountEmailBase="billu.naveen@aivar.tech")
+        self._set_reviewer(lambda prompt: conv.report_reply_review("no", "x"))
+        self._set_converse(lambda prompt: (self._type(expect="REFUSED: the independent reply review")(prompt),
+                                           _escalate("x", "y")(prompt)))
+        self._invoke()
+        self.assertEqual(self.fake_ops.answers, [])
+
+    def test_an_unconfigured_reviewer_raises_and_the_reply_is_refused(self):
+        self._env(accountEmailBase="billu.naveen@aivar.tech")
+        self.assertIs(app.transform_conversation, conv)
+        p = mock.patch.object(conv, "_reply_reviewer", conv._reviewer_not_configured)
+        p.start()
+        self.addCleanup(p.stop)
+        # app.invoke installs the real wiring, so drive the tool directly inside a turn.
+        conv.begin_turn(qkey="message:msg-text", pending=NO_OPTIONS, scope=SCOPE,
+                        context={"accountEmailBase": "x@y.com"}, turns=1)
+        self.addCleanup(conv.end_turn)
+        tools._state["mode"] = "deploy"
+        out = conv.answer_transform_question("design", "r", ["context:accountEmailBase"], text="Use prefix x.")
+        self.assertTrue(out.startswith("REFUSED: the independent reply review failed"), out)
+        self.assertIn("no reply reviewer is configured", out)
+
+    def test_the_email_basis_only_resolves_when_the_operator_gave_one(self):
+        self._env()  # no accountEmail on the run
+        self._set_reviewer(_verdict(False))
+        self._set_converse(lambda prompt: (self._type(expect="REFUSED: these basis entries")(prompt),
+                                           _escalate("The email convention is not known.")(prompt)))
+        self._invoke()
+        self.assertEqual(self.fake_ops.answers, [])
+        ctx = conv.run_context(meta={}, foundation={}, gaps={}, scope=SCOPE)
+        self.assertNotIn("accountEmailBase", ctx)
+        ctx = conv.run_context(meta={"accountEmailBase": "a@b.com"}, foundation={}, gaps={}, scope=SCOPE)
+        self.assertEqual(ctx["accountEmailBase"], "a@b.com")
+
+    def test_option_and_text_together_or_neither_are_refused(self):
+        self._env()
+        self._set_converse(lambda prompt: (
+            _answer(option="Landing Zone", text="x", expect="REFUSED: send exactly one")(prompt),
+            _answer(option="", text="", expect="REFUSED: send exactly one")(prompt),
+            _escalate("Nothing to send.")(prompt)))
+        self._invoke()
+        self.assertEqual(self.fake_ops.answers, [])
+
+    def test_reviewer_agent_has_only_the_verdict_tool_and_its_own_prompt(self):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, *, model, system_prompt, tools):
+                captured.update(system_prompt=system_prompt, tools=tools)
+
+            def __call__(self, prompt):
+                return "ok"
+
+        self._make_env()
+        for target, attr, value in ((app, "Agent", FakeAgent), (app, "BedrockModel", lambda **k: "model")):
+            p = mock.patch.object(target, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(app, "_review_agent", _REAL_REVIEW_AGENT)
+        p.start()
+        self.addCleanup(p.stop)
+
+        _REAL_REVIEW_AGENT("prompt")
+
+        self.assertEqual({_tool_name(t) for t in captured["tools"]}, {"report_reply_review"})
+        self.assertEqual(captured["system_prompt"], app.REVIEW_SYSTEM)
+        self.assertIn("If you are unsure, answer true", app.REVIEW_SYSTEM)
+
+
+class AllowedOptions(_SequencerCaseBase):
+    def _env(self, options):
+        pending = {**MESSAGE, "options": options, "choices": [{"label": o, "value": o} for o in options]}
+        self._make_env(transform_ops=FakeTransformOps(poll_script=[("EXECUTING", pending)]),
+                       meta_extra={"transformAnalyzeJobId": ANALYZE_JOB,
+                                   "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}})
+        self._seed_foundation()
+        self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
+
+    def test_every_design_stage_option_can_be_selected(self):
+        for label in ("Get started", "My own structure", "Create a Control Tower landing zone (recommended)",
+                      "Recommend additional SCPs", "None (skip)"):
+            with self.subTest(label):
+                self._env([label, "Learn more"])
+                self._set_converse(_answer(option=label, category="design", basis=("scope:/ous/0/name",)))
+                self._invoke()
+                self.assertEqual([a["option"] for a in self.fake_ops.answers], [label])
+
+    def test_review_and_approval_options_still_go_to_a_person(self):
+        self._env(["Continue", "Proceed", "Deploy for me", "Update connector account", "Generate infrastructure as code"])
+        self._set_converse(lambda prompt: (
+            *[_answer(option=o, expect="REFUSED")(prompt) for o in ("Continue", "Proceed", "Deploy for me")],
+            _escalate("Approval gate.", "Deploy for me", "approval")(prompt)))
+        result = self._invoke()
+        self.assertEqual(self.fake_ops.answers, [])
+        note = result["pendingHumanInput"]["agentNote"]
+        self.assertEqual((note["suggestion"], note["suggestionType"]), ("Deploy for me", "approval"))
+
+    def test_every_allowed_option_is_named_in_the_conversation_prompt(self):
+        for label in conv.AGENT_ANSWERABLE_OPTIONS:
+            self.assertIn(label.lower(), app.CONVERSE_SYSTEM.lower(), label)
+
+
+class SuggestionTypes(_SequencerCaseBase):
+    def _env(self, pending):
+        self._make_env(transform_ops=FakeTransformOps(poll_script=[("EXECUTING", pending)]),
+                       meta_extra={"transformAnalyzeJobId": ANALYZE_JOB,
+                                   "deployTarget": {"mode": "keys", "accountId": TARGET_ACCOUNT}})
+        self._seed_foundation()
+        self._seed_checkpoint("transform_analyze_started", jobId=ANALYZE_JOB)
+
+    def _escalating(self, *calls):
+        def turn(prompt):
+            for args, expect in calls:
+                out = conv.escalate_to_human(*args)
+                assert out.startswith(expect), (args, out)
+        self._set_converse(turn)
+
+    def test_a_suggestion_needs_a_type_and_a_type_needs_a_suggestion(self):
+        self._env(MESSAGE)
+        self._escalating((("r", "Landing Zone", ""), "REFUSED: a suggestion needs suggestion_type"),
+                         (("r", "Landing Zone", "mystery"), "REFUSED: a suggestion needs suggestion_type"),
+                         (("r", "", "option"), "REFUSED: suggestion_type was given without"),
+                         (("Needs a person.",), "Handed"))
+        result = self._invoke()
+        self.assertEqual(result["pendingHumanInput"]["agentNote"], {"reason": "Needs a person.", "suggestion": None})
+
+    def test_an_option_suggestion_must_be_an_offered_label_and_is_normalised(self):
+        self._env(MESSAGE)
+        self._escalating((("r", "Landing Zone - the run builds one", "option"), "REFUSED"),
+                         (("r", "Deploy for me", "approval"), "REFUSED"),
+                         (("r", "end-to-end migration", "approval"), "Handed"))
+        result = self._invoke()
+        note = result["pendingHumanInput"]["agentNote"]
+        self.assertEqual((note["suggestion"], note["suggestionType"]), ("End-to-End Migration", "approval"))
+
+    def test_text_suggestions_are_only_for_messages_without_options(self):
+        self._env(MESSAGE)
+        self._escalating((("r", "Use OU Workloads.", "text"), "REFUSED: suggestion_type 'text'"),
+                         (("r", "Landing Zone", "option"), "Handed"))
+        self._invoke()
+        self.assertEqual(self.table.item("AGENTQ#message:msg-0001")["suggestionType"], "option")
+
+    def test_a_task_can_carry_steps(self):
+        self._env(PENDING)
+        self._escalating((("r", "Open the console", "option"), "REFUSED"),
+                         (("Complete it in the console.", "Connect account 222222222222.", "steps"), "Handed"))
+        result = self._invoke()
+        note = result["pendingHumanInput"]["agentNote"]
+        self.assertEqual((note["suggestion"], note["suggestionType"]), ("Connect account 222222222222.", "steps"))
