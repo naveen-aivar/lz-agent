@@ -376,7 +376,7 @@ function deployCtaCard(run) {
 }
 
 function deployStepsHtml(run, audit) {
-  const waitingOnPerson = run.status === "RUNNING" && (run.awaitingHitl === true || !!run.pendingHumanInput);
+  const waitingOnPerson = run.status === "RUNNING" && (run.awaitingHitl === true || (!!run.pendingHumanInput && !isUpdateOnly(run.pendingHumanInput)));
   const has = (a) => audit.some((x) => x.action === a);
   const hasTool = (name) => audit.some((x) => x.action === name);
   const jobDone = audit.some((x) => x.action === "tool.transform_poll_analyze_job" && parseAuditDetail(x).done === true);
@@ -435,6 +435,7 @@ function deployContinueNotice(audit, run) {
 // META.pendingHumanInput (phase_invoke) mirrors the question an AWS Transform job is waiting on.
 // Everything from Transform is untrusted text: md() escapes it, and only https console URLs are linked.
 // Message questions can be answered here (POST /runs/{id}/answer, approver group); tasks need Transform's own form.
+const isUpdateOnly = (p) => !!(p && p.agentNote && p.agentNote.informational === true);
 const questionKey = (p) => (p ? `${p.jobId}:${p.messageId || p.taskId || p.title}` : "");
 function answerState(p) {
   const key = questionKey(p);
@@ -498,10 +499,10 @@ function humanInputBanner(run, audit = []) {
     action = `<p class="hint">${p.kind === "task" ? "This is a Transform task with its own form. Open it in AWS Transform to complete it." : "Answer in AWS Transform."}</p>`;
   }
   return `<section class="hitl" role="region" aria-labelledby="hitl-heading">
-    <div class="hitl-head"><span class="pulse" aria-hidden="true"></span><h2 id="hitl-heading">${answered ? "Answer sent to AWS Transform" : "AWS Transform needs your input"}</h2>
+    <div class="hitl-head"><span class="pulse" aria-hidden="true"></span><h2 id="hitl-heading">${answered ? "Answer sent to AWS Transform" : isUpdateOnly(p) ? "Update from AWS Transform" : "AWS Transform needs your input"}</h2>
       ${asked ? `<span class="hint" style="margin:0">asked ${esc(ago(asked))}</span>` : ""}<span class="hitl-link">${openLink}</span></div>
     ${p.title && p.kind === "task" ? `<p style="margin:0 0 8px"><strong>${esc(p.title)}</strong></p>` : ""}
-    ${question}${note && !answered ? `<div class="agent-note" role="note"><strong>Deploy agent:</strong> ${esc(note.reason)}${note.suggestion ? `<div class="hint">Suggested: ${esc(note.suggestion)}</div>` : ""}${typeof note.link === "string" && /^https:\/\/[a-z0-9-]+\.console\.aws\.amazon\.com\//.test(note.link) ? `<div style="margin-top:8px"><a class="btn btn-sm btn-primary" href="${esc(note.link)}" target="_blank" rel="noopener noreferrer">Approve in the AWS console ↗<span class="sr-only"> (opens in a new tab)</span></a></div>` : ""}</div>` : ""}${action}
+    ${question}${note && !answered ? `<div class="agent-note" role="note"><strong>${isUpdateOnly(p) ? "Deploy agent (no reply needed):" : "Deploy agent:"}</strong> ${esc(note.reason)}${note.suggestion ? `<div class="hint">Suggested: ${esc(note.suggestion)}</div>` : ""}${note.suggestion && p.kind === "message" && p.messageId && canAnswerTransform() && !answered ? `<div style="margin-top:8px"><button class="btn btn-sm" type="button" data-answer-use-suggestion>Use this as my reply</button> <span class="hint">You can edit it before sending.</span></div>` : ""}${typeof note.link === "string" && /^https:\/\/[a-z0-9-]+\.console\.aws\.amazon\.com\//.test(note.link) ? `<div style="margin-top:8px"><a class="btn btn-sm btn-primary" href="${esc(note.link)}" target="_blank" rel="noopener noreferrer">Approve in the AWS console ↗<span class="sr-only"> (opens in a new tab)</span></a></div>` : ""}</div>` : ""}${action}
     <p class="hint" style="margin-top:12px">Transform job <code>${esc(p.jobId || "")}</code>. The deploy resumes on its own once Transform has your answer. It fails if no answer arrives within about 24 hours.</p></section>`;
 }
 
@@ -524,7 +525,7 @@ async function sendAnswer(payload) {
 
 // Toast when a question arrives while the page is open (not for one already waiting when the run was opened).
 function notifyHumanInput(run) {
-  const p = run.status === "RUNNING" && run.pendingHumanInput;
+  const p = run.status === "RUNNING" && run.pendingHumanInput && !isUpdateOnly(run.pendingHumanInput) && run.pendingHumanInput;
   const key = p ? questionKey(p) : "";
   if (S.notifyRun !== run.runId) { S.notifyRun = run.runId; if (key) S.notified.add(key); return; }
   if (!key || S.notified.has(key)) return;
@@ -532,7 +533,7 @@ function notifyHumanInput(run) {
   toast("AWS Transform needs your input");
 }
 const needsAnswer = (run) => {
-  const p = run.status === "RUNNING" && run.pendingHumanInput;
+  const p = run.status === "RUNNING" && run.pendingHumanInput && !isUpdateOnly(run.pendingHumanInput) && run.pendingHumanInput;
   return !!p && !(run.pendingAnswer && p.messageId && run.pendingAnswer.messageId === p.messageId);
 };
 
@@ -940,6 +941,12 @@ function onView(e) {
   }
   if (e.target.closest("[data-answer-send]")) { if (S.answer.selected !== null) sendAnswer({ option: S.answer.selected }); return; }
   if (e.target.closest("[data-answer-cancel]")) { S.answer.selected = null; renderRun(); return; }
+  if (e.target.closest("[data-answer-use-suggestion]")) {
+    const p = S.data && S.data.run && S.data.run.pendingHumanInput;
+    const sug = p && p.agentNote && typeof p.agentNote.suggestion === "string" ? p.agentNote.suggestion : "";
+    if (sug) { S.answer.draft = sug.slice(0, 4000); S.answer.reply = true; S.answer.selected = null; renderRun(); const t = $("answer-text"); if (t) t.focus(); }
+    return;
+  }
   if (e.target.closest("[data-answer-reply-open]")) { S.answer.reply = true; S.answer.selected = null; renderRun(); const t = $("answer-text"); if (t) t.focus(); return; }
   if (e.target.closest("[data-answer-reply-close]")) { S.answer.reply = false; renderRun(); return; }
   if (e.target.closest("[data-answer-text]")) { const t = S.answer.draft.trim(); if (t) { S.answer.selected = null; sendAnswer({ text: t }); } return; }

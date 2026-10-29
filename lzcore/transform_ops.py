@@ -12,6 +12,7 @@ internals, so their shape is asserted at import against the pinned library versi
 from __future__ import annotations
 
 import asyncio
+import datetime
 import inspect
 import os
 import json
@@ -651,7 +652,13 @@ def answer_message(
             )
             raise QuestionChanged(f"Transform job {job_id} is no longer waiting on message {message_id}; {now_waiting}")
         if option is not None:
-            choice = next((c for c in live["choices"] if c["label"] == option), None)
+            matches = [c for c in live["choices"] if c["label"] == option]
+            if len(matches) > 1:
+                raise RuntimeError(
+                    f"Transform message {message_id} offers {len(matches)} options labelled {option!r}; "
+                    "answer it in AWS Transform"
+                )
+            choice = matches[0] if matches else None
             if choice is None:
                 raise ValueError(f"{option!r} is not one of the offered options {[c['label'] for c in live['choices']]}")
             if not choice["value"]:
@@ -859,6 +866,30 @@ def newest_system_message_id(job_id: str, workspace: Optional[str] = None) -> Op
         if not origin:
             raise RuntimeError(f"Transform message {newest.get('messageId')!r} for job {job_id} has no messageOrigin")
         return None if origin == "USER" else newest.get("messageId")
+
+    return _run(_go())
+
+
+def _epoch(value: Any, what: str) -> float:
+    if isinstance(value, datetime.datetime):
+        return value.timestamp()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    raise RuntimeError(f"Transform {what} has an unreadable createdAt: {value!r}")
+
+
+def user_reply_since(job_id: str, since: int, workspace: Optional[str] = None) -> Optional[str]:
+    """Message id of the first USER message in the job created at or after epoch ``since``; None if none.
+
+    Used to tell whether an interrupted answer already reached Transform before sending it again."""
+    ws = workspace or workspace_id()
+    _ensure_connected()
+
+    async def _go():
+        for m in _by_created(await _job_messages(ws, job_id), "messageId", "message"):
+            if m.get("messageOrigin") == "USER" and _epoch(m["createdAt"], f"message {m.get('messageId')}") >= since:
+                return m.get("messageId")
+        return None
 
     return _run(_go())
 

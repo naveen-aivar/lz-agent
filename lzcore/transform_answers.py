@@ -33,6 +33,17 @@ class AnswerExists(RuntimeError):
     """The question already has an answer (sent or being sent)."""
 
 
+class AnswerRecordFailed(RuntimeError):
+    """Transform accepted the reply but recording it failed. The answer is out: never retry or release it."""
+
+    def __init__(self, message_id: str, sent_message_id: Optional[str], cause: Exception):
+        self.message_id, self.sent_message_id, self.cause = message_id, sent_message_id, cause
+        super().__init__(
+            f"the reply to Transform message {message_id} was sent (Transform message {sent_message_id}) but "
+            f"recording it failed: {type(cause).__name__}: {cause}"
+        )
+
+
 def answer_key(run_id: str, message_id: str) -> dict:
     return {"PK": f"RUN#{run_id}", "SK": f"ANSWER#{message_id}"}
 
@@ -79,21 +90,26 @@ def send_answer(
     by: str,
     at: int,
     send: Callable[..., dict],
+    find_reply: Callable[[int], Optional[str]],
     audit_extra: Optional[dict] = None,
 ) -> dict[str, Any]:
     """Reserve, send and record one answer to ``pending``. Returns the recorded answer.
 
+    ``find_reply(since)`` returns the Transform message id of a USER reply in the job created at or after
+    epoch ``since``, else None. It is used only when taking over an abandoned reservation: if the earlier
+    sender's reply already reached Transform, that reply is recorded as sent and nothing is sent again.
+
     Raises ValueError for a malformed reply, AnswerExists when the question already has an answer,
-    and re-raises whatever ``send`` raised (QuestionChanged, TransformAccessDenied, ...) after
-    marking the reservation failed and auditing transform.answer_failed.
+    AnswerRecordFailed when Transform accepted the reply but recording it failed, and re-raises whatever
+    ``send`` raised (QuestionChanged, TransformAccessDenied, ...) after marking the reservation failed and
+    auditing transform.answer_failed.
     """
     reply_text = validate_reply(pending, option, text)
     message_id, job_id = pending["messageId"], pending["jobId"]
     key = answer_key(run_id, message_id)
     previous = table.get_item(Key=key, ConsistentRead=True).get("Item")
-    # Taking over an abandoned reservation reuses its token: if the first send did reach Transform, the
-    # retry is a duplicate Transform ignores, not a second message.
-    token = previous["idempotencyToken"] if _is_stale_sending(previous, at) else str(uuid.uuid4())
+    takeover = _is_stale_sending(previous, at)
+    token = previous["idempotencyToken"] if takeover else str(uuid.uuid4())
     answer = {"jobId": job_id, "messageId": message_id, "option": option, "text": reply_text, "by": by, "at": at}
     try:
         table.put_item(
@@ -108,6 +124,16 @@ def send_answer(
             raise
         raise AnswerExists(f"Transform message {message_id} already has an answer") from e
 
+    if takeover:
+        # The earlier sender died after reserving. If its reply reached Transform, record that reply as sent
+        # instead of sending another one (the live re-check would refuse a second send anyway).
+        already = find_reply(int(previous.get("at") or 0))
+        if already:
+            recovered = {**{k: previous.get(k) for k in ("jobId", "messageId", "option", "text", "by", "at")},
+                         "status": "sent", "sentMessageId": already}
+            _record_sent(table, audit, run_id, key, recovered, {"recovered": True, **(audit_extra or {})})
+            return recovered
+
     try:
         sent = send(job_id=job_id, message_id=message_id, idempotency_token=token, option=option, text=reply_text)
     except Exception as e:  # noqa: BLE001 - recorded, released for retry and re-raised, never swallowed
@@ -121,15 +147,25 @@ def send_answer(
         audit("transform.answer_failed", {"jobId": job_id, "messageId": message_id, "error": error})
         raise
 
+    # From here on the reply is out. A failure is reported as AnswerRecordFailed so no caller releases or
+    # retries it as if nothing had been sent.
     sent_id = sent.get("sentMessageId") if isinstance(sent, dict) else None
-    if not sent_id:
-        raise RuntimeError(f"Transform answer to message {message_id} returned no sentMessageId: {sent!r}")
-    recorded = {**answer, "status": "sent", "sentMessageId": sent_id}
+    try:
+        if not sent_id:
+            raise RuntimeError(f"Transform returned no sentMessageId: {sent!r}")
+        recorded = {**answer, "status": "sent", "sentMessageId": sent_id}
+        _record_sent(table, audit, run_id, key, recorded, audit_extra or {})
+    except Exception as e:  # noqa: BLE001 - converted to a named error that says the reply was sent
+        raise AnswerRecordFailed(message_id, sent_id, e) from e
+    return recorded
+
+
+def _record_sent(table, audit: Callable[[str, dict], None], run_id: str, key: dict, recorded: dict, extra: dict) -> None:
     table.update_item(
         Key=key,
         UpdateExpression="SET #st = :s, sentMessageId = :m",
         ExpressionAttributeNames={"#st": "status"},
-        ExpressionAttributeValues={":s": "sent", ":m": sent_id},
+        ExpressionAttributeValues={":s": "sent", ":m": recorded["sentMessageId"]},
     )
     table.update_item(
         Key={"PK": f"RUN#{run_id}", "SK": "META"},
@@ -139,11 +175,10 @@ def send_answer(
     audit(
         "transform.answer_sent",
         {
-            "jobId": job_id,
-            "messageId": message_id,
-            "option": option,
-            "text": (reply_text or "")[:AUDIT_TEXT_LIMIT] or None,
-            **(audit_extra or {}),
+            "jobId": recorded["jobId"],
+            "messageId": recorded["messageId"],
+            "option": recorded.get("option"),
+            "text": (recorded.get("text") or "")[:AUDIT_TEXT_LIMIT] or None,
+            **extra,
         },
     )
-    return recorded

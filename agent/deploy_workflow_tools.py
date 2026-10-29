@@ -701,10 +701,13 @@ def _save_waiting(cp: dict, pending: dict) -> dict:
     return read_checkpoint() or {}
 
 
-def _clear_pending(cp: dict) -> dict:
-    """The pending item needs nobody (progress message): drop it from the waiting checkpoint and keep polling."""
-    extra = {k: v for k, v in cp.items() if k not in ("stage", "updatedAt", "pendingHumanInput", "awaitingHitl")}
-    _save_checkpoint(cp["stage"], pendingHumanInput=None, awaitingHitl=False, **extra)
+def _clear_pending(cp: dict, pending: dict, item: dict) -> dict:
+    """The agent judged the message to be progress only: keep polling (not a wait on a person), but keep the
+    message visible as an update with the agent's note, so a person can still reply if the agent was wrong."""
+    shown = {**pending, "agentNote": conv.agent_note(item)}
+    if cp.get("pendingHumanInput") != shown or cp.get("awaitingHitl"):
+        extra = {k: v for k, v in cp.items() if k not in ("stage", "updatedAt", "pendingHumanInput", "awaitingHitl")}
+        _save_checkpoint(cp["stage"], pendingHumanInput=shown, awaitingHitl=False, **extra)
     return _continue_from(read_checkpoint() or {})
 
 
@@ -747,15 +750,24 @@ def _handle_connector_task(cp: dict, pending: dict, qkey: str, item: dict) -> di
             region=region, workspace=ws,
         )
         connector_id, status = created["connectorId"], created["status"]
-        item = conv.put_question(
-            qkey, status="awaiting_connector", kind="task", title=pending.get("title"), connectorId=connector_id,
-            connectorType=request["connectorType"], verificationLink=created["verificationLink"],
-            account=account, region=region,
-        )
+        try:
+            item = conv.put_question(
+                qkey, status="awaiting_connector", kind="task", title=pending.get("title"), connectorId=connector_id,
+                connectorType=request["connectorType"], verificationLink=created["verificationLink"],
+                account=account, region=region,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"created Transform connector {connector_id} for account {account} in {region} but could not record "
+                f"it ({type(e).__name__}: {e}); delete it in the Transform console before starting a new run"
+            ) from e
         base.log_tool_event("transform.connector_created", {
             "connectorId": connector_id, "connectorType": request["connectorType"],
             "accountId": account, "region": region})
     if status == "ACTIVE":
+        # Read what Transform said last BEFORE submitting: that message predates the task. Reading it after the
+        # submit could pick up a new question Transform asks in reply, and mark it handled by mistake.
+        before_submit = transform_ops.newest_system_message_id(job_id, ws)
         resuming = item.get("status") == "submitting"  # an earlier invoke marked it and may have submitted
         item = conv.put_question(
             qkey, **{**{k: v for k, v in item.items() if k not in ("PK", "SK", "updatedAt")}, "status": "submitting"})
@@ -768,7 +780,7 @@ def _handle_connector_task(cp: dict, pending: dict, qkey: str, item: dict) -> di
             if not resuming:
                 raise  # the task is not open and we never started submitting: a real change in Transform
             out = {"status": "closed by the earlier submit"}
-        stale = transform_ops.newest_system_message_id(job_id, ws)
+        stale = before_submit
         if stale and not conv.get_question(f"message:{stale}"):
             # Whatever Transform said before this task is not a new question (it would otherwise read as a
             # FINAL_RESPONSE waiting for a reply once the task is gone).
@@ -813,7 +825,7 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
         if handled is not None:
             return handled
     if status == "informational":
-        return _clear_pending(cp)
+        return _clear_pending(cp, pending, item)
     if status == "escalated":
         return _escalated(cp, pending, item)
     if status in ("answered", "superseded"):
@@ -864,11 +876,16 @@ def _converse_on_pending(converse: Callable[[str], object], cp: dict) -> dict:
         decided = conv.end_turn()
 
     item = conv.get_question(qkey) or {}
-    if error is None and decided and item.get("status") == decided:
+    if decided and item.get("status") == decided:
+        # A decision recorded in this turn stands even if the model raised afterwards (for example a Bedrock
+        # stream error after the tool call): overwriting it would re-open an escalated question to the model.
+        if error is not None:
+            base.log_tool_event("transform.agent_turn_error_after_decision",
+                                {"question": qkey, "decision": decided, "error": error[:500]})
         if decided == "escalated":
             return _escalated(cp, pending, item)
         if decided == "informational":
-            return _clear_pending(cp)
+            return _clear_pending(cp, pending, item)
         return _continue_from(cp)
 
     error = error or "the model ended the turn without answering or escalating"

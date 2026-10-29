@@ -198,5 +198,21 @@ class QuestionPredicate(_Case):
         self.assertIsNone(transform_ops.newest_system_message_id(JOB, WS))
 
 
+class OptionsAndReplies(_Case):
+    def test_duplicate_option_labels_are_refused(self):
+        msgs = [message("m1", "USER", 1, "hi"), message("m2", "SYSTEM", 2, "Pick", [select("Proceed", "Proceed")])]
+        fake = self.install(FakeTransform(messages=msgs))
+        with self.assertRaisesRegex(RuntimeError, "2 options labelled 'Proceed'"):
+            transform_ops.answer_message(JOB, "m2", idempotency_token=TOKEN, option="Proceed", workspace=WS)
+        self.assertEqual([op for op, _ in fake.calls if op == "SendMessage"], [])
+
+    def test_user_reply_since(self):
+        msgs = [message("m1", "SYSTEM", 1, "Q?"), message("m2", "USER", 5, "yes"), message("m3", "SYSTEM", 6, "ok")]
+        self.install(FakeTransform(messages=msgs))
+        t5 = msgs[1]["createdAt"].timestamp()
+        self.assertEqual(transform_ops.user_reply_since(JOB, int(t5), WS), "m2")
+        self.assertIsNone(transform_ops.user_reply_since(JOB, int(t5) + 1, WS))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -105,10 +105,11 @@ def _validate_pending(pending, run_id: str) -> dict | None:
         and isinstance(note.get("reason"), str)
         and (note.get("suggestion") is None or isinstance(note.get("suggestion"), str))
         and (note.get("link") is None or (isinstance(note.get("link"), str) and _CONSOLE_LINK.match(note["link"])))
+        and (note.get("informational") is None or note.get("informational") is True)
     ):
         raise RuntimeError(
             f"agent continue payload for {run_id}: pendingHumanInput.agentNote must be "
-            "{reason: str, suggestion: str | null, link?: https URL} or absent"
+            "{reason: str, suggestion: str | null, link?: AWS console https URL, informational?: true} or absent"
         )
     return pending
 
@@ -148,6 +149,17 @@ def _sync_pending_human_input(run_id: str, phase: str, awaiting: bool, job_id, p
         raise RuntimeError(f"deploy run {run_id} META not found while recording the continue result")
     previous = run.get("pendingHumanInput")
     key = {"PK": f"RUN#{run_id}", "SK": "META"}
+    if not awaiting and pending is not None and (pending.get("agentNote") or {}).get("informational") is True:
+        # A Transform update the agent judged needs no reply: shown in the UI (a person may still reply), not
+        # counted as a wait on a person and not announced as a question.
+        table().update_item(
+            Key=key,
+            UpdateExpression="SET pendingHumanInput = :p, awaitingHitl = :f",
+            ConditionExpression="#s = :running",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":p": pending, ":f": False, ":running": "RUNNING"},
+        )
+        return
     if awaiting and pending is not None:
         table().update_item(
             Key=key,

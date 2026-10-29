@@ -414,6 +414,9 @@ class FakeTransformOps:
     def transform_region(self):
         return "ap-south-1"
 
+    def user_reply_since(self, job_id, since, workspace=None):
+        return None
+
     def recent_conversation(self, job_id, workspace=None, limit=12):
         return [{"messageId": "m-0", "origin": "SYSTEM", "createdAt": "1", "text": "Welcome", "options": []}]
 
@@ -1388,13 +1391,17 @@ class TransformConversation(_SequencerCaseBase):
         self._assert_continue(result, awaiting=True, pending=MESSAGE)
         self.assertEqual(len(self.fake_ops.answers), 1)
 
-    def test_design_answer_cites_a_scope_pointer(self):
+    def test_typed_replies_are_refused_and_go_to_a_person_as_a_suggestion(self):
         self._env([("EXECUTING", MESSAGE)])
-        self._set_converse(_answer(option="", text="Use the OU Workloads.", category="design", basis=("scope:/ous/0/name",)))
+        self._set_converse(lambda prompt: (
+            _answer(option="", text="Use the OU Workloads.", category="design", basis=("scope:/ous/0/name",),
+                    expect="REFUSED")(prompt),
+            _escalate("Transform needs the structure typed in.", "Use the OU Workloads.")(prompt)))
 
-        self._invoke()
+        result = self._invoke()
 
-        self.assertEqual(self.fake_ops.answers[0]["text"], "Use the OU Workloads.")
+        self.assertEqual(self.fake_ops.answers, [])
+        self.assertEqual(result["pendingHumanInput"]["agentNote"]["suggestion"], "Use the OU Workloads.")
 
     def test_unresolvable_basis_and_approval_category_are_refused(self):
         self._env([("EXECUTING", MESSAGE)])
@@ -1424,16 +1431,17 @@ class TransformConversation(_SequencerCaseBase):
 
         result = self._invoke()
 
-        self._assert_continue(result, awaiting=False, pending=None)
+        shown = {**self.PROGRESS, "agentNote": {"reason": "Only a progress update.", "suggestion": None, "informational": True}}
+        self._assert_continue(result, awaiting=False, pending=shown)
         self.assertEqual(self.fake_ops.answers, [])
         self.assertIsNone(self.table.item("ANSWER#msg-progress"))
         self.assertEqual(self._q("message:msg-progress")["status"], "informational")
         self.assertIn("transform.no_reply_needed", self.table.actions())
         cp = self._checkpoint()
-        self.assertEqual((cp["stage"], cp["awaitingHitl"], cp["pendingHumanInput"]), ("transform_analyze_waiting", False, None))
-        # The same message is still the newest on the next poll: no second model turn, still no card.
+        self.assertEqual((cp["stage"], cp["awaitingHitl"], cp["pendingHumanInput"]), ("transform_analyze_waiting", False, shown))
+        # The same message is still the newest on the next poll: no second model turn; still shown, not a wait.
         again = self._invoke()
-        self._assert_continue(again, awaiting=False, pending=None)
+        self._assert_continue(again, awaiting=False, pending=shown)
 
     def test_no_reply_needed_is_refused_for_questions_with_options_and_for_tasks(self):
         self._env([("EXECUTING", MESSAGE)])
@@ -1536,7 +1544,25 @@ class TransformConversation(_SequencerCaseBase):
         self._assert_error(results[-1], "transform_converse failed", "message:msg-0001",
                            f"in {conv.MAX_TURNS_PER_QUESTION} model turns", "without answering or escalating")
         self.assertEqual(len(self.table.audit_of("transform.agent_turn_failed")), conv.MAX_TURNS_PER_QUESTION)
-        self.assertIn("did not finish", prompts[1])  # the retry is told what went wrong
+        self.assertIn("<previous_turn_error>", prompts[1])  # the retry is told what went wrong, escaped
+        self.assertIn("without answering or escalating", prompts[1])
+
+    def test_a_decision_stands_when_the_model_raises_after_making_it(self):
+        self._env([("EXECUTING", MESSAGE), ("EXECUTING", MESSAGE)])
+
+        def escalate_then_crash(prompt):
+            _escalate("A person must choose.")(prompt)
+            raise RuntimeError("Bedrock stream reset")
+
+        self._set_converse(escalate_then_crash)  # a second model turn would fail: _set_converse has only one
+
+        first = self._invoke()
+        again = self._invoke()
+
+        self.assertEqual(self._q()["status"], "escalated")
+        self.assertEqual(first["pendingHumanInput"]["agentNote"]["reason"], "A person must choose.")
+        self.assertEqual(again["pendingHumanInput"]["agentNote"]["reason"], "A person must choose.")
+        self.assertIn("transform.agent_turn_error_after_decision", self.table.actions())
 
     def test_model_error_is_retried_on_the_next_invoke(self):
         self._env([("EXECUTING", MESSAGE), ("EXECUTING", MESSAGE)])
@@ -1645,6 +1671,9 @@ class ConnectorTask(_SequencerCaseBase):
         self.assertIn("us-east-1", first["pendingHumanInput"]["agentNote"]["reason"])
 
     def test_conversation_context_carries_the_effective_region(self):
+        p = mock.patch.dict(os.environ, {"TRANSFORM_REGION": "ap-south-1"})
+        p.start()
+        self.addCleanup(p.stop)
         ctx = conv.run_context(meta={"targetRegion": "us-east-1"}, foundation={}, gaps={}, scope=SCOPE)
         self.assertEqual((ctx["targetRegion"], ctx["targetRegionIsOverride"]), ("us-east-1", True))
         ctx = conv.run_context(meta={}, foundation={}, gaps={}, scope=SCOPE)
@@ -1693,6 +1722,33 @@ class ConnectorTask(_SequencerCaseBase):
 
         self.assertEqual(self.table.item("AGENTQ#message:msg-stale")["status"], "superseded")
 
+    def test_newest_message_is_read_before_the_submit(self):
+        self._env([("EXECUTING", PENDING)], ["ACTIVE"])
+        order = []
+        real_submit, real_newest = self.fake_ops.submit_connector_task, self.fake_ops.newest_system_message_id
+        self.fake_ops.submit_connector_task = lambda **kw: (order.append("submit"), real_submit(**kw))[1]
+        self.fake_ops.newest_system_message_id = lambda *a, **k: (order.append("newest"), real_newest(*a, **k))[1]
+
+        self._invoke()
+
+        self.assertEqual(order, ["newest", "submit"])
+
+    def test_failure_to_record_a_new_connector_names_it(self):
+        self._env([("EXECUTING", PENDING)], ["PENDING"])
+        real_put = conv.put_question
+
+        def failing_put(qkey, **fields):
+            if fields.get("status") == "awaiting_connector":
+                raise RuntimeError("DynamoDB throttled")
+            return real_put(qkey, **fields)
+
+        p = mock.patch.object(conv, "put_question", failing_put)
+        p.start()
+        self.addCleanup(p.stop)
+
+        self._assert_error(self._invoke(), "transform_converse failed", "created Transform connector conn-1",
+                           "delete it in the Transform console")
+
     def test_unsupported_connector_type_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "only creates"):
             real_transform_ops.check_connector_type("vmware_migration|infra_provisioning|6")
@@ -1738,15 +1794,67 @@ class ApprovalGate(_SequencerCaseBase):
         self.assertIsNone(self.table.item("ANSWER#msg-0001"))
         self.assertEqual(self.table.meta.get("agentAnswerCount", 0), 0)
 
-    def test_factual_free_text_is_sent_and_costs_one_slot(self):
+    def test_any_typed_reply_is_refused_even_harmless_ones(self):
         self._env()
-        self._set_converse(_answer(option="", text="The target account is 111122223333 and the Region is us-east-1.",
-                                   category="workflow", basis=("context:targetRegion",)))
+        replies = ["The target account is 111122223333 and the Region is us-east-1.", "Yes", "OK", "Looks good",
+                   "go-ahead", "Let's go", "pro\u200bceed"]
+        calls = [lambda prompt, t=t: _answer(option="", text=t, expect="REFUSED")(prompt) for t in replies]
+        self._set_converse(lambda prompt: ([c(prompt) for c in calls], _escalate("Needs a person.")(prompt)))
 
         self._invoke()
 
+        self.assertEqual(self.fake_ops.answers, [])
+        self.assertEqual(self.table.meta.get("agentAnswerCount", 0), 0)
+
+    def test_option_whose_value_differs_from_its_label_is_refused(self):
+        self._env({**self.OFFERED, "options": ["Landing Zone"],
+                   "choices": [{"label": "Landing Zone", "value": "Deploy for me"}]})
+        self._set_converse(lambda prompt: (_answer(expect="REFUSED")(prompt), _escalate("Odd option value.")(prompt)))
+
+        self._invoke()
+
+        self.assertEqual(self.fake_ops.answers, [])
+
+    def test_duplicate_option_labels_are_refused(self):
+        self._env({**self.OFFERED, "options": ["Landing Zone", "Landing Zone"],
+                   "choices": [{"label": "Landing Zone", "value": "Landing Zone"},
+                               {"label": "Landing Zone", "value": "Deploy for me"}]})
+        self._set_converse(lambda prompt: (_answer(expect="REFUSED")(prompt), _escalate("Two identical options.")(prompt)))
+
+        self._invoke()
+
+        self.assertEqual(self.fake_ops.answers, [])
+
+    def test_option_case_is_normalised_to_the_offered_label(self):
+        self._env()
+        self._set_converse(_answer(option="landing zone"))
+
+        self._invoke()
+
+        self.assertEqual([a["option"] for a in self.fake_ops.answers], ["Landing Zone"])
+
+    def test_slot_stays_taken_when_the_reply_went_out_but_recording_failed(self):
+        self._env()
+        real_send = conv.send_answer
+
+        def sent_then_failed(**kw):
+            kw["send"](job_id=kw["pending"]["jobId"], message_id=kw["pending"]["messageId"],
+                       idempotency_token="t", option=kw["option"], text=None)
+            raise conv.AnswerRecordFailed(kw["pending"]["messageId"], "sent-1", RuntimeError("DynamoDB down"))
+
+        p = mock.patch.object(conv, "send_answer", sent_then_failed)
+        p.start()
+        self.addCleanup(p.stop)
+        self._set_converse(_answer(expect="never"))
+
+        result = self._invoke()
+
         self.assertEqual(len(self.fake_ops.answers), 1)
-        self.assertEqual(self.table.meta["agentAnswerCount"], 1)
+        self.assertEqual(self.table.meta["agentAnswerCount"], 1)  # not given back: the reply is out
+        self.assertEqual(self.table.item("AGENTQ#message:msg-0001")["status"], "answered")
+        self.assertEqual(result["status"], "continue")  # the recorded decision stands
+        self.assertIn("transform.agent_turn_error_after_decision", self.table.actions())
+        del real_send
 
     def test_failed_send_gives_the_answer_slot_back(self):
         self._make_env(transform_ops=FakeTransformOps(poll_script=[("EXECUTING", self.OFFERED)],

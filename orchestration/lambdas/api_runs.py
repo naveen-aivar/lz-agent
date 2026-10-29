@@ -361,6 +361,13 @@ def _send_transform_answer(**kwargs) -> dict:
     return transform_ops.answer_message(**kwargs)
 
 
+def _find_transform_reply(*, job_id: str, since: int):
+    """Seam for tests. Imported lazily: only this route loads the Transform library."""
+    from lzcore import transform_ops
+
+    return transform_ops.user_reply_since(job_id, since)
+
+
 def _answer(run_id, sub, event, invoked_by):
     """Answer the Transform message question a deploy run is waiting on (contract C1 kind=message).
 
@@ -403,7 +410,7 @@ def _answer(run_id, sub, event, invoked_by):
     if text is not None and (not isinstance(text, str) or not 0 < len(text.strip()) <= 4000):
         return _resp(400, {"error": "text must be 1-4000 characters"})
 
-    from lzcore.transform_answers import AnswerExists, send_answer
+    from lzcore.transform_answers import AnswerExists, AnswerRecordFailed, send_answer
     from lzcore.transform_ops import QuestionChanged, TransformAccessDenied  # lazy: Transform library
 
     # Same reservation and record path as the deploy agent (lzcore.transform_answers).
@@ -418,7 +425,10 @@ def _answer(run_id, sub, event, invoked_by):
             by=sub,
             at=now(),
             send=_send_transform_answer,
+            find_reply=lambda since: _find_transform_reply(job_id=pending["jobId"], since=since),
         )
+    except AnswerRecordFailed as e:
+        return _resp(500, {"error": f"{e}. Do not answer again; check the run's activity."})
     except AnswerExists:
         return _resp(409, {"error": "this question already has an answer"})
     except QuestionChanged as e:

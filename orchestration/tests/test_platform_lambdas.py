@@ -513,6 +513,18 @@ class PhaseInvokeTests(_Base):
         self.assertNotIn("pendingHumanInput", self.table.meta(self.RUN))
         self.assertEqual(len(self.table.audit(self.RUN, "phase.human_input_resolved")), 1)
 
+    def test_informational_update_is_stored_without_counting_as_a_wait(self):
+        note = {"reason": "Progress only.", "suggestion": None, "informational": True}
+        update = {**pending(), "kind": "message", "taskId": None, "messageId": "m-9", "options": [], "agentNote": note}
+        out, _ = self.invoke([cont(False, update)], progress=2, hitl=4)
+        self.assertEqual((out["progressCount"], out["hitlCount"], out["awaitingHitl"]), (3, 4, False))
+        meta = self.table.meta(self.RUN)
+        self.assertEqual(meta["pendingHumanInput"], update)
+        self.assertIs(meta["awaitingHitl"], False)
+        self.assertEqual(self.table.audit(self.RUN, "phase.awaiting_human"), [])
+        with self.assertRaisesRegex(RuntimeError, "agentNote must be"):
+            self.invoke([cont(False, {**update, "agentNote": {**note, "informational": "yes"}})])
+
     def test_agent_note_link_must_be_an_aws_console_url(self):
         ok = {"reason": "Approve it.", "suggestion": None,
               "link": "https://ap-south-1.console.aws.amazon.com/transform/connector/c-1/configure?region=ap-south-1"}

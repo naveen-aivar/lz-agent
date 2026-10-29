@@ -26,7 +26,6 @@ Per-question state lives in DynamoDB at RUN#<runId> / AGENTQ#<questionKey>:
 from __future__ import annotations
 
 import json
-import re
 import time
 from typing import Any, Optional
 
@@ -34,7 +33,7 @@ from botocore.exceptions import ClientError
 from strands import tool
 
 from lzcore import transform_ops
-from lzcore.transform_answers import AnswerExists, send_answer
+from lzcore.transform_answers import AnswerExists, AnswerRecordFailed, send_answer
 
 import tools as base
 
@@ -52,15 +51,11 @@ RUN_PURPOSE = (
     "no network migration, no server migration."
 )
 
-# Options the agent may select. Everything else (Proceed, Continue, Deploy for me, Approve proposal, any new
-# label Transform introduces) is handed to a person: the list fails closed. Compared case-insensitively.
+# The only answers the agent sends on its own: selecting one of these offered options. Both choose a workflow
+# path and change nothing in AWS. Everything else (Proceed, Continue, Deploy for me, Approve proposal, any new
+# label Transform introduces) is handed to a person: the list fails closed. The agent never sends typed text;
+# a reply that needs text is escalated with the text as the suggestion, and a person sends it.
 AGENT_ANSWERABLE_OPTIONS = frozenset({"landing zone", "custom structure"})
-# Outgoing free-text guardrail: a reply the agent sends must not carry approval or go-ahead wording. This is a
-# policy on what the platform will send on a person's behalf, not a classification of the question.
-APPROVAL_WORDING = re.compile(
-    r"\b(proceed|continue|deploy|deployment|approve|approval|go\s*a?head|start\s+(the\s+)?(execution|build)|execute|apply)\b",
-    re.IGNORECASE,
-)
 # Atomic per-run cap on agent answers: the slot is taken before sending and given back if the send fails.
 SLOT_CONDITION = "#s = :running AND (attribute_not_exists(agentAnswerCount) OR agentAnswerCount < :max)"
 
@@ -95,6 +90,8 @@ def put_question(qkey: str, **fields) -> dict:
 def agent_note(item: dict) -> dict:
     """What the UI shows next to an escalated question."""
     note = {"reason": item.get("reason") or "", "suggestion": item.get("suggestion") or None}
+    if item.get("informational"):
+        note["informational"] = True  # shown as an update the person may still reply to, not as a question
     if item.get("link"):
         note["link"] = item["link"]  # https AWS console link the person must open (connector approval)
     return note
@@ -169,15 +166,16 @@ def build_prompt(*, pending: dict, scope: dict, context: dict, conversation: lis
             f"approved design is {len(scope_json)} characters (limit {SCOPE_PROMPT_LIMIT} for the Transform conversation turn)"
         )
     parts = [
-        "Decide the pending AWS Transform question below with exactly one tool call: "
-        "answer_transform_question or escalate_to_human.",
+        "Decide the pending AWS Transform message below with exactly one tool call: "
+        "answer_transform_question, no_reply_needed or escalate_to_human.",
         f"<pending_question>\n{_json_for_prompt(question, indent=1)}\n</pending_question>",
         f"<recent_transform_conversation>\n{_json_for_prompt(conversation, indent=1)}\n</recent_transform_conversation>",
         f"<run_context>\n{_json_for_prompt(context, indent=1)}\n</run_context>",
         f"<approved_design>\n{scope_json}\n</approved_design>",
     ]
     if prior and prior.get("lastError"):
-        parts.append(f"Your previous turn on this question did not finish: {prior['lastError']}")
+        # The error can quote Transform text (for example the offered options), so it is escaped like the rest.
+        parts.append(f"<previous_turn_error>\n{_json_for_prompt(prior['lastError'])}\n</previous_turn_error>")
     return "\n\n".join(parts)
 
 
@@ -238,16 +236,17 @@ def _refuse_unless_open() -> Optional[str]:
 
 @tool
 def answer_transform_question(category: str, rationale: str, basis: list[str], option: str = "", text: str = "") -> str:
-    """Send your answer to the pending AWS Transform message question.
+    """Select one offered option of the pending AWS Transform question.
 
+    You may select only "Landing Zone" or "Custom structure", and only when Transform offers it (case does
+    not matter). Any other option, and any typed reply, is refused: call escalate_to_human instead and put
+    the exact option or reply text in suggestion, so a person can send it.
     category: "design" when the approved design states the answer, "workflow" for a workflow choice
-      that follows from the run purpose and context. Approval gates have no category: escalate them.
+      that follows from the run purpose and context.
     rationale: why this is the answer, in one or two sentences.
     basis: entries "scope:<JSON pointer into the approved design>" or "context:<run_context key>".
-    option: one of the offered option labels, exactly as given, and only if it names a workflow choice
-      ("Landing Zone", "Custom structure"). Anything that approves, continues or starts execution is escalated.
-      Or text: a free-text reply (1-4000 characters) that states facts from the design or context and contains no
-      approval wording (proceed, continue, deploy, approve, execute, apply). Give exactly one of option or text.
+    option: the option to select.
+    text: not accepted (kept so a mistaken call gets a clear refusal).
     """
     refused = _refuse_unless_open()
     if refused:
@@ -266,14 +265,21 @@ def answer_transform_question(category: str, rationale: str, basis: list[str], o
     if bad:
         return (f"REFUSED: these basis entries do not resolve in the approved design or run context: {bad}. "
                 f"Context keys: {sorted(_turn['context'])}.")
-    opt, txt = (option or None), (text or None)
-    if opt is not None and opt.strip().lower() not in AGENT_ANSWERABLE_OPTIONS:
-        return (f"REFUSED: {opt!r} is not an option the agent may select. Anything that approves, continues or "
-                "starts execution, and any option not on the agent's list, goes to escalate_to_human.")
-    if txt is not None and APPROVAL_WORDING.search(txt):
-        return ("REFUSED: the reply contains approval or go-ahead wording (proceed, continue, deploy, approve, "
-                "execute, apply, start execution). The agent never approves. State only facts from the design or "
-                "context, or call escalate_to_human.")
+    if text:
+        return ("REFUSED: the agent does not send typed replies. Call escalate_to_human with the exact reply text "
+                "in suggestion; a person reviews and sends it.")
+    if not option or option.strip().lower() not in AGENT_ANSWERABLE_OPTIONS:
+        return (f"REFUSED: {option!r} is not an option the agent may select (only 'Landing Zone' or 'Custom "
+                "structure'). Call escalate_to_human with the option you would choose in suggestion.")
+    wanted = option.strip().lower()
+    offered = [c for c in pending.get("choices") or [] if str(c.get("label", "")).strip().lower() == wanted]
+    if len(offered) != 1:
+        return (f"REFUSED: Transform offers {len(offered)} options named {option!r}. Call escalate_to_human.")
+    # The value is what Transform receives; it must say the same thing as the label (untrusted Transform data).
+    if str(offered[0].get("value") or "").strip().lower() not in ("", wanted):
+        return (f"REFUSED: the option {offered[0]['label']!r} would send {offered[0].get('value')!r} to Transform, "
+                "which is not the same as its label. Call escalate_to_human.")
+    opt, txt = offered[0]["label"], None  # the exact label as offered
     qkey = _turn["qkey"]
     if not _reserve_answer_slot():
         return (f"REFUSED: the agent has used its {MAX_AGENT_ANSWERS_PER_RUN} answers for this run, or the run is "
@@ -289,6 +295,7 @@ def answer_transform_question(category: str, rationale: str, basis: list[str], o
             by="agent",
             at=int(time.time()),
             send=lambda **kw: transform_ops.answer_message(**kw, workspace=pending["workspaceId"]),
+            find_reply=lambda since: transform_ops.user_reply_since(pending["jobId"], since, pending["workspaceId"]),
             audit_extra={"by": "agent", "category": category, "rationale": rationale.strip()[:500],
                          "basis": basis[:20], "question": pending.get("title")},
         )
@@ -307,8 +314,15 @@ def answer_transform_question(category: str, rationale: str, basis: list[str], o
                      turns=_turn.get("turns"), reason=str(e)[:NOTE_LIMIT])
         _turn["decided"] = "superseded"
         return f"REFUSED: AWS Transform moved on ({e}). Stop now; the next question comes on a later poll."
+    except AnswerRecordFailed:
+        # The reply reached Transform: the slot stays taken and the decision is recorded, then the turn fails loudly.
+        put_question(qkey, status="answered", kind=pending["kind"], title=pending.get("title"), turns=_turn.get("turns"),
+                     category=category, rationale=rationale.strip(), basis=basis, option=opt,
+                     reason="sent, but recording the answer failed")
+        _turn["decided"] = "answered"
+        raise
     except Exception:
-        _release_answer_slot()
+        _release_answer_slot()  # only failures before or during the send reach here: nothing went out
         raise
     put_question(qkey, status="answered", kind=pending["kind"], title=pending.get("title"), turns=_turn.get("turns"),
                  category=category, rationale=rationale.strip(), basis=basis, option=opt, text=sent.get("text"))
@@ -363,7 +377,7 @@ def no_reply_needed(reason: str) -> str:
     if not isinstance(reason, str) or not reason.strip() or len(reason) > NOTE_LIMIT:
         return f"REFUSED: reason must be 1-{NOTE_LIMIT} characters."
     put_question(_turn["qkey"], status="informational", kind=pending["kind"], title=pending.get("title"),
-                 turns=_turn.get("turns"), reason=reason.strip())
+                 turns=_turn.get("turns"), reason=reason.strip(), informational=True)
     base.log_tool_event("transform.no_reply_needed", {"jobId": pending.get("jobId"), "messageId": pending.get("messageId"),
                                                       "reason": reason.strip()[:300]})
     _turn["decided"] = "informational"

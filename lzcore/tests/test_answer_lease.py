@@ -45,12 +45,13 @@ class Table:
 
 
 class Lease(unittest.TestCase):
-    def send(self, table, at, tokens):
+    def send(self, table, at, tokens, already=None, audits=None):
         def fake(**kw):
             tokens.append(kw["idempotency_token"])
             return {"sentMessageId": "sent-1"}
-        return send_answer(table=table, audit=lambda a, d: None, run_id=RUN, pending=PENDING, option="Landing Zone",
-                           text=None, by="agent", at=at, send=fake)
+        return send_answer(table=table, audit=lambda a, d: (audits if audits is not None else []).append((a, d)),
+                           run_id=RUN, pending=PENDING, option="Landing Zone", text=None, by="agent", at=at,
+                           send=fake, find_reply=lambda since: already)
 
     def stuck(self, table, leased_at, token="tok-1"):
         table.items[(f"RUN#{RUN}", f"ANSWER#{MID}")] = {
@@ -68,6 +69,32 @@ class Lease(unittest.TestCase):
         out = self.send(t, at=1000 + SENDING_LEASE_SECONDS + 1, tokens=tokens)
         self.assertEqual(tokens, ["tok-original"])
         self.assertEqual(out["status"], "sent")
+
+    def test_takeover_records_an_answer_that_already_reached_transform_instead_of_resending(self):
+        t = Table(); self.stuck(t, leased_at=1000)
+        t.items[(f"RUN#{RUN}", f"ANSWER#{MID}")].update(at=990, option="Landing Zone", jobId="job-1", messageId=MID)
+        tokens, audits = [], []
+        out = self.send(t, at=1000 + SENDING_LEASE_SECONDS + 1, tokens=tokens, already="user-msg-9", audits=audits)
+        self.assertEqual(tokens, [])  # nothing sent again
+        self.assertEqual((out["status"], out["sentMessageId"]), ("sent", "user-msg-9"))
+        self.assertEqual(t.items[(f"RUN#{RUN}", f"ANSWER#{MID}")]["status"], "sent")
+        self.assertTrue(audits[-1][1]["recovered"])
+
+    def test_record_failure_after_the_send_is_reported_as_sent(self):
+        from lzcore.transform_answers import AnswerRecordFailed
+
+        class Broken(Table):
+            def update_item(self, Key, UpdateExpression, **kw):
+                if "#st = :s" in UpdateExpression:
+                    raise RuntimeError("DynamoDB down")
+                return super().update_item(Key, UpdateExpression, **kw)
+
+        t, tokens = Broken(), []
+        with self.assertRaises(AnswerRecordFailed) as ctx:
+            self.send(t, at=500, tokens=tokens)
+        self.assertEqual(len(tokens), 1)
+        self.assertEqual(ctx.exception.sent_message_id, "sent-1")
+        self.assertIn("was sent", str(ctx.exception))
 
     def test_existing_answer_ignores_an_abandoned_reservation_but_not_a_live_or_sent_one(self):
         t = Table(); self.stuck(t, leased_at=1000)
