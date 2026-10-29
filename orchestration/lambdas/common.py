@@ -7,6 +7,7 @@ Table layout (PK / SK):
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal
 import json
 import os
 import time
@@ -48,6 +49,13 @@ ERROR_CODES = {
 }
 
 
+def _json_default(o):
+    """DynamoDB returns numbers as Decimal: keep them numbers (the API contract says integer), not strings."""
+    if isinstance(o, Decimal):
+        return int(o) if o == o.to_integral_value() else float(o)
+    return str(o)
+
+
 def envelope_response(code: int, body: dict) -> dict:
     """API Gateway proxy response for ``body`` (success) or ``{"error": message, ...extra}`` (failure)."""
     if code < 400:
@@ -63,7 +71,7 @@ def envelope_response(code: int, body: dict) -> dict:
             error["details"] = details
         payload = {"error": error}
     return {"statusCode": code, "headers": {"content-type": "application/json"},
-            "body": json.dumps(payload, default=str)}
+            "body": json.dumps(payload, default=_json_default)}
 
 
 def now() -> int:

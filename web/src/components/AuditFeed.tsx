@@ -1,30 +1,18 @@
 import type { AuditItem } from "../api/client";
+import { feedText } from "../logic/activity";
+import { ago } from "../logic/format";
 
-const tsOf = (sk: string): number => Number(sk.split("#")[1] ?? 0);
-const noise = new Set(["deploy.sequencer.step", "phase.started", "phase.continue", "tool.transform_poll_analyze_job"]);
-
-/** The audit log, newest first. Routine polling rows are hidden unless `all` is set. */
-export function AuditFeed({ audit, all = false }: { audit: AuditItem[]; all?: boolean }) {
-  const rows = [...audit].sort((a, b) => tsOf(b.SK) - tsOf(a.SK)).filter((a) => all || !noise.has(a.action));
-  if (!rows.length) return <p className="hint">Nothing recorded yet.</p>;
+/** Events, already ordered newest first, worded like the classic UI. */
+export function AuditFeed({ audit, userSub }: { audit: AuditItem[]; userSub: string }) {
+  if (!audit.length) return <p className="hint">Nothing recorded yet.</p>;
   return (
-    <ul className="feed">
-      {rows.map((a) => {
-        let detail = "";
-        try {
-          const d = a.detail ? (JSON.parse(a.detail) as Record<string, unknown>) : {};
-          detail = String(d.title ?? d.reason ?? d.text ?? d.option ?? d.error ?? "");
-        } catch {
-          detail = "";
-        }
-        return (
-          <li key={a.SK}>
-            <time dateTime={new Date(tsOf(a.SK) * 1000).toISOString()}>{new Date(tsOf(a.SK) * 1000).toLocaleTimeString()}</time>{" "}
-            <code>{a.action}</code> <span className="hint">{a.actor === "agent" ? "deploy agent" : a.actor === "system" ? "platform" : "a person"}</span>
-            {detail && <div className="detail">{detail.slice(0, 300)}</div>}
-          </li>
-        );
-      })}
-    </ul>
+    <ol className="feed">
+      {audit.map((a) => (
+        <li key={a.SK} className={/failed/.test(a.action) ? "bad" : ""}>
+          <time dateTime={new Date(a.ts * 1000).toISOString()} title={new Date(a.ts * 1000).toLocaleString()}>{ago(a.ts)}</time>
+          <span>{feedText(a, userSub)}</span>
+        </li>
+      ))}
+    </ol>
   );
 }

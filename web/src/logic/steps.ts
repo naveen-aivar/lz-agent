@@ -1,0 +1,39 @@
+import type { AuditItem, Run } from "../api/client";
+import { detailOf } from "./activity";
+import { isUpdateOnly } from "./question";
+
+export interface Step {
+  name: string;
+  sub: string;
+  state: "done" | "active" | "failed" | "";
+  waiting: boolean;
+}
+
+const STEPS: [string, string][] = [
+  ["Discover baseline", "Organizations snapshot and gap analysis"],
+  ["Build with AWS Transform", "Transform plans and builds; the deploy agent answers from the design"],
+  ["Assess and plan", "Foundation assessment and IaC change plan"],
+  ["Attest and deliver", "Foundation report and artifacts"],
+];
+
+/** Where a deploy run is, from its audit log (the classic UI's Progress card). */
+export function deploySteps(run: Run, audit: AuditItem[]): Step[] {
+  const p = run.pendingHumanInput;
+  const waitingOnPerson = run.status === "RUNNING" && (run.awaitingHitl === true || (!!p && !isUpdateOnly(p)));
+  const has = (action: string) => audit.some((x) => x.action === action);
+  const jobDone = audit.some((x) => x.action === "tool.transform_poll_analyze_job" && detailOf(x).done === true);
+  const done = [
+    has("tool.run_pre_discover") || has("tool.run_pre_discover.failed"),
+    jobDone,
+    has("tool.save_iac_change_plan") || has("tool.render_iac_bundles"),
+    has("deploy.attested") || (run.status === "DELIVERED" && has("phase.completed")),
+  ];
+  const next = done.indexOf(false);
+  const failed = run.status === "FAILED";
+  return STEPS.map(([name, sub], i) => {
+    const state: Step["state"] = done[i] ? "done" : i === next ? (failed ? "failed" : run.status === "AWAITING_INPUT" ? "" : "active") : "";
+    const waiting = state === "active" && waitingOnPerson;
+    const text = done[i] ? "Done" : state === "failed" ? "Stopped here" : waiting ? "Waiting for your answer" : state === "active" ? "In progress" : sub;
+    return { name, sub: text, state, waiting };
+  });
+}

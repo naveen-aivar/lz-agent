@@ -155,10 +155,11 @@ components:
         artifacts: {type: object, additionalProperties: true}
     AuditItem:
       type: object
-      required: [SK, action, actor]
+      required: [SK, action, actor, ts]
       additionalProperties: true
       properties:
         SK: {type: string}
+        ts: {type: integer, description: Epoch seconds.}
         action: {type: string}
         actor: {type: string}
         detail: {type: string, description: JSON text.}

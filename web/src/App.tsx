@@ -4,10 +4,17 @@ import type { Claims } from "./auth";
 import { createClient } from "./api/client";
 import { loadConfig } from "./config";
 import type { Config } from "./config";
+import { DashboardPage } from "./components/DashboardPage";
 import { RunPage } from "./components/RunPage";
 import { RunsPage } from "./components/RunsPage";
+import { Shell } from "./components/Shell";
 
-const routeOf = (): { runId: string | null } => ({ runId: (location.hash.match(/^#\/run\/([0-9a-f]+)$/) ?? [])[1] ?? null });
+type Route = { page: "dashboard" | "runs" | "run"; runId: string | null };
+const routeOf = (): Route => {
+  const run = (location.hash.match(/^#\/run\/([0-9a-f]+)$/) ?? [])[1];
+  if (run) return { page: "run", runId: run };
+  return { page: location.hash === "#/runs" ? "runs" : "dashboard", runId: null };
+};
 
 export function App() {
   const [cfg, setCfg] = useState<Config | null>(null);
@@ -15,6 +22,7 @@ export function App() {
   const [notice, setNotice] = useState("");
   const [booting, setBooting] = useState(true);
   const [route, setRoute] = useState(routeOf());
+  const [runCrumb, setRunCrumb] = useState("");
 
   useEffect(() => {
     const onHash = () => setRoute(routeOf());
@@ -66,21 +74,16 @@ export function App() {
       </main>
     );
   }
+  const crumbs = { dashboard: "Dashboard", runs: "Runs", run: runCrumb || "Run" };
   return (
-    <>
-      <header className="top">
-        <a href="#/runs" onClick={() => (location.hash = "#/runs")}>Landing Zone Agent</a>
-        <span>{claims.email}</span>
-        <a href="/">Classic UI</a>
-        <button type="button" className="btn btn-sm" onClick={() => logout(cfg)}>Sign out</button>
-      </header>
-      <main>
-        {route.runId ? (
-          <RunPage runId={route.runId} api={api} canAnswer={canAnswerTransform(claims)} userSub={claims.sub ?? ""} />
-        ) : (
-          <RunsPage api={api} onOpen={(id) => (location.hash = `#/run/${id}`)} />
-        )}
-      </main>
-    </>
+    <Shell nav={route.page === "dashboard" ? "dashboard" : "runs"} crumb={crumbs[route.page]} email={claims.email} onSignOut={() => logout(cfg)}>
+      {route.page === "run" && route.runId ? (
+        <RunPage key={route.runId} runId={route.runId} api={api} canAnswer={canAnswerTransform(claims)} userSub={claims.sub ?? ""} onCrumb={setRunCrumb} />
+      ) : route.page === "runs" ? (
+        <RunsPage api={api} onOpen={(id) => (location.hash = `#/run/${id}`)} />
+      ) : (
+        <DashboardPage api={api} />
+      )}
+    </Shell>
   );
 }

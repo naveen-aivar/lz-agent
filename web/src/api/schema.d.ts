@@ -344,6 +344,8 @@ export interface components {
         };
         AuditItem: {
             SK: string;
+            /** @description Epoch seconds. */
+            ts: number;
             action: string;
             actor: string;
             /** @description JSON text. */

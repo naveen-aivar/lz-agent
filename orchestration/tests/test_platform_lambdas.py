@@ -587,6 +587,12 @@ class EnvelopeTests(_Base):
         out = common.envelope_response(500, {"error": "stopped", "runId": "r", "status": "FAILED"})
         self.assertEqual(json.loads(out["body"])["error"]["details"], {"runId": "r", "status": "FAILED"})
 
+    def test_dynamodb_numbers_stay_numbers(self):
+        from decimal import Decimal
+        out = common.envelope_response(200, {"createdAt": Decimal("1793248670"), "ratio": Decimal("0.5"), "n": 3})
+        self.assertEqual(json.loads(out["body"]), {"data": {"createdAt": 1793248670, "ratio": 0.5, "n": 3}})
+        self.assertIsInstance(json.loads(out["body"])["data"]["createdAt"], int)
+
     def test_artifacts_use_the_same_envelope(self):
         import api_artifacts
         event = {"requestContext": {"authorizer": {"jwt": {"claims": {"sub": USER}}}},
