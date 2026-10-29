@@ -65,7 +65,8 @@ RUN_PURPOSE = (
 # handed to a person: the list fails closed. Widen it only for labels that cannot start a change in AWS.
 AGENT_ANSWERABLE_OPTIONS = frozenset({
     "landing zone", "custom structure", "my own structure", "get started",
-    "create a control tower landing zone (recommended)", "recommend additional scps", "none (skip)",
+    "create a control tower landing zone (recommended)", "create a control tower landing zone",
+    "recommend additional scps", "none (skip)", "skip for now",
 })
 # Atomic per-run cap on agent answers: the slot is taken before sending and given back if the send fails.
 SLOT_CONDITION = "#s = :running AND (attribute_not_exists(agentAnswerCount) OR agentAnswerCount < :max)"

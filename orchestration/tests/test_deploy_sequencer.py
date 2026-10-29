@@ -2398,7 +2398,7 @@ class AllowedOptions(_SequencerCaseBase):
 
     def test_every_design_stage_option_can_be_selected(self):
         for label in ("Get started", "My own structure", "Create a Control Tower landing zone (recommended)",
-                      "Recommend additional SCPs", "None (skip)"):
+                      "Create a Control Tower landing zone", "Recommend additional SCPs", "None (skip)", "Skip for now"):
             with self.subTest(label):
                 self._env([label, "Learn more"])
                 self._set_converse(_answer(option=label, category="design", basis=("scope:/ous/0/name",)))
