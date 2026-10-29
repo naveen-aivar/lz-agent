@@ -572,6 +572,8 @@ async def _pending_human_input(ws: str, job_id: str, free_text: bool = False) ->
             "kind": "task",
             "taskId": task["taskId"],
             "messageId": None,
+            # TOOL_APPROVAL tasks are approve/reject gates a signed-in approver can decide from the platform UI.
+            "category": task.get("category"),
             "title": title,
             "text": (task.get("description") or "")[:PENDING_TEXT_LIMIT],
             "options": [],
@@ -859,6 +861,37 @@ def submit_connector_task(*, job_id: str, task_id: str, connector_id: str, conne
                 f"{connector_id} was not accepted"
             )
         return {"taskId": task_id, "status": after.get("status"), "responseArtifactId": response_id}
+
+    return _run(_go())
+
+
+def decide_tool_approval(*, job_id: str, task_id: str, decision: str, idempotency_token: str,
+                         workspace: Optional[str] = None) -> dict[str, Any]:
+    """Approve or reject an open TOOL_APPROVAL task (the library's own path for these: no response artifact).
+
+    Called only by the platform's /decision route for a signed-in approver; the deploy agent has no tool for it.
+    Raises QuestionChanged when the task is not an open TOOL_APPROVAL task, and RuntimeError when Transform still
+    shows it open after the submit."""
+    if decision not in ("APPROVE", "REJECT"):
+        raise ValueError(f"decision must be APPROVE or REJECT, got {decision!r}")
+    ws = workspace or workspace_id()
+    _ensure_connected()
+
+    async def _go():
+        task = await _get_task(ws, job_id, task_id)
+        if task.get("category") != "TOOL_APPROVAL" or task.get("status") != "AWAITING_APPROVAL":
+            raise QuestionChanged(
+                f"Transform task {task_id} is {task.get('category')}/{task.get('status')}, not an open approval task"
+            )
+        await _call(
+            "SubmitCriticalHitlTask",
+            SubmitCriticalHitlTaskRequest(workspaceId=ws, jobId=job_id, taskId=task_id, action=decision,
+                                          idempotencyToken=idempotency_token),
+        )
+        after = await _get_task(ws, job_id, task_id)
+        if after.get("status") == "AWAITING_APPROVAL":
+            raise RuntimeError(f"Transform task {task_id} is still AWAITING_APPROVAL after the {decision}")
+        return {"taskId": task_id, "status": after.get("status"), "action": decision}
 
     return _run(_go())
 

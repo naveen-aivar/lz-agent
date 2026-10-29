@@ -4,7 +4,7 @@ also returned inline) | reports (zip of every raw scan report) | deployment-repo
 iac-change-plan | iac-manifest | foundation-assessment (deploy run brownfield/greenfield assessment)."""
 import json
 
-from common import ARTIFACT_BUCKET, artifact, audit, get_run, s3
+from common import ARTIFACT_BUCKET, artifact, audit, envelope_response, get_run, s3
 
 NAMES = {
     "terraform",
@@ -19,7 +19,7 @@ NAMES = {
 
 
 def _resp(code, body):
-    return {"statusCode": code, "headers": {"content-type": "application/json"}, "body": json.dumps(body)}
+    return envelope_response(code, body)
 
 
 def handler(event, _ctx):

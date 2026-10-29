@@ -97,6 +97,9 @@ def _validate_pending(pending, run_id: str) -> dict | None:
     if created is not None and (isinstance(created, bool) or not isinstance(created, int)):
         # DynamoDB (boto3 resource) refuses floats; the agent sends Transform's timestamp as integer milliseconds.
         raise RuntimeError(f"agent continue payload for {run_id}: pendingHumanInput.createdAtMs must be an integer or absent")
+    category = pending.get("category")
+    if category is not None and not isinstance(category, str):
+        raise RuntimeError(f"agent continue payload for {run_id}: pendingHumanInput.category must be a string or null")
     choices = pending.get("choices")
     if choices is not None and not (
         isinstance(choices, list)

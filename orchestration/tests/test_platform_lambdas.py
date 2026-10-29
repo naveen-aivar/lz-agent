@@ -82,6 +82,8 @@ class FakeTable:
             item.pop(names.get(name, name), None)
         return {}
 
+    def scan(self, FilterExpression=None, ExpressionAttributeValues=None, **kw):
+        return {"Items": [copy.deepcopy(i) for (pk, sk), i in self.items.items() if sk == "META"]}
     def query(self, KeyConditionExpression):
         def match(cond, item):
             kind = type(cond).__name__
@@ -196,7 +198,11 @@ class _Base(unittest.TestCase):
         if run_id:
             event["pathParameters"] = {"runId": run_id}
         r = api_runs.handler(event, None)
-        return r["statusCode"], json.loads(r["body"])
+        self.raw = json.loads(r["body"])
+        if r["statusCode"] >= 400:  # unwrap {"error": {code, message, details}} the way scripts/run_deploy.py does
+            err = self.raw["error"]
+            return r["statusCode"], {"error": err["message"], "code": err["code"], **(err.get("details") or {})}
+        return r["statusCode"], self.raw["data"]
 
     def deploy_keys(self, **kw):
         body = {"deployTarget": {"accountId": ACCOUNT, "accessKeyId": "AKIAEXAMPLE", "secretAccessKey": "secret"}}
@@ -532,6 +538,257 @@ class AnswerRecoveryTests(AnswerTests):
         self.assertIn("Do not answer again", out["error"])
         (row,) = self.table.audit(self.RUN, "transform.answer_record_failed")
         self.assertEqual(json.loads(row["detail"])["sentMessageId"], "m-sent")
+
+
+class EnvelopeTests(_Base):
+    """Every response is {"data": ...} or {"error": {"code", "message", "details"?}}."""
+
+    def test_success_is_wrapped_in_data(self):
+        code, _ = self.api("GET /runs/{runId}", run_id=DESIGN_ID)
+        self.assertEqual(code, 200)
+        self.assertEqual(set(self.raw), {"data"})
+        self.assertEqual(self.raw["data"]["run"]["runId"], DESIGN_ID)
+
+    def test_errors_carry_a_code_a_message_and_optional_details(self):
+        code, _ = self.api("GET /runs/{runId}", run_id="nope")
+        self.assertEqual((code, self.raw), (404, {"error": {"code": "not_found", "message": "not found"}}))
+        code, _ = self.api("POST /runs", {"customerId": "A"})
+        self.assertEqual((code, self.raw["error"]["code"]), (400, "bad_request"))
+        self.assertEqual(set(self.raw), {"error"})
+
+    def test_every_status_the_handlers_use_has_a_code(self):
+        used = {int(c) for c in re.findall(r"_resp\((\d{3})", (ROOT / "orchestration" / "lambdas" / "api_runs.py").read_text())}
+        used |= {int(c) for c in re.findall(r"_resp\((\d{3})", (ROOT / "orchestration" / "lambdas" / "api_artifacts.py").read_text())}
+        self.assertTrue(used - {200, 201, 202} <= set(common.ERROR_CODES), used)
+
+    def test_the_envelope_refuses_what_it_cannot_describe(self):
+        with self.assertRaisesRegex(ValueError, "no error code"):
+            common.envelope_response(418, {"error": "teapot"})
+        for body in ({}, {"error": ""}, {"error": {"x": 1}}, "boom"):
+            with self.assertRaises(TypeError):
+                common.envelope_response(400, body)
+        out = common.envelope_response(500, {"error": "stopped", "runId": "r", "status": "FAILED"})
+        self.assertEqual(json.loads(out["body"])["error"]["details"], {"runId": "r", "status": "FAILED"})
+
+    def test_artifacts_use_the_same_envelope(self):
+        import api_artifacts
+        event = {"requestContext": {"authorizer": {"jwt": {"claims": {"sub": USER}}}},
+                 "pathParameters": {"runId": DESIGN_ID, "name": "bogus"}}
+        out = api_artifacts.handler(event, None)
+        self.assertEqual(json.loads(out["body"]), {"error": {"code": "bad_request", "message": "unknown artifact"}})
+
+
+class DecisionTests(_Base):
+    RUN = "d" * 32
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {"TRANSFORM_APPROVER_GROUP": GROUP,
+                                           "TRANSFORM_ROLE_ARN": "arn:aws:iam::222222222222:role/IngramLandingZoneTransform"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.task = {**pending(), "category": "TOOL_APPROVAL"}
+        self.table.put_item({"PK": f"RUN#{self.RUN}", "SK": "META", "runId": self.RUN, "runKind": "deploy",
+                             "status": "RUNNING", "requester": USER, "pendingHumanInput": self.task, "awaitingHitl": True})
+        self.sent, self.send_error = [], None
+
+        def fake_send(**kw):
+            self.sent.append(kw)
+            if self.send_error is not None:
+                raise self.send_error
+            return {"taskId": kw["task_id"], "status": "CLOSED", "action": kw["decision"]}
+
+        p = mock.patch.object(api_runs, "_send_transform_decision", fake_send)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def decide(self, body=None, groups=(GROUP,), **kw):
+        body = {"jobId": "job-1", "taskId": "t-1", "decision": "approve"} if body is None else body
+        return self.api("POST /runs/{runId}/decision", body, run_id=self.RUN,
+                        groups=list(groups) if groups is not None else None, **kw)
+
+    def test_approve_is_sent_recorded_and_audited_with_the_person(self):
+        code, out = self.decide()
+        self.assertEqual(code, 200, out)
+        (call,) = self.sent
+        self.assertEqual((call["job_id"], call["task_id"], call["decision"]), ("job-1", "t-1", "APPROVE"))
+        meta = self.table.meta(self.RUN)
+        self.assertEqual((meta["pendingDecision"]["by"], meta["pendingDecision"]["decision"]), (USER, "approve"))
+        (row,) = self.table.audit(self.RUN, "transform.task_approved")
+        self.assertEqual(row["actor"], USER)
+        self.assertEqual(json.loads(row["detail"])["title"], "Approve the OU changes?")
+
+    def test_reject_is_sent_as_reject_and_audited_as_rejected(self):
+        code, _ = self.decide({"jobId": "job-1", "taskId": "t-1", "decision": "reject"})
+        self.assertEqual(code, 200)
+        self.assertEqual(self.sent[0]["decision"], "REJECT")
+        self.assertEqual(len(self.table.audit(self.RUN, "transform.task_rejected")), 1)
+
+    def test_the_token_is_stable_so_a_double_click_is_a_duplicate_for_transform(self):
+        self.decide()
+        self.decide()
+        self.assertEqual(self.sent[0]["idempotency_token"], self.sent[1]["idempotency_token"])
+        self.decide({"jobId": "job-1", "taskId": "t-1", "decision": "reject"})
+        self.assertNotEqual(self.sent[0]["idempotency_token"], self.sent[2]["idempotency_token"])
+
+    def test_requires_the_approver_group_the_owner_and_a_running_deploy_run(self):
+        for groups in (None, (), ("other",)):
+            self.assertEqual(self.decide(groups=groups)[0], 403, groups)
+        self.assertEqual(self.decide(sub=OTHER_USER)[0], 404)
+        self.assertEqual(self.decide(direct=True, invoked_by=OPERATOR)[0], 400)
+        self.table.meta(self.RUN)["status"] = "FAILED"
+        self.assertEqual(self.decide()[0], 409)
+        self.assertEqual(self.sent, [])
+
+    def test_only_a_tool_approval_task_that_matches_the_page_can_be_decided(self):
+        self.table.meta(self.RUN)["pendingHumanInput"] = {**self.task, "category": "HITL"}
+        code, out = self.decide()
+        self.assertEqual(code, 409)
+        self.assertIn("own form", out["error"])
+        self.table.meta(self.RUN)["pendingHumanInput"] = {**self.task, "category": None}
+        self.assertEqual(self.decide()[0], 409)
+        self.table.meta(self.RUN)["pendingHumanInput"] = question()
+        self.assertIn("message question", self.decide()[1]["error"])
+        self.table.meta(self.RUN)["pendingHumanInput"] = self.task
+        self.assertEqual(self.decide({"jobId": "job-1", "taskId": "t-9", "decision": "approve"})[0], 409)
+        self.assertEqual(self.sent, [])
+
+    def test_body_validation(self):
+        for body in ({"jobId": "job-1", "taskId": "t-1"}, {"jobId": "job-1", "taskId": "t-1", "decision": "APPROVE"},
+                     {"jobId": "job-1", "taskId": "t-1", "decision": "maybe"}):
+            self.assertEqual(self.decide(body)[0], 400, body)
+        self.assertEqual(self.sent, [])
+
+    def test_transform_problems_are_named_and_audited(self):
+        from lzcore.transform_ops import QuestionChanged, TransformAccessDenied
+        self.send_error = QuestionChanged("task is CLOSED")
+        code, out = self.decide()
+        self.assertEqual(code, 409)
+        self.assertIn("moved on", out["error"])
+        self.send_error = TransformAccessDenied("SubmitCriticalHitlTask", "ws-1", "arn:aws:sts::2:assumed-role/T/x", "403")
+        self.assertEqual(self.decide()[0], 502)
+        self.send_error = RuntimeError("Transform 500")
+        code, out = self.decide()
+        self.assertEqual(code, 502)
+        self.assertIn("Transform 500", out["error"])
+        self.assertEqual(len(self.table.audit(self.RUN, "transform.task_decision_failed")), 2)
+        self.assertNotIn("pendingDecision", self.table.meta(self.RUN))
+
+    def test_no_transform_role_is_501(self):
+        os.environ["TRANSFORM_ROLE_ARN"] = ""
+        self.assertEqual(self.decide()[0], 501)
+
+    def test_the_deploy_agent_has_no_path_to_the_decision(self):
+        import re as _re
+        for path in ("agent/transform_conversation.py", "agent/deploy_workflow_tools.py", "agent/app.py", "agent/tools.py"):
+            text = (ROOT / path).read_text()
+            self.assertIsNone(_re.search(r"decide_tool_approval|SubmitCriticalHitlTask\(|/decision", text), path)
+
+
+def _json_schema(node):
+    """OpenAPI 3.0 schema -> JSON Schema: `nullable: true` becomes a type union / an extra null enum value."""
+    if isinstance(node, list):
+        return [_json_schema(n) for n in node]
+    if not isinstance(node, dict):
+        return node
+    out = {k: _json_schema(v) for k, v in node.items() if k != "nullable"}
+    if node.get("nullable") and "type" in out:
+        out["type"] = [out["type"], "null"] if isinstance(out["type"], str) else out["type"] + ["null"]
+        if "enum" in out and None not in out["enum"]:
+            out["enum"] = out["enum"] + [None]
+    return out
+
+
+OPENAPI = yaml.safe_load((ROOT / "docs" / "openapi.yaml").read_text())
+
+
+def _validate(instance, schema_name):
+    import jsonschema
+    doc = {"$ref": f"#/components/schemas/{schema_name}", "components": _json_schema(OPENAPI["components"])}
+    jsonschema.validate(instance, doc)
+
+
+class OpenApiTests(_Base):
+    """docs/openapi.yaml describes exactly the routes in platform.yaml, and real responses match its schemas."""
+
+    def test_the_spec_lists_exactly_the_api_routes_of_the_template(self):
+        template_routes = set()
+        for res in RES.values():
+            props = res.get("Properties") or {}
+            if res["Type"] == "AWS::ApiGatewayV2::Route" and props.get("AuthorizationType") == "JWT":
+                template_routes.add(props["RouteKey"])
+        spec_routes = {f"{verb.upper()} {path}" for path, ops in OPENAPI["paths"].items() for verb in ops}
+        self.assertEqual(spec_routes, template_routes)
+
+    def test_every_operation_has_an_id_a_success_envelope_and_error_responses_that_use_the_error_envelope(self):
+        ids = []
+        for path, ops in OPENAPI["paths"].items():
+            for verb, op in ops.items():
+                ids.append(op["operationId"])
+                ok = [c for c in op["responses"] if c.startswith("2")]
+                self.assertEqual(len(ok), 1, (verb, path))
+                ref = op["responses"][ok[0]]["content"]["application/json"]["schema"]["$ref"]
+                self.assertTrue(ref.endswith("Envelope"), (verb, path, ref))
+                for code, resp in op["responses"].items():
+                    if code.startswith(("4", "5")):
+                        self.assertEqual(resp["$ref"].split("/")[-1] in OPENAPI["components"]["responses"], True, (verb, path))
+        self.assertEqual(len(ids), len(set(ids)))
+        for name, resp in OPENAPI["components"]["responses"].items():
+            self.assertEqual(resp["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/ErrorEnvelope", name)
+
+    def test_error_codes_in_the_spec_are_the_codes_the_code_can_return(self):
+        self.assertEqual(set(OPENAPI["components"]["schemas"]["ErrorCode"]["enum"]), set(common.ERROR_CODES.values()))
+
+    def test_real_responses_match_the_schemas(self):
+        self.table.items[(f"RUN#{DESIGN_ID}", "META")]["createdAt"] = 1  # the list sorts on it
+        code, _ = self.api("POST /runs", {"customerId": "acme", "requirements": "x"})
+        self.assertEqual(code, 201); _validate(self.raw, "CreateRunEnvelope")
+        code, _ = self.api("GET /runs")
+        self.assertEqual(code, 200); _validate(self.raw, "RunsEnvelope")
+        code, res = self.deploy_keys()
+        self.assertEqual(code, 202); _validate(self.raw, "RunIdEnvelope")
+        deploy_id = res["runId"]
+        code, _ = self.api("GET /runs/{runId}", run_id=deploy_id)
+        self.assertEqual(code, 200); _validate(self.raw, "RunEnvelope")
+        code, _ = self.api("GET /runs/{runId}/audit", run_id=deploy_id)
+        self.assertEqual(code, 200); _validate(self.raw, "AuditEnvelope")
+        code, _ = self.api("POST /runs/{runId}/stop", run_id=deploy_id)
+        self.assertEqual(code, 200); _validate(self.raw, "StoppedEnvelope")
+        for route, rid in (("GET /runs/{runId}", "nope"), ("POST /runs/{runId}/stop", deploy_id)):
+            code, _ = self.api(route, run_id=rid)
+            self.assertGreaterEqual(code, 400); _validate(self.raw, "ErrorEnvelope")
+
+    def test_a_run_waiting_on_a_task_and_a_message_matches_the_run_schema(self):
+        run = "c" * 32
+        agent_note = {"reason": "Approve it.", "suggestion": "Proceed", "suggestionType": "approval"}
+        for pend in ({**pending(), "category": "TOOL_APPROVAL", "agentNote": agent_note, "createdAtMs": 1793248000123},
+                     {**question(), "agentNote": {"reason": "r", "informational": True}, "jobAwaitingInput": False}):
+            self.table.put_item({"PK": f"RUN#{run}", "SK": "META", "runId": run, "runKind": "deploy", "status": "RUNNING",
+                                 "requester": USER, "createdAt": 1, "error": "", "awaitingHitl": True,
+                                 "pendingHumanInput": pend, "pendingDecision": {"jobId": "j", "taskId": "t", "decision": "approve", "by": USER, "at": 2},
+                                 "pendingAnswer": {"jobId": "j", "messageId": "m", "status": "sent", "by": "agent", "at": 3}})
+            code, _ = self.api("GET /runs/{runId}", run_id=run)
+            self.assertEqual(code, 200); _validate(self.raw, "RunEnvelope")
+
+    def test_answer_and_decision_responses_match_the_schemas(self):
+        group = "transform-approvers"
+        run = "e" * 32
+        env = mock.patch.dict(os.environ, {"TRANSFORM_APPROVER_GROUP": group, "TRANSFORM_ROLE_ARN": "arn:aws:iam::2:role/T"})
+        env.start(); self.addCleanup(env.stop)
+        self.table.put_item({"PK": f"RUN#{run}", "SK": "META", "runId": run, "runKind": "deploy", "status": "RUNNING",
+                             "requester": USER, "pendingHumanInput": question()})
+        sent = mock.patch.object(api_runs, "_send_transform_answer",
+                                 lambda **kw: {"jobId": kw["job_id"], "answeredMessageId": kw["message_id"], "sentMessageId": "m-sent", "text": "x"})
+        sent.start(); self.addCleanup(sent.stop)
+        code, _ = self.api("POST /runs/{runId}/answer", {"jobId": "job-1", "messageId": "m-2", "option": "Proceed"},
+                           run_id=run, groups=[group])
+        self.assertEqual(code, 200); _validate(self.raw, "PendingAnswerEnvelope")
+        self.table.meta(run)["pendingHumanInput"] = {**pending(), "category": "TOOL_APPROVAL"}
+        dec = mock.patch.object(api_runs, "_send_transform_decision", lambda **kw: {"status": "CLOSED"})
+        dec.start(); self.addCleanup(dec.stop)
+        code, _ = self.api("POST /runs/{runId}/decision", {"jobId": "job-1", "taskId": "t-1", "decision": "approve"},
+                           run_id=run, groups=[group])
+        self.assertEqual(code, 200); _validate(self.raw, "PendingDecisionEnvelope")
 
 
 # ---------------------------------------------------------------- phase_invoke

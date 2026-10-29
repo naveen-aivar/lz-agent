@@ -1,0 +1,409 @@
+openapi: 3.0.3
+info:
+  title: Ingram landing zone platform API
+  version: "27"
+  description: |
+    The HTTP API behind the UI (API Gateway HTTP API, Cognito JWT). Every response is an envelope:
+    `{"data": ...}` on success, `{"error": {"code", "message", "details"?}}` on failure. The error `code`
+    follows the HTTP status (see `ErrorCode`). Clients unwrap it in one place; `web/src/api` is generated
+    from this file (`npm run gen:api`), and `tests` check that this file lists exactly the routes in
+    `infra/platform/platform.yaml`.
+servers:
+  - url: https://{host}
+    variables:
+      host: {default: d3hry80lb2bie6.cloudfront.net}
+security:
+  - cognito: []
+components:
+  securitySchemes:
+    cognito:
+      type: apiKey
+      in: header
+      name: authorization
+      description: The Cognito ID token (JWT), sent as is.
+  parameters:
+    runId:
+      name: runId
+      in: path
+      required: true
+      schema: {type: string, pattern: "^[0-9a-f]{32}$"}
+  responses:
+    BadRequest: {description: The request is malformed., content: {application/json: {schema: {$ref: "#/components/schemas/ErrorEnvelope"}}}}
+    Forbidden: {description: The caller is not allowed (for example not in the approver group)., content: {application/json: {schema: {$ref: "#/components/schemas/ErrorEnvelope"}}}}
+    NotFound: {description: No such run for this caller., content: {application/json: {schema: {$ref: "#/components/schemas/ErrorEnvelope"}}}}
+    Conflict: {description: The run or the question is not in a state that allows this., content: {application/json: {schema: {$ref: "#/components/schemas/ErrorEnvelope"}}}}
+    Upstream: {description: AWS Transform or another dependency failed or refused., content: {application/json: {schema: {$ref: "#/components/schemas/ErrorEnvelope"}}}}
+  schemas:
+    ErrorCode:
+      type: string
+      enum: [bad_request, unauthorized, forbidden, not_found, conflict, too_many_requests, internal_error, not_implemented, upstream_error, unavailable]
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          additionalProperties: false
+          properties:
+            code: {$ref: "#/components/schemas/ErrorCode"}
+            message: {type: string, minLength: 1}
+            details: {type: object, additionalProperties: true}
+    RunStatus:
+      type: string
+      enum: [AWAITING_INPUT, RUNNING, DELIVERED, FAILED]
+    RunSummary:
+      type: object
+      required: [runId, status, createdAt, error]
+      properties:
+        runId: {type: string}
+        customerId: {type: string, nullable: true}
+        status: {type: string}
+        createdAt: {type: integer}
+        runKind: {type: string, nullable: true, enum: [deploy, null]}
+        designRunId: {type: string, nullable: true}
+        error: {type: string}
+    Choice:
+      type: object
+      required: [label]
+      properties:
+        label: {type: string}
+        value: {type: string, nullable: true}
+    AgentNote:
+      type: object
+      required: [reason]
+      additionalProperties: false
+      properties:
+        reason: {type: string}
+        suggestion: {type: string, nullable: true}
+        suggestionType:
+          type: string
+          description: |
+            What `suggestion` is. option: an offered option label. approval: an offered option that approves or
+            starts something (a person confirms it). text: the exact typed reply, for a message without options.
+            steps: instructions for a task.
+          enum: [option, approval, text, steps]
+        link: {type: string, description: An AWS console https URL the person must open (connector approval).}
+        informational: {type: boolean, enum: [true], description: The agent judged the message needs no reply.}
+    PendingHumanInput:
+      type: object
+      description: What AWS Transform is waiting on. A message question (kind=message) is answered with POST .../answer; a TOOL_APPROVAL task (kind=task) is decided with POST .../decision.
+      required: [source, jobId, kind, title, text, options, consoleUrl]
+      properties:
+        source: {type: string, enum: [transform]}
+        jobId: {type: string}
+        workspaceId: {type: string}
+        kind: {type: string, enum: [message, task]}
+        taskId: {type: string, nullable: true}
+        messageId: {type: string, nullable: true}
+        category: {type: string, nullable: true, description: "For tasks. TOOL_APPROVAL tasks can be approved or rejected from the UI."}
+        title: {type: string}
+        text: {type: string}
+        options: {type: array, items: {type: string}}
+        choices: {type: array, items: {$ref: "#/components/schemas/Choice"}}
+        jobAwaitingInput: {type: boolean}
+        createdAtMs: {type: integer, description: Transform's own timestamp of the question, epoch milliseconds.}
+        consoleUrl: {type: string}
+        agentNote: {$ref: "#/components/schemas/AgentNote"}
+    PendingAnswer:
+      type: object
+      required: [jobId, messageId, status, by, at]
+      properties:
+        jobId: {type: string}
+        messageId: {type: string}
+        option: {type: string, nullable: true}
+        text: {type: string, nullable: true}
+        status: {type: string, enum: [sent]}
+        sentMessageId: {type: string}
+        by: {type: string, description: The person's Cognito sub, or "agent".}
+        at: {type: integer}
+        recovered: {type: boolean, description: An earlier reply by `by` had already reached Transform.}
+    PendingDecision:
+      type: object
+      required: [jobId, taskId, decision, by, at]
+      properties:
+        jobId: {type: string}
+        taskId: {type: string}
+        decision: {type: string, enum: [approve, reject]}
+        by: {type: string}
+        at: {type: integer}
+        taskStatus: {type: string, nullable: true}
+    Run:
+      type: object
+      description: The run's META item without credential pointers. Fields beyond those listed may be present.
+      required: [runId, status]
+      additionalProperties: true
+      properties:
+        runId: {type: string}
+        runKind: {type: string, enum: [deploy], nullable: true}
+        designRunId: {type: string, nullable: true}
+        customerId: {type: string}
+        status: {type: string}
+        createdAt: {type: integer}
+        error: {type: string}
+        awaitingHitl: {type: boolean}
+        pendingHumanInput: {$ref: "#/components/schemas/PendingHumanInput"}
+        pendingAnswer: {$ref: "#/components/schemas/PendingAnswer"}
+        pendingDecision: {$ref: "#/components/schemas/PendingDecision"}
+        targetRegion: {type: string}
+        accountEmailBase: {type: string}
+        deployTarget: {type: object, additionalProperties: true}
+        artifacts: {type: object, additionalProperties: true}
+    AuditItem:
+      type: object
+      required: [SK, action, actor]
+      additionalProperties: true
+      properties:
+        SK: {type: string}
+        action: {type: string}
+        actor: {type: string}
+        detail: {type: string, description: JSON text.}
+    DeployTargetRequest:
+      type: object
+      description: One of an IAM role or access keys. Secrets are stored encrypted for this run only.
+      additionalProperties: true
+      properties:
+        accountId: {type: string, pattern: "^[0-9]{12}$"}
+        roleArn: {type: string}
+        externalId: {type: string}
+        accessKeyId: {type: string}
+        secretAccessKey: {type: string}
+        sessionToken: {type: string}
+    CreateRunRequest:
+      type: object
+      required: [customerId]
+      properties:
+        customerId: {type: string, pattern: "^[a-z0-9-]{3,40}$"}
+        requirements: {type: string, maxLength: 100000}
+        fileName: {type: string}
+    DeployRequest:
+      type: object
+      properties:
+        deployTarget: {$ref: "#/components/schemas/DeployTargetRequest"}
+        targetRegion: {type: string, description: Overrides the design's home Region for this run. Approver group or operator only.}
+        accountEmail:
+          type: string
+          description: prefix@domain for the new accounts; Transform adds +account-name. No "+".
+          pattern: "^[A-Za-z0-9._-]{1,64}@([A-Za-z0-9-]+\\.)+[A-Za-z]{2,63}$"
+    AnswerRequest:
+      type: object
+      required: [jobId, messageId]
+      description: Exactly one of option or text.
+      properties:
+        jobId: {type: string}
+        messageId: {type: string}
+        option: {type: string}
+        text: {type: string, minLength: 1, maxLength: 4000}
+    DecisionRequest:
+      type: object
+      required: [jobId, taskId, decision]
+      properties:
+        jobId: {type: string}
+        taskId: {type: string}
+        decision: {type: string, enum: [approve, reject]}
+    VerifyRequest:
+      type: object
+      required: [designRunId, deployTarget]
+      properties:
+        designRunId: {type: string}
+        deployTarget: {$ref: "#/components/schemas/DeployTargetRequest"}
+    CreateRunData:
+      type: object
+      required: [runId]
+      properties:
+        runId: {type: string}
+        upload: {type: object, nullable: true, additionalProperties: true, description: A presigned POST for the SOW file.}
+    RunIdData:
+      type: object
+      required: [runId]
+      properties:
+        runId: {type: string}
+        designRunId: {type: string}
+    StoppedData:
+      type: object
+      required: [runId, status]
+      properties:
+        runId: {type: string}
+        status: {type: string, enum: [FAILED]}
+    RunsData:
+      type: object
+      required: [runs]
+      properties:
+        runs: {type: array, items: {$ref: "#/components/schemas/RunSummary"}}
+    RunData:
+      type: object
+      required: [run]
+      properties:
+        run: {$ref: "#/components/schemas/Run"}
+    AuditData:
+      type: object
+      required: [audit]
+      properties:
+        audit: {type: array, items: {$ref: "#/components/schemas/AuditItem"}}
+    ScopeData:
+      type: object
+      required: [scope, sha, orgDiagram]
+      properties:
+        scope: {type: object, additionalProperties: true}
+        sha: {type: string}
+        orgDiagram: {type: string, description: Mermaid source.}
+    VerifyData:
+      type: object
+      required: [ok]
+      additionalProperties: true
+      properties:
+        ok: {type: boolean}
+        message: {type: string}
+        error: {type: string}
+        warnings: {type: array, items: {type: string}}
+    PendingAnswerData:
+      type: object
+      required: [pendingAnswer]
+      properties:
+        pendingAnswer: {$ref: "#/components/schemas/PendingAnswer"}
+    PendingDecisionData:
+      type: object
+      required: [pendingDecision]
+      properties:
+        pendingDecision: {$ref: "#/components/schemas/PendingDecision"}
+    ArtifactData:
+      type: object
+      required: [url, sha256, filename]
+      additionalProperties: true
+      properties:
+        url: {type: string}
+        sha256: {type: string}
+        filename: {type: string}
+    CreateRunEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/CreateRunData"}}}
+    RunIdEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/RunIdData"}}}
+    StoppedEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/StoppedData"}}}
+    RunsEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/RunsData"}}}
+    RunEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/RunData"}}}
+    AuditEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/AuditData"}}}
+    ScopeEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/ScopeData"}}}
+    VerifyEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/VerifyData"}}}
+    PendingAnswerEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/PendingAnswerData"}}}
+    PendingDecisionEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/PendingDecisionData"}}}
+    ArtifactEnvelope: {type: object, required: [data], properties: {data: {$ref: "#/components/schemas/ArtifactData"}}}
+paths:
+  /runs:
+    post:
+      operationId: createRun
+      summary: Create a design run from a SOW file and/or typed requirements.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/CreateRunRequest"}}}}
+      responses:
+        "201": {description: Created., content: {application/json: {schema: {$ref: "#/components/schemas/CreateRunEnvelope"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+    get:
+      operationId: listRuns
+      summary: The caller's 25 newest runs.
+      responses:
+        "200": {description: OK., content: {application/json: {schema: {$ref: "#/components/schemas/RunsEnvelope"}}}}
+  /runs/{runId}/start:
+    post:
+      operationId: startRun
+      summary: Start the design workflow for a run.
+      parameters: [{$ref: "#/components/parameters/runId"}]
+      responses:
+        "202": {description: Started., content: {application/json: {schema: {$ref: "#/components/schemas/RunIdEnvelope"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /runs/{runId}/deploy:
+    post:
+      operationId: startDeploy
+      summary: Start a deploy run for a DELIVERED design run.
+      parameters: [{$ref: "#/components/parameters/runId"}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/DeployRequest"}}}}
+      responses:
+        "202": {description: Started. `runId` is the new deploy run., content: {application/json: {schema: {$ref: "#/components/schemas/RunIdEnvelope"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /runs/{runId}/stop:
+    post:
+      operationId: stopRun
+      summary: Stop a RUNNING run; it is marked FAILED and its stored credentials are deleted.
+      parameters: [{$ref: "#/components/parameters/runId"}]
+      responses:
+        "200": {description: Stopped., content: {application/json: {schema: {$ref: "#/components/schemas/StoppedEnvelope"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /runs/{runId}/answer:
+    post:
+      operationId: answerQuestion
+      summary: Answer the Transform message question a deploy run is waiting on (approver group).
+      parameters: [{$ref: "#/components/parameters/runId"}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/AnswerRequest"}}}}
+      responses:
+        "200": {description: Sent., content: {application/json: {schema: {$ref: "#/components/schemas/PendingAnswerEnvelope"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "502": {$ref: "#/components/responses/Upstream"}
+  /runs/{runId}/decision:
+    post:
+      operationId: decideTask
+      summary: Approve or reject the TOOL_APPROVAL task a deploy run is waiting on (approver group).
+      description: |
+        The platform submits the decision to AWS Transform as the signed-in person; the audit log records their sub.
+        Only the task in `pendingHumanInput` with category TOOL_APPROVAL can be decided. The deploy agent has no
+        path to this route.
+      parameters: [{$ref: "#/components/parameters/runId"}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/DecisionRequest"}}}}
+      responses:
+        "200": {description: Submitted., content: {application/json: {schema: {$ref: "#/components/schemas/PendingDecisionEnvelope"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "502": {$ref: "#/components/responses/Upstream"}
+  /deploy-target/verify:
+    post:
+      operationId: verifyDeployTarget
+      summary: Test target-account credentials without storing them.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/VerifyRequest"}}}}
+      responses:
+        "200": {description: The probe ran; see `ok`., content: {application/json: {schema: {$ref: "#/components/schemas/VerifyEnvelope"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /runs/{runId}:
+    get:
+      operationId: getRun
+      summary: One run.
+      parameters: [{$ref: "#/components/parameters/runId"}]
+      responses:
+        "200": {description: OK., content: {application/json: {schema: {$ref: "#/components/schemas/RunEnvelope"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /runs/{runId}/scope:
+    get:
+      operationId: getScope
+      summary: The approved design and its organization diagram.
+      parameters: [{$ref: "#/components/parameters/runId"}]
+      responses:
+        "200": {description: OK., content: {application/json: {schema: {$ref: "#/components/schemas/ScopeEnvelope"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /runs/{runId}/audit:
+    get:
+      operationId: getAudit
+      summary: The run's audit log, oldest first.
+      parameters: [{$ref: "#/components/parameters/runId"}]
+      responses:
+        "200": {description: OK., content: {application/json: {schema: {$ref: "#/components/schemas/AuditEnvelope"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /runs/{runId}/artifacts/{name}:
+    get:
+      operationId: getArtifact
+      summary: A 5-minute download link, plus the content for JSON artifacts.
+      parameters:
+        - {$ref: "#/components/parameters/runId"}
+        - name: name
+          in: path
+          required: true
+          schema: {type: string, enum: [terraform, cloudformation, report, reports, deployment-report, iac-change-plan, iac-manifest, foundation-assessment]}
+      responses:
+        "200": {description: OK., content: {application/json: {schema: {$ref: "#/components/schemas/ArtifactEnvelope"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}

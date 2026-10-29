@@ -57,9 +57,9 @@ async function api(path, opts = {}) {
   if (!token || jwtExpired(token)) expireSession();
   const r = await fetch(cfg.apiUrl + path, { ...opts, headers: { authorization: token, "content-type": "application/json" } });
   if (r.status === 401) expireSession();
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || r.statusText);
-  return data;
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((body.error && body.error.message) || r.statusText);
+  return body.data;  // every API response is {data} or {error: {code, message, details?}} (docs/openapi.yaml)
 }
 
 /* ---------- helpers ---------- */
@@ -518,6 +518,14 @@ function humanInputBanner(run, audit = []) {
   } else if (p.kind === "message") {
     action = `${options.length ? `<div class="choices">${options.map((o) => `<span class="choice choice-ro">${esc(o)}</span>`).join("")}</div>` : ""}
       <p class="hint">${p.messageId ? `Only members of the <code>${APPROVER_GROUP}</code> group can answer from here. Ask an administrator to add you, or answer in AWS Transform.` : "Answer in AWS Transform."}</p>`;
+  } else if (p.kind === "task" && p.category === "TOOL_APPROVAL" && canAnswerTransform()) {
+    const decided = run.pendingDecision && run.pendingDecision.taskId === p.taskId ? run.pendingDecision : null;
+    action = decided
+      ? `<div class="hitl-sent" role="status"><span class="spin spin-green" aria-hidden="true"></span><div><strong>${decided.decision === "approve" ? "Approved" : "Rejected"} in AWS Transform</strong> ${decided.by === claims.sub ? "" : "(by another user) "}· ${esc(ago(decided.at))}<div class="hint">Waiting for Transform to continue. This page updates on its own.</div></div></div>`
+      : `<p class="hint">Approving makes AWS Transform apply this deployment to the target account. It is recorded under your name.</p>
+         <div class="confirm-actions"><button class="btn btn-primary btn-sm" type="button" data-decide="approve" ${a.sending ? "disabled" : ""}>${a.sending ? '<span class="spin"></span> Sending…' : "Approve in this app"}</button>
+         <button class="btn btn-sm" type="button" data-decide="reject" ${a.sending ? "disabled" : ""}>Reject</button></div>
+         ${a.error ? `<p class="errtext" role="alert" style="margin:10px 0 0">${esc(a.error)}</p>` : ""}`;
   } else {
     action = `<p class="hint">${p.kind === "task" ? "This is a Transform task with its own form. Open it in AWS Transform to complete it." : "Answer in AWS Transform."}</p>`;
   }
@@ -539,6 +547,25 @@ async function sendAnswer(payload) {
     const r = await api(`/runs/${run.runId}/answer`, { method: "POST", body: JSON.stringify({ jobId: p.jobId, messageId: p.messageId, ...payload }) });
     if (S.data && S.data.run.runId === run.runId) S.data.run.pendingAnswer = r.pendingAnswer;
     toast("Answer sent to AWS Transform");
+  } catch (e) {
+    if (e.message === "session expired") return;
+    S.answer.error = e.message;
+  } finally {
+    S.answer.sending = false;
+    if (S.data && S.data.run.runId === run.runId) { renderRun(); openRun(run.runId, { silent: true }); }
+  }
+}
+
+async function decideTask(decision) {
+  const run = S.data && S.data.run, p = run && run.pendingHumanInput;
+  if (!p || S.answer.sending) return;
+  const what = decision === "approve" ? "Approve" : "Reject";
+  if (!confirm(`${what} “${p.title}” in AWS Transform? This is recorded under your name.`)) return;
+  S.answer.sending = true; S.answer.error = ""; renderRun();
+  try {
+    const r = await api(`/runs/${run.runId}/decision`, { method: "POST", body: JSON.stringify({ jobId: p.jobId, taskId: p.taskId, decision }) });
+    if (S.data && S.data.run.runId === run.runId) S.data.run.pendingDecision = r.pendingDecision;
+    toast(decision === "approve" ? "Approved in AWS Transform" : "Rejected in AWS Transform");
   } catch (e) {
     if (e.message === "session expired") return;
     S.answer.error = e.message;
@@ -986,6 +1013,8 @@ function onView(e) {
   if (e.target.closest("[data-answer-reply-open]")) { S.answer.reply = true; S.answer.selected = null; renderRun(); const t = $("answer-text"); if (t) t.focus(); return; }
   if (e.target.closest("[data-answer-reply-close]")) { S.answer.reply = false; renderRun(); return; }
   if (e.target.closest("[data-answer-text]")) { const t = S.answer.draft.trim(); if (t) { S.answer.selected = null; sendAnswer({ text: t }); } return; }
+  const decideBtn = e.target.closest("[data-decide]");
+  if (decideBtn) { decideTask(decideBtn.dataset.decide); return; }
   if (e.target.closest("[data-hitl-expand]")) { S.answer.expanded = !S.answer.expanded; renderRun(); return; }
   const t = e.target.closest("[data-tab],[data-dl],[data-copy],[data-full]");
   if (!t) return;

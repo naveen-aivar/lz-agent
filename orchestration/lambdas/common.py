@@ -39,6 +39,33 @@ def s3():
     return _s3
 
 
+# Every API response is {"data": ...} on success or {"error": {"code", "message", "details"?}} on failure
+# (docs/openapi.yaml). The code is fixed by the HTTP status; an unmapped status raises instead of guessing one.
+ERROR_CODES = {
+    400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found", 409: "conflict",
+    429: "too_many_requests", 500: "internal_error", 501: "not_implemented", 502: "upstream_error",
+    503: "unavailable",
+}
+
+
+def envelope_response(code: int, body: dict) -> dict:
+    """API Gateway proxy response for ``body`` (success) or ``{"error": message, ...extra}`` (failure)."""
+    if code < 400:
+        payload = {"data": body}
+    else:
+        if code not in ERROR_CODES:
+            raise ValueError(f"no error code is defined for HTTP status {code}")
+        if not isinstance(body, dict) or not isinstance(body.get("error"), str) or not body["error"]:
+            raise TypeError(f"an error response needs a non-empty string 'error', got {body!r}")
+        error = {"code": ERROR_CODES[code], "message": body["error"]}
+        details = {k: v for k, v in body.items() if k != "error"}
+        if details:
+            error["details"] = details
+        payload = {"error": error}
+    return {"statusCode": code, "headers": {"content-type": "application/json"},
+            "body": json.dumps(payload, default=str)}
+
+
 def now() -> int:
     return int(time.time())
 

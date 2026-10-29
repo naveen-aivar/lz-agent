@@ -784,15 +784,16 @@ Resources:
       AllowedOAuthFlows: [code]
       AllowedOAuthScopes: [openid, email]
       SupportedIdentityProviders: [COGNITO]
+      # The React UI (web/) is served by CloudFront at /v2/index.html next to the classic UI at /.
       CallbackURLs:
         !If
           - UseCloudFront
-          - [!Sub "https://${Distribution.DomainName}/"]
+          - [!Sub "https://${Distribution.DomainName}/", !Sub "https://${Distribution.DomainName}/v2/index.html"]
           - [!Sub "${Api.ApiEndpoint}/"]
       LogoutURLs:
         !If
           - UseCloudFront
-          - [!Sub "https://${Distribution.DomainName}/"]
+          - [!Sub "https://${Distribution.DomainName}/", !Sub "https://${Distribution.DomainName}/v2/index.html"]
           - [!Sub "${Api.ApiEndpoint}/"]
       AccessTokenValidity: 60
       IdTokenValidity: 60
@@ -838,6 +839,9 @@ Resources:
   RouteAnswerRun:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref Api, RouteKey: "POST /runs/{runId}/answer", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
+  RouteDecideTask:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: "POST /runs/{runId}/decision", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}
   RouteVerifyDeployTarget:
     Type: AWS::ApiGatewayV2::Route
     Properties: {ApiId: !Ref Api, RouteKey: "POST /deploy-target/verify", AuthorizationType: JWT, AuthorizerId: !Ref Authorizer, Target: !Sub "integrations/${RunsIntegration}"}

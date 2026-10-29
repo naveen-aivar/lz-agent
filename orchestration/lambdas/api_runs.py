@@ -25,7 +25,7 @@ import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
-from common import ARTIFACT_BUCKET, audit, delete_run_credentials, get_run, now, s3, table
+from common import ARTIFACT_BUCKET, audit, delete_run_credentials, envelope_response, get_run, now, s3, table
 from lzcore.aws_target_session import public_deploy_target
 from lzcore.regions import ALL_REGIONS
 from lzcore.deploy_target_api import (
@@ -46,7 +46,7 @@ class BadRequest(ValueError):
 
 
 def _resp(code, body):
-    return {"statusCode": code, "headers": {"content-type": "application/json"}, "body": json.dumps(body, default=str)}
+    return envelope_response(code, body)
 
 
 def _claims(event):
@@ -392,6 +392,85 @@ def _find_transform_reply(*, pending: dict):
     return transform_ops.user_reply_since(pending["jobId"], since, pending.get("workspaceId"))
 
 
+def _send_transform_decision(**kwargs):
+    """Seam for tests. Imported lazily: only this route loads the Transform library."""
+    from lzcore import transform_ops
+
+    return transform_ops.decide_tool_approval(**kwargs)
+
+
+def _decide_task(run_id, sub, event, invoked_by):
+    """Approve or reject the Transform approval task a deploy run is waiting on (pending kind=task, category
+    TOOL_APPROVAL, for example "Approve Landing Zone Deployment").
+
+    Only the run owner, signed in through the UI and in the approver group, may decide; the deploy agent has no
+    path to this route or to the call behind it. The task must be the one in META.pendingHumanInput, and
+    transform_ops re-checks it against the live job (category TOOL_APPROVAL, status AWAITING_APPROVAL) before
+    submitting. The idempotency token is fixed per run, task and decision, so a double click or a retry after a
+    crash is a duplicate Transform ignores. The decision is audited with the person's sub.
+    """
+    if invoked_by is not None:
+        return _resp(400, {"error": "decisions are accepted only from signed-in users in the UI"})
+    run = get_run(run_id)
+    if not run or not _can_view(run, sub):
+        return _resp(404, {"error": "not found"})
+    group = _approver_group()
+    if not os.environ.get("TRANSFORM_ROLE_ARN", "").strip():
+        return _resp(501, {"error": "deciding AWS Transform tasks from the UI needs the platform's TransformRoleArn; "
+                                    "decide in AWS Transform instead"})
+    if group not in _groups(event):
+        return _resp(403, {"error": f"only members of the {group!r} group can decide AWS Transform tasks from here"})
+    if run.get("runKind") != "deploy" or run.get("status") != "RUNNING":
+        return _resp(409, {"error": f"run is {run.get('status')}; only RUNNING deploy runs take decisions"})
+    pending = run.get("pendingHumanInput")
+    if not isinstance(pending, dict):
+        return _resp(409, {"error": "AWS Transform is not waiting on a task for this run"})
+    if pending.get("kind") != "task" or not pending.get("taskId"):
+        return _resp(409, {"error": "this is a message question; answer it instead"})
+    if pending.get("category") != "TOOL_APPROVAL":
+        return _resp(409, {"error": "this task has its own form; complete it in AWS Transform (open it from the link)"})
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "body must be JSON"})
+    if not isinstance(body, dict):
+        return _resp(400, {"error": "body must be a JSON object"})
+    if body.get("jobId") != pending.get("jobId") or body.get("taskId") != pending["taskId"]:
+        return _resp(409, {"error": "the task has changed since this page loaded; review the new task"})
+    decision = {"approve": "APPROVE", "reject": "REJECT"}.get(body.get("decision"))
+    if decision is None:
+        return _resp(400, {"error": "decision must be 'approve' or 'reject'"})
+
+    from lzcore.transform_ops import QuestionChanged, TransformAccessDenied  # lazy: Transform library
+
+    detail = {"jobId": pending["jobId"], "taskId": pending["taskId"], "title": pending.get("title"),
+              "decision": body["decision"]}
+    try:
+        result = _send_transform_decision(
+            job_id=pending["jobId"], task_id=pending["taskId"], decision=decision,
+            idempotency_token=str(uuid.uuid5(uuid.NAMESPACE_URL, f"lz-agent-decision:{run_id}:{pending['taskId']}:{decision}")),
+            workspace=pending.get("workspaceId"),
+        )
+    except QuestionChanged as e:
+        return _resp(409, {"error": f"AWS Transform has moved on: {e}"})
+    except TransformAccessDenied as e:
+        audit(run_id, sub, "transform.task_decision_failed", {**detail, "error": str(e)[:500]})
+        return _resp(502, {"error": str(e)})
+    except Exception as e:  # noqa: BLE001 - audited and returned: nothing is assumed about whether it was applied
+        audit(run_id, sub, "transform.task_decision_failed", {**detail, "error": f"{type(e).__name__}: {e}"[:500]})
+        return _resp(502, {"error": f"sending the decision to AWS Transform failed: {type(e).__name__}: {str(e)[:300]}"})
+    decided = {"taskId": pending["taskId"], "jobId": pending["jobId"], "decision": body["decision"], "by": sub,
+               "at": now(), "taskStatus": result.get("status")}
+    table().update_item(
+        Key={"PK": f"RUN#{run_id}", "SK": "META"},
+        UpdateExpression="SET pendingDecision = :d",
+        ExpressionAttributeValues={":d": decided},
+    )
+    audit(run_id, sub, "transform.task_approved" if decision == "APPROVE" else "transform.task_rejected",
+          {**detail, "taskStatus": result.get("status")})
+    return _resp(200, {"pendingDecision": decided})
+
+
 def _answer(run_id, sub, event, invoked_by):
     """Answer the Transform message question a deploy run is waiting on (contract C1 kind=message).
 
@@ -493,6 +572,8 @@ def handler(event, _ctx):
         return _stop(run_id, sub, invoked_by)
     if route.endswith("/answer"):
         return _answer(run_id, sub, event, invoked_by)
+    if route.endswith("/decision"):
+        return _decide_task(run_id, sub, event, invoked_by)
     if route.endswith("/audit"):
         return _audit(run_id, sub)
     if route.endswith("/scope"):

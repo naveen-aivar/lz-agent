@@ -59,7 +59,12 @@ def _invoke_api(lam, fn: str, route: str, sub: str, invoked_by: str, body: dict,
     payload = json.loads(out["Payload"].read() or b"{}")
     if out.get("FunctionError"):
         _fail(f"{route} Lambda error: {json.dumps(payload)[:1500]}")
-    return int(payload.get("statusCode", 0)), json.loads(payload.get("body") or "{}")
+    body = json.loads(payload.get("body") or "{}")
+    code = int(payload.get("statusCode", 0))
+    if code >= 400:  # {"error": {"code", "message", "details"?}}
+        err = body["error"]
+        return code, {"error": err["message"], "code": err["code"], **(err.get("details") or {})}
+    return code, body["data"]
 
 
 def _target_from_args(args) -> dict:

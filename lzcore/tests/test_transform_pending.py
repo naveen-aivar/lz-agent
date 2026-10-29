@@ -137,7 +137,7 @@ class PendingDetection(_Case):
         fake = FakeTransform(tasks=[
             {"taskId": "t-new", "status": "AWAITING_APPROVAL", "title": "Later", "createdAt": at(5)},
             {"taskId": "t-old", "status": "AWAITING_HUMAN_INPUT", "title": "Approve OU changes",
-             "description": "x" * 3000, "createdAt": at(1)},
+             "category": "TOOL_APPROVAL", "description": "x" * 3000, "createdAt": at(1)},
         ])
         out = self.poll(fake)
         self.assertTrue(out["awaitingHumanApproval"])
@@ -149,7 +149,8 @@ class PendingDetection(_Case):
         self.assertEqual(p["options"], [])
         self.assertEqual(p["consoleUrl"], CONSOLE)
         self.assertEqual((p["source"], p["jobId"], p["workspaceId"]), ("transform", JOB, WS))
-        self.assertEqual(set(p), {"source", "jobId", "workspaceId", "kind", "taskId", "messageId", "title", "text", "options", "choices", "consoleUrl"})
+        self.assertEqual(p["category"], "TOOL_APPROVAL")
+        self.assertEqual(set(p), {"source", "jobId", "workspaceId", "kind", "taskId", "messageId", "category", "title", "text", "options", "choices", "consoleUrl"})
         body = dict(fake.calls)["ListHitlTasks"]
         self.assertEqual(body["taskType"], "NORMAL")
         self.assertEqual(body["taskFilter"]["taskStatuses"], list(transform_ops._ACTIONABLE_HITL_STATUSES))
