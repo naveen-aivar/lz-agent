@@ -68,3 +68,34 @@ describe("RunsPage", () => {
     expect(screen.getAllByRole("row")).toHaveLength(4);
   });
 });
+
+describe("RunsPage paging", () => {
+  const many: RunSummary[] = Array.from({ length: 60 }, (_, i) => ({
+    runId: String(i).padStart(32, "0"), customerId: "acme", status: "DELIVERED", createdAt: now - i * 60, runKind: null, error: "",
+  }));
+  const big = () => ({ listRuns: vi.fn().mockResolvedValue({ runs: many, total: 60 }) }) as unknown as Client;
+
+  it("shows 25 runs, then 25 more on request, and says how many there are", async () => {
+    render(<RunsPage api={big()} onOpen={() => {}} />);
+    expect(await screen.findByTestId("run-count")).toHaveTextContent("Showing 25 of 60 runs");
+    expect(screen.getAllByRole("row")).toHaveLength(26);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Show 25 more" }));
+    expect(screen.getByTestId("run-count")).toHaveTextContent("Showing 50 of 60 runs");
+    await user.click(screen.getByRole("button", { name: "Show 10 more" }));
+    expect(screen.getByTestId("run-count")).toHaveTextContent("Showing 60 of 60 runs");
+    expect(screen.getAllByRole("row")).toHaveLength(61);
+    expect(screen.queryByRole("button", { name: /Show .* more/ })).toBeNull();
+  });
+
+  it("says when the API list is shorter than the number of runs", async () => {
+    const cut = { listRuns: vi.fn().mockResolvedValue({ runs: many.slice(0, 30), total: 900 }) } as unknown as Client;
+    render(<RunsPage api={cut} onOpen={() => {}} />);
+    expect(await screen.findByTestId("run-count")).toHaveTextContent("Showing 25 of 900 runs (the newest 30 can be listed)");
+  });
+
+  it("counts the dashboard over every run, not the first page", async () => {
+    render(<DashboardPage api={big()} />);
+    expect(await screen.findByText("60 delivered · 0 failed")).toBeInTheDocument();
+  });
+});

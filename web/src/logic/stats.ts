@@ -1,6 +1,9 @@
 import type { RunSummary } from "../api/client";
 import { isDone } from "./format";
 
+/** Rows the run history shows before "Show more". */
+export const PAGE_SIZE = 25;
+
 export interface Stats {
   total: number;
   delivered: number;

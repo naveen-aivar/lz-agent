@@ -587,6 +587,29 @@ class EnvelopeTests(_Base):
         out = common.envelope_response(500, {"error": "stopped", "runId": "r", "status": "FAILED"})
         self.assertEqual(json.loads(out["body"])["error"]["details"], {"runId": "r", "status": "FAILED"})
 
+    def test_the_run_list_returns_every_run_newest_first_with_a_total(self):
+        self.table.items[(f"RUN#{DESIGN_ID}", "META")]["createdAt"] = 1
+        for i in range(40):
+            rid = f"{i:032x}"
+            self.table.put_item({"PK": f"RUN#{rid}", "SK": "META", "runId": rid, "requester": USER, "status": "DELIVERED",
+                                 "customerId": "acme", "createdAt": 1000 + i, "error": ""})
+        code, out = self.api("GET /runs")
+        self.assertEqual(code, 200)
+        self.assertEqual((len(out["runs"]), out["total"]), (41, 41))  # not cut at 25
+        self.assertEqual(out["runs"][0]["createdAt"], 1039)
+        self.assertEqual(out["runs"][-1]["runId"], DESIGN_ID)
+        _validate(self.raw, "RunsEnvelope")
+
+    def test_the_run_list_says_when_it_is_cut(self):
+        for i in range(5):
+            rid = f"{i:032x}"
+            self.table.put_item({"PK": f"RUN#{rid}", "SK": "META", "runId": rid, "requester": USER, "status": "FAILED",
+                                 "createdAt": 10 + i, "error": ""})
+        self.table.items[(f"RUN#{DESIGN_ID}", "META")]["createdAt"] = 1
+        with mock.patch.object(api_runs, "MAX_LISTED_RUNS", 3):
+            _, out = self.api("GET /runs")
+        self.assertEqual((len(out["runs"]), out["total"]), (3, 6))
+
     def test_dynamodb_numbers_stay_numbers(self):
         from decimal import Decimal
         out = common.envelope_response(200, {"createdAt": Decimal("1793248670"), "ratio": Decimal("0.5"), "n": 3})

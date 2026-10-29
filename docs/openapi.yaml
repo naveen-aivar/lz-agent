@@ -240,9 +240,10 @@ components:
         status: {type: string, enum: [FAILED]}
     RunsData:
       type: object
-      required: [runs]
+      required: [runs, total]
       properties:
         runs: {type: array, items: {$ref: "#/components/schemas/RunSummary"}}
+        total: {type: integer, description: How many runs the caller has. Larger than runs.length only past 500.}
     RunData:
       type: object
       required: [run]
@@ -309,7 +310,7 @@ paths:
         "400": {$ref: "#/components/responses/BadRequest"}
     get:
       operationId: listRuns
-      summary: The caller's 25 newest runs.
+      summary: The caller's runs, newest first (at most 500; `total` says how many exist).
       responses:
         "200": {description: OK., content: {application/json: {schema: {$ref: "#/components/schemas/RunsEnvelope"}}}}
   /runs/{runId}/start:

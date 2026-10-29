@@ -118,6 +118,10 @@ def _create(event, sub):
     return _resp(201, {"runId": run_id, "upload": upload})
 
 
+# Runs returned by GET /runs, newest first. "total" says how many the caller has, so a client can tell when the list is cut.
+MAX_LISTED_RUNS = 500
+
+
 def _list(sub):
     """The caller's runs, newest first. A scan is fine at this volume."""
     kwargs = {"FilterExpression": "SK = :m", "ExpressionAttributeValues": {":m": "META"}}
@@ -130,7 +134,9 @@ def _list(sub):
         kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
     runs.sort(key=lambda r: r["createdAt"], reverse=True)
     keep = ("runId", "customerId", "status", "createdAt", "runKind", "designRunId")
-    return _resp(200, {"runs": [{**{k: r.get(k) for k in keep}, "error": str(r.get("error", ""))[:200]} for r in runs[:25]]})
+    shown = runs[:MAX_LISTED_RUNS]
+    return _resp(200, {"runs": [{**{k: r.get(k) for k in keep}, "error": str(r.get("error", ""))[:200]} for r in shown],
+                       "total": len(runs)})
 
 
 def _start(run_id, sub):

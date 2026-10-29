@@ -11,7 +11,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The caller's 25 newest runs. */
+        /** The caller's runs, newest first (at most 500; `total` says how many exist). */
         get: operations["listRuns"];
         put?: never;
         /** Create a design run from a SOW file and/or typed requirements. */
@@ -416,6 +416,8 @@ export interface components {
         };
         RunsData: {
             runs: components["schemas"]["RunSummary"][];
+            /** @description How many runs the caller has. Larger than runs.length only past 500. */
+            total: number;
         };
         RunData: {
             run: components["schemas"]["Run"];
