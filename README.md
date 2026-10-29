@@ -120,3 +120,17 @@ Create Cognito users. Any signed-in user can start a run, and each user sees onl
 ```
 python -m unittest discover -s orchestration/tests -v
 ```
+
+## React UI (`web/`)
+
+A Vite + React + TypeScript app served by CloudFront at `/v2/index.html`, next to the classic UI at `/`. It covers the runs list, the run page (question and approval panel, activity, design, details), and the deploy dialog. Creating a design run from a SOW is still in the classic UI.
+
+```
+cd web
+npm ci
+npm run gen:api   # regenerate src/api/schema.d.ts from docs/openapi.yaml
+npm run typecheck && npm test
+npm run build     # scripts/deploy.sh does this and syncs web/dist to s3://<UiBucket>/v2
+```
+
+The API contract is `docs/openapi.yaml`: every response is `{data}` or `{error: {code, message, details?}}`, and a test checks the file lists exactly the routes in `infra/platform/platform.yaml`. The React app needs CloudFront (the Cognito callback `https://<distribution>/v2/index.html`).

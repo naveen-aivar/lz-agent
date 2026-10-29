@@ -1142,6 +1142,19 @@ def _unwrap(stmt):
 
 
 class PlatformTemplateTests(unittest.TestCase):
+    def test_react_ui_callback_and_decision_route(self):
+        client = RES["UserPoolClient"]["Properties"]
+        for key in ("CallbackURLs", "LogoutURLs"):
+            urls = client[key]["If"][1]
+            self.assertEqual(len(urls), 2, key)
+            self.assertTrue(any("/v2/index.html" in str(u) for u in urls), key)
+        route = RES["RouteDecideTask"]["Properties"]
+        self.assertEqual((route["RouteKey"], route["AuthorizationType"]), ("POST /runs/{runId}/decision", "JWT"))
+
+    def test_deploy_script_publishes_the_react_build_under_v2(self):
+        text = (ROOT / "scripts" / "deploy.sh").read_text()
+        self.assertIn('aws s3 sync web/dist "s3://$UI/v2" --delete', text)
+        self.assertIn("npm ci", text)
     def test_agent_transform_actions_conditional_and_enumerated(self):
         stmts = [u for s in _statements("AgentRole") for u in _unwrap(s)]
         transform = [(c, s) for c, s in stmts if any(a.startswith("transform:") for a in _actions(s))]

@@ -102,5 +102,12 @@ sed "s|src=\"app.js\"|src=\"app.js?v=$(date +%s)\"|" ui/index.html > build/index
 aws s3 cp build/index.html "s3://$UI/index.html" --content-type text/html --cache-control no-cache --only-show-errors
 aws s3 cp ui/app.js "s3://$UI/app.js" --content-type application/javascript --cache-control no-cache --only-show-errors
 aws s3 cp build/config.json "s3://$UI/config.json" --content-type application/json --cache-control no-store --only-show-errors
+# React UI (web/), served by CloudFront at /v2/index.html next to the classic UI. Needs CloudFront: the callback URL
+# https://<distribution>/v2/index.html is registered on the user pool client by platform.yaml.
+if [ -d web ]; then
+  (cd web && npm ci --silent && npm run build --silent)
+  aws s3 sync web/dist "s3://$UI/v2" --delete --cache-control no-cache --only-show-errors
+  echo "React UI: $(out UiUrl)/v2/index.html"
+fi
 echo "UI: $(out UiUrl)"
 [ -n "$TAG" ] || echo "First pass done. Re-run with an image tag (e.g. v1) to build the agent image and create the AgentCore runtime."

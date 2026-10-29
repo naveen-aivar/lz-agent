@@ -7,3 +7,6 @@ __pycache__/
 .terraform/
 testing/.venv/
 .deploy-env.local
+
+web/node_modules/
+web/dist/
