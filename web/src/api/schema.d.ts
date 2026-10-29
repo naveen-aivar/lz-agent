@@ -307,6 +307,7 @@ export interface components {
             pendingDecision?: components["schemas"]["PendingDecision"];
             targetRegion?: string;
             accountEmailBase?: string;
+            mapAgreement?: string;
             deployTarget?: {
                 [key: string]: unknown;
             };
@@ -347,6 +348,8 @@ export interface components {
             targetRegion?: string;
             /** @description prefix@domain for the new accounts; Transform adds +account-name. No "+". */
             accountEmail?: string;
+            /** @description none, or the full AWS MAP tag with its prefix (for example mig12345). The agent answers Transform's MAP question from it. */
+            mapAgreement?: string;
         };
         /** @description Exactly one of option or text. */
         AnswerRequest: {

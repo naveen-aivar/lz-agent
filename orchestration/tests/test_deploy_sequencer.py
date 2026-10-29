@@ -2322,6 +2322,36 @@ class TypedReplies(_SequencerCaseBase):
         ctx = conv.run_context(meta={"accountEmailBase": "a@b.com"}, foundation={}, gaps={}, scope=SCOPE)
         self.assertEqual(ctx["accountEmailBase"], "a@b.com")
 
+    MAP_Q = {**NO_OPTIONS, "messageId": "msg-map", "text": "Do you have a MAP agreement? If yes, enter the full tag value, "
+             "for example mig12345."}
+
+    def test_the_map_question_is_answered_from_the_run_input(self):
+        for given, reply in (("none", "No"), ("migABCDE12345", "migABCDE12345")):
+            with self.subTest(given):
+                self._env(self.MAP_Q, mapAgreement=given)
+                self._set_reviewer(_verdict(False))
+                self._set_converse(self._type(reply, basis=("context:mapAgreement",), category="design"))
+                self._invoke()
+                (sent,) = self.fake_ops.answers
+                self.assertEqual((sent["message_id"], sent["text"]), ("msg-map", reply))
+                self.assertEqual(self.table.item("ANSWER#msg-map")["by"], "agent")
+
+    def test_the_map_question_goes_to_a_person_when_the_run_has_no_map_input(self):
+        self._env(self.MAP_Q)
+        self._set_reviewer(_verdict(False))
+        self._set_converse(lambda prompt: (self._type("No", expect="REFUSED: these basis entries",
+                                                      basis=("context:mapAgreement",))(prompt),
+                                           _escalate("The design and run do not state a MAP agreement.")(prompt)))
+        result = self._invoke()
+        self.assertEqual(self.fake_ops.answers, [])
+        self.assertIn("MAP agreement", result["pendingHumanInput"]["agentNote"]["reason"])
+
+    def test_the_map_input_is_in_the_run_context_and_the_prompt_only_when_given(self):
+        self._make_env()  # installs the fake Transform (run_context reads its Region)
+        self.assertNotIn("mapAgreement", conv.run_context(meta={}, foundation={}, gaps={}, scope=SCOPE))
+        self.assertEqual(conv.run_context(meta={"mapAgreement": "none"}, foundation={}, gaps={}, scope=SCOPE)["mapAgreement"], "none")
+        self.assertIn("context mapAgreement", app.CONVERSE_SYSTEM)
+
     def test_option_and_text_together_or_neither_are_refused(self):
         self._env()
         self._set_converse(lambda prompt: (

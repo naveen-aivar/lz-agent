@@ -148,6 +148,7 @@ components:
         pendingDecision: {$ref: "#/components/schemas/PendingDecision"}
         targetRegion: {type: string}
         accountEmailBase: {type: string}
+        mapAgreement: {type: string}
         deployTarget: {type: object, additionalProperties: true}
         artifacts: {type: object, additionalProperties: true}
     AuditItem:
@@ -186,6 +187,10 @@ components:
           type: string
           description: prefix@domain for the new accounts; Transform adds +account-name. No "+".
           pattern: "^[A-Za-z0-9._-]{1,64}@([A-Za-z0-9-]+\\.)+[A-Za-z]{2,63}$"
+        mapAgreement:
+          type: string
+          description: 'none, or the full AWS MAP tag with its prefix (for example mig12345). The agent answers Transform''s MAP question from it.'
+          pattern: "^(none|(mig_ec2_|comm_ec2_|mig|sap|oracle|comm)[A-Za-z0-9]{1,40})$"
     AnswerRequest:
       type: object
       required: [jobId, messageId]

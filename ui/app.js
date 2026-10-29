@@ -936,6 +936,11 @@ function deployPayloadFromForm() {
     if (/\+/.test(email) || !/^[A-Za-z0-9._-]{1,64}@([A-Za-z0-9-]+\.)+[A-Za-z]{2,63}$/.test(email)) throw new Error("Account email must look like prefix@domain, without a +");
     body.accountEmail = email;
   }
+  const map = $("deployForm").mapAgreement.value.trim();
+  if (map) {
+    if (!/^(none|(mig_ec2_|comm_ec2_|mig|sap|oracle|comm)[A-Za-z0-9]{1,40})$/.test(map)) throw new Error("MAP agreement must be none or the full MAP tag, such as mig12345");
+    body.mapAgreement = map;
+  }
   return body;
 }
 function deployTargetFromForm() {

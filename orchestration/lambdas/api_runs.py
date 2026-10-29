@@ -175,6 +175,11 @@ def _deliverable_design_run(design_run_id, sub):
 _ACCOUNT_EMAIL = re.compile(r"[A-Za-z0-9._-]{1,64}@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}")
 
 
+# AWS MAP (Migration Acceleration Program) agreement for billing attribution: "none", or the full tag with its
+# workload-type prefix, the format AWS Transform asks for (for example mig12345, sapABCDE12345).
+_MAP_AGREEMENT = re.compile(r"none|(?:mig_ec2_|comm_ec2_|mig|sap|oracle|comm)[A-Za-z0-9]{1,40}")
+
+
 def _deploy(design_run_id, sub, event, invoked_by):
     design, err = _deliverable_design_run(design_run_id, sub)
     if err:
@@ -213,6 +218,11 @@ def _deploy(design_run_id, sub, event, invoked_by):
         return _resp(400, {"error": "accountEmail must look like prefix@domain, without a '+' (Transform adds "
                                     "'+account-name' for each new account)"})
 
+    map_agreement = body.get("mapAgreement")
+    if map_agreement is not None and (not isinstance(map_agreement, str) or not _MAP_AGREEMENT.fullmatch(map_agreement)):
+        return _resp(400, {"error": "mapAgreement must be 'none' or the full MAP tag with its prefix "
+                                    "(mig, sap, oracle, comm, mig_ec2_ or comm_ec2_ followed by letters and digits)"})
+
     try:
         deploy_target = parse_deploy_target_from_request(
             body, deploy_id=deploy_id, put_credentials=_put_credentials
@@ -240,6 +250,8 @@ def _deploy(design_run_id, sub, event, invoked_by):
         item["targetRegion"] = target_region
     if account_email:
         item["accountEmailBase"] = account_email
+    if map_agreement:
+        item["mapAgreement"] = map_agreement
     if invoked_by:
         item["invokedBy"] = invoked_by
     try:

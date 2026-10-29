@@ -89,6 +89,7 @@ export function RunPage({ runId, api, canAnswer, userSub, pollMs = 4000 }: {
           {run.designRunId && (<><dt>Design run</dt><dd><code>{run.designRunId}</code></dd></>)}
           {run.targetRegion && (<><dt>Control Tower Region</dt><dd>{run.targetRegion}</dd></>)}
           {run.accountEmailBase && (<><dt>Account email</dt><dd>{run.accountEmailBase}</dd></>)}
+          {run.mapAgreement && (<><dt>MAP agreement</dt><dd>{run.mapAgreement}</dd></>)}
           {run.deployTarget && (<><dt>Deploy target</dt><dd><code>{JSON.stringify(run.deployTarget)}</code></dd></>)}
         </dl>
       )}

@@ -2,12 +2,13 @@ import { useState } from "react";
 import type { Client, DeployRequest } from "../api/client";
 
 type Method = "role" | "keys" | "platform";
+const MAP = /^(none|(mig_ec2_|comm_ec2_|mig|sap|oracle|comm)[A-Za-z0-9]{1,40})$/;
 const EMAIL = /^[A-Za-z0-9._-]{1,64}@([A-Za-z0-9-]+\.)+[A-Za-z]{2,63}$/;
 
 /** Builds the POST /runs/{id}/deploy body from the form, or throws a message naming what is wrong. */
 export function buildDeployRequest(f: {
   method: Method; accountId: string; roleArn: string; externalId: string; accessKeyId: string;
-  secretAccessKey: string; sessionToken: string; accountEmail: string; targetRegion: string;
+  secretAccessKey: string; sessionToken: string; accountEmail: string; mapAgreement: string; targetRegion: string;
 }): DeployRequest {
   const body: DeployRequest = {};
   if (f.method !== "platform") {
@@ -27,6 +28,11 @@ export function buildDeployRequest(f: {
     if (email.includes("+") || !EMAIL.test(email)) throw new Error("Account email must look like prefix@domain, without a +");
     body.accountEmail = email;
   }
+  const map = f.mapAgreement.trim();
+  if (map) {
+    if (!MAP.test(map)) throw new Error("MAP agreement must be none or the full MAP tag, such as mig12345");
+    body.mapAgreement = map;
+  }
   if (f.targetRegion.trim()) body.targetRegion = f.targetRegion.trim();
   return body;
 }
@@ -38,7 +44,7 @@ export function DeployDialog({ designRunId, api, onStarted, onCancel }: {
   onCancel: () => void;
 }) {
   const [f, setF] = useState({ method: "role" as Method, accountId: "", roleArn: "", externalId: "", accessKeyId: "",
-    secretAccessKey: "", sessionToken: "", accountEmail: "", targetRegion: "" });
+    secretAccessKey: "", sessionToken: "", accountEmail: "", mapAgreement: "", targetRegion: "" });
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const set = (k: keyof typeof f) => (e: { target: { value: string } }) => setF({ ...f, [k]: e.target.value });
@@ -86,6 +92,10 @@ export function DeployDialog({ designRunId, api, onStarted, onCancel }: {
       <label>Account email (optional)
         <span className="hint">prefix@domain for the new accounts, without a +. Transform adds +account-name.</span>
         <input type="email" value={f.accountEmail} onChange={set("accountEmail")} />
+      </label>
+      <label>MAP agreement (optional)
+        <span className="hint">none, or the full MAP tag such as mig12345. The agent answers Transform's MAP question from it.</span>
+        <input value={f.mapAgreement} onChange={set("mapAgreement")} placeholder="none" />
       </label>
       <label>Control Tower Region override (optional)<input value={f.targetRegion} onChange={set("targetRegion")} placeholder="us-east-1" /></label>
       {message && <p role="status" className="hint">{message}</p>}

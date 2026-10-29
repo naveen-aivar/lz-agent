@@ -131,6 +131,8 @@ def main() -> None:
                     "home Region (use when IAM Identity Center in the target account is in another Region)")
     ap.add_argument("--account-email", help="prefix@domain for the new accounts' email addresses (no '+'); Transform "
                     "adds '+account-name'. The agent answers Transform's email question from it.")
+    ap.add_argument("--map-agreement", help="'none' or the full MAP tag (for example mig12345). The agent answers "
+                    "Transform's MAP question from it.")
     ap.add_argument("--no-follow", action="store_true", help="start the run and exit")
     args = ap.parse_args()
 
@@ -172,6 +174,8 @@ def main() -> None:
         start_body["targetRegion"] = args.target_region
     if args.account_email:
         start_body["accountEmail"] = args.account_email
+    if args.map_agreement:
+        start_body["mapAgreement"] = args.map_agreement
     code, res = _invoke_api(lam, fn, "POST /runs/{runId}/deploy", sub, invoked_by, start_body,
                             run_id=args.design_run)
     if code not in (200, 201, 202):

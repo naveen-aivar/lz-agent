@@ -163,8 +163,10 @@ def run_context(*, meta: dict, foundation: dict, gaps: dict, scope: Optional[dic
     target = meta.get("deployTarget") or {}
     org = foundation.get("organization") or {}
     email = {"accountEmailBase": meta["accountEmailBase"]} if meta.get("accountEmailBase") else {}
+    map_agreement = {"mapAgreement": meta["mapAgreement"]} if meta.get("mapAgreement") else {}
     return {
         **email,  # present only when the operator supplied it: "prefix@domain", Transform adds "+account-name"
+        **map_agreement,  # present only when supplied: "none" (no MAP agreement) or the full MAP tag value
         "runPurpose": RUN_PURPOSE,
         "deployTargetAccountId": target.get("accountId") or org.get("callerAccountId"),
         "transformRegion": transform_ops.transform_region(),

@@ -269,6 +269,19 @@ class ApiRunsTests(_Base):
             self.assertIn("targetRegion", res["error"])
         code, res = self.deploy_keys()
         self.assertNotIn("targetRegion", self.table.meta(res["runId"]))
+    def test_map_agreement_is_validated_and_stored_on_the_run(self):
+        target = {"accountId": ACCOUNT, "accessKeyId": "AKIAEXAMPLE", "secretAccessKey": "secret"}
+        for good in ("none", "mig12345", "sapABCDE12345", "mig_ec2_X1", "comm_ec2_X1", "oracleA1", "commA1"):
+            code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "mapAgreement": good}, run_id=DESIGN_ID)
+            self.assertEqual(code, 202, good)
+            self.assertEqual(self.table.meta(res["runId"])["mapAgreement"], good)
+        for bad in ("None", "yes", "12345", "mig", "migrate!", "xyz123", 5, "", "mig 1", "a" * 80):
+            code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "mapAgreement": bad}, run_id=DESIGN_ID)
+            self.assertEqual(code, 400, bad)
+            self.assertIn("mapAgreement", res["error"])
+        code, res = self.deploy_keys()
+        self.assertNotIn("mapAgreement", self.table.meta(res["runId"]))
+
     def test_account_email_is_validated_and_stored_on_the_run(self):
         target = {"accountId": ACCOUNT, "accessKeyId": "AKIAEXAMPLE", "secretAccessKey": "secret"}
         code, res = self.api("POST /runs/{runId}/deploy", {"deployTarget": target, "accountEmail": "billu.naveen@aivar.tech"},
