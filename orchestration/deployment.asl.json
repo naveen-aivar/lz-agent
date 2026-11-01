@@ -51,6 +51,7 @@
         "Payload": {"runId.$": "$.runId", "status": "DELIVERED"}
       },
       "ResultPath": null,
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 4, "BackoffRate": 2}],
       "End": true
     },
     "MarkFailedProgressBudget": {
@@ -83,6 +84,7 @@
         "Payload": {"runId.$": "$.runId", "status": "FAILED", "error.$": "$.error"}
       },
       "ResultPath": null,
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 4, "BackoffRate": 2}],
       "Next": "Failed"
     },
     "Failed": {"Type": "Fail", "Error": "DeployRunFailed", "Cause": "See deploy run audit log"}

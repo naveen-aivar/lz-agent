@@ -1514,6 +1514,25 @@ class PlatformTemplateTests(unittest.TestCase):
         route = RES["RouteDecideTask"]["Properties"]
         self.assertEqual((route["RouteKey"], route["AuthorizationType"]), ("POST /runs/{runId}/decision", "JWT"))
 
+    def test_the_states_that_write_the_final_status_retry_and_have_room_to_finish(self):
+        """MarkFailed and MarkDelivered are the only steps that write a terminal status. Without a Retry a
+        single Lambda timeout strands the run as RUNNING for ever, which the UI shows as still live. That
+        happened: phase_status took ~14 s at 128 MB against a 15 s timeout."""
+        for name in ("statemachine.asl.json", "deployment.asl.json"):
+            states = json.loads((ROOT / "orchestration" / name).read_text())["States"]
+            marks = [n for n, s in states.items()
+                     if s.get("Type") == "Task" and n in ("MarkFailed", "MarkDelivered")]
+            self.assertEqual(sorted(marks), ["MarkDelivered", "MarkFailed"], name)
+            for n in marks:
+                with self.subTest(machine=name, state=n):
+                    retry = states[n].get("Retry")
+                    self.assertTrue(retry, f"{name}:{n} has no Retry; a timeout would strand the run")
+                    self.assertIn("States.ALL", retry[0]["ErrorEquals"])
+                    self.assertGreaterEqual(retry[0]["MaxAttempts"], 2)
+        props = RES["PhaseStatusFn"]["Properties"]
+        self.assertGreaterEqual(props["Timeout"], 60)
+        self.assertGreaterEqual(props["MemorySize"], 512)
+
     def test_every_requirement_has_an_upper_bound(self):
         """The agent image and the Lambda package are rebuilt on every deploy, so an unbounded requirement
         lets a new major release reach production with no code change. mcp 2.0 did exactly that: it renamed

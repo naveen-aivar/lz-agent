@@ -703,7 +703,10 @@ Resources:
       Runtime: python3.12
       Handler: phase_status.handler
       Role: !GetAtt PhaseRole.Arn
-      Timeout: 15
+      # This is the only step that writes the final status, so it must not time out: a run that misses it is
+      # stuck RUNNING forever in the UI. At the default 128 MB it took ~14 s against a 15 s timeout.
+      Timeout: 60
+      MemorySize: 512
       Code: {S3Bucket: !Ref CodeBucket, S3Key: orchestration.zip}
       Environment: {Variables: {STATE_TABLE: !Ref StateTable, ARTIFACT_BUCKET: !Ref ArtifactBucket}}
 

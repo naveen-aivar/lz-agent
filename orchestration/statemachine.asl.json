@@ -37,12 +37,16 @@
     "MarkDelivered": {
       "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {"FunctionName": "${PhaseStatusArn}", "Payload": {"runId.$": "$.runId", "status": "DELIVERED"}},
-      "ResultPath": null, "End": true
+      "ResultPath": null,
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 4, "BackoffRate": 2}],
+      "End": true
     },
     "MarkFailed": {
       "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {"FunctionName": "${PhaseStatusArn}", "Payload": {"runId.$": "$.runId", "status": "FAILED", "error.$": "$.error"}},
-      "ResultPath": null, "Next": "Failed"
+      "ResultPath": null,
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 4, "BackoffRate": 2}],
+      "Next": "Failed"
     },
     "Failed": {"Type": "Fail", "Error": "RunFailed", "Cause": "See the run's audit log"}
   }
