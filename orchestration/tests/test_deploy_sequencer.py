@@ -128,7 +128,7 @@ def _install_import_stubs() -> None:
             stdio.StdioServerParameters = StdioServerParameters
             stdio.get_default_environment = _unused
             stdio.stdio_client = _unused
-            streamable.streamablehttp_client = _unused
+            streamable.streamable_http_client = _unused  # the mcp 2.x name; see agent/requirements.txt
             mcp.client = client
             client.stdio = stdio
             client.streamable_http = streamable

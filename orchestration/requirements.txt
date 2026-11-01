@@ -1,1 +1,5 @@
+# The Lambda package is rebuilt on every deploy, so every requirement carries an upper bound (see
+# agent/requirements.txt). mcp arrives through the Transform MCP server, which requires the 2.x line; it is
+# pinned to the same range as the agent so both builds resolve the same library.
 awslabs.aws-transform-mcp-server==0.2.3
+mcp>=2.0,<2.2

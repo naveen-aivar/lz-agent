@@ -356,11 +356,13 @@ def aws_docs_tools():
     Raises when the server cannot be reached or returns no tools: an agent silently running
     without its documentation tools would answer from memory instead.
     """
-    from mcp.client.streamable_http import streamablehttp_client
+    # mcp 2.x spells it streamable_http_client (1.x called it streamablehttp_client). The line is pinned in
+    # agent/requirements.txt because the Transform MCP server requires 2.x.
+    from mcp.client.streamable_http import streamable_http_client
     from strands.tools.mcp import MCPClient
 
     try:
-        client = MCPClient(lambda: streamablehttp_client(AWS_KNOWLEDGE_MCP_URL))
+        client = MCPClient(lambda: streamable_http_client(AWS_KNOWLEDGE_MCP_URL))
         client.start()
         loaded = client.list_tools_sync()
     except Exception as e:

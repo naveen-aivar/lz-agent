@@ -1,5 +1,12 @@
-bedrock-agentcore>=0.1.0
-strands-agents>=1.0.0
-mcp>=1.0.0
-boto3>=1.39.0
+# Every dependency carries an upper bound: the agent image is rebuilt on every deploy, so an unbounded
+# requirement lets a new major release reach production without a code change. mcp 2.0 did exactly that and
+# broke every run: it renamed streamablehttp_client, which agent/tools.py imports.
+# The mcp line is 2.0/2.1, the only range all three consumers accept:
+#   awslabs.aws-transform-mcp-server 0.2.3 requires >=2.0.0,<3.0.0; strands-agents requires >=1.23.0,<2.2.
+# Install plain bedrock-agentcore, never the [strands-agents] extra: that extra pins mcp<2.0.0 and cannot
+# be satisfied alongside the Transform MCP server.
+bedrock-agentcore>=0.1.0,<2
+strands-agents>=1.62,<2
+mcp>=2.0,<2.2
+boto3>=1.39.0,<2
 awslabs.aws-transform-mcp-server==0.2.3

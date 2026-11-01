@@ -1514,6 +1514,32 @@ class PlatformTemplateTests(unittest.TestCase):
         route = RES["RouteDecideTask"]["Properties"]
         self.assertEqual((route["RouteKey"], route["AuthorizationType"]), ("POST /runs/{runId}/decision", "JWT"))
 
+    def test_every_requirement_has_an_upper_bound(self):
+        """The agent image and the Lambda package are rebuilt on every deploy, so an unbounded requirement
+        lets a new major release reach production with no code change. mcp 2.0 did exactly that: it renamed
+        streamablehttp_client (agent/tools.py) and every design run failed to start."""
+        for rel in ("agent/requirements.txt", "orchestration/requirements.txt"):
+            lines = [ln.strip() for ln in (ROOT / rel).read_text().splitlines()]
+            reqs = [ln for ln in lines if ln and not ln.startswith("#")]
+            self.assertTrue(reqs, rel)
+            for req in reqs:
+                with self.subTest(requirement=req, file=rel):
+                    self.assertTrue("==" in req or "<" in req,
+                                    f"{rel}: {req!r} has no upper bound; pin it (== or <) so builds are reproducible")
+
+    def test_the_installed_mcp_has_the_client_names_the_agent_imports(self):
+        """agent/tools.py and agent/transform_mcp.py import these by name. Both agent entry points call
+        aws_docs_tools(), so a renamed symbol fails every run before it starts. The other tests stub the mcp
+        module, so this is the only check against the real library."""
+        import mcp.client.stdio
+        import mcp.client.streamable_http
+
+        self.assertTrue(hasattr(mcp.client.streamable_http, "streamable_http_client"),
+                        "the installed mcp has no streamable_http_client (the 2.x name agent/tools.py imports). "
+                        "Reinstall from agent/requirements.txt.")
+        for name in ("StdioServerParameters", "get_default_environment", "stdio_client"):
+            self.assertTrue(hasattr(mcp.client.stdio, name), name)
+
     def test_deploy_script_publishes_the_react_build_at_the_root_and_not_the_classic_ui(self):
         text = (ROOT / "scripts" / "deploy.sh").read_text()
         self.assertIn('aws s3 sync web/dist "s3://$UI" --delete --exclude config.json', text)
