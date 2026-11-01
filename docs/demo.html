@@ -1,0 +1,713 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ingram Landing Zone Agent &middot; Demo</title>
+<!--
+  Self-contained demo of the Landing Zone Agent. No backend, no AWS credentials, no network calls.
+  Open it in a browser and present. Figures are from design run 73dcc255 (getsetyo11).
+
+  Keys:  left / right  step    N  speaker notes    T  theme    F  full screen
+-->
+<style>
+:root {
+  --bg:#0a0e14; --bg2:#0e131b; --panel:#12161d; --card:#1a1f29; --card-h:#20262f; --border:#262c37;
+  --ink:#e6e9ef; --dim:#8b94a3; --faint:#6b7483;
+  --blue:#2b8ef0; --blue-d:#1b6fc4; --green:#37d67a; --green-bg:#0f2a1c; --green-bd:#1d4a30; --green-ink:#8de8b2;
+  --amber:#f0b429; --amber-bg:#2a2410; --amber-bd:#4a3a1d; --red:#ef5a5a; --red-bg:#241314; --red-bd:#4a1d1d;
+  --blue-bg:#0e1e33; --blue-bd:#1d3660; --blue-ink:#b0ccf5; --violet-bg:#1f1b3d; --violet:#a99cf8;
+  --glow:#10243a; --radius:12px; --radius-s:8px; color-scheme: dark;
+}
+[data-theme="light"] {
+  --bg:#f4f6fa; --bg2:#fff; --panel:#fff; --card:#fff; --card-h:#f0f3f8; --border:#dde2ea;
+  --ink:#1a2030; --dim:#545e70; --faint:#6f7a8c;
+  --blue:#1b6fc4; --blue-d:#14589c; --green:#1a8f50; --green-bg:#e4f6ec; --green-bd:#b4e2c8; --green-ink:#176b3e;
+  --amber:#a86a00; --amber-bg:#fdf3dc; --amber-bd:#efd89a; --red:#c93636; --red-bg:#fdeaea; --red-bd:#f2b8b8;
+  --blue-bg:#e8f1fc; --blue-bd:#bcd5f3; --blue-ink:#1d4f8a; --violet-bg:#eeebfd; --violet:#5b49c9;
+  --glow:#e3edf9; color-scheme: light;
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+body { background: radial-gradient(1200px 700px at 85% -5%, var(--glow) 0%, var(--bg) 45%) fixed, var(--bg);
+  color:var(--ink); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  min-height:100vh; padding-bottom:38vh; }  /* clears the notes panel, which is up to 34vh tall */
+code { background:var(--card); border:1px solid var(--border); border-radius:4px; padding:.1em .4em;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.86em; }
+h2 { font-size:15px; } h3 { font-size:13px; margin:14px 0 6px; }
+a { color:var(--blue); }
+
+/* presenter chrome */
+.top { position:sticky; top:0; z-index:30; display:flex; align-items:center; gap:14px;
+  padding:12px 24px; background:var(--bg2); border-bottom:1px solid var(--border); flex-wrap:wrap; }
+.logo { font-weight:800; letter-spacing:1px; font-size:17px; } .logo b { color:var(--blue); }
+.top .ttl { color:var(--dim); font-size:13px; }
+.top .sp { margin-left:auto; display:flex; gap:8px; align-items:center; }
+.btn { font:inherit; font-size:13px; font-weight:600; cursor:pointer; border:1px solid var(--border);
+  background:var(--card); color:var(--ink); border-radius:var(--radius-s); padding:7px 14px; }
+.btn:hover:not(:disabled) { background:var(--card-h); }
+.btn:disabled { opacity:.4; cursor:not-allowed; }
+.btn-p { background:var(--blue); border-color:var(--blue); color:#fff; }
+.btn-p:hover:not(:disabled) { background:var(--blue-d); }
+.btn-sm { padding:4px 10px; font-size:12px; }
+.rail { display:flex; gap:6px; padding:14px 24px 0; flex-wrap:wrap; }
+.rail button { font:inherit; font-size:12px; font-weight:600; cursor:pointer; border:1px solid var(--border);
+  background:var(--panel); color:var(--dim); border-radius:999px; padding:5px 13px; }
+.rail button[aria-current="true"] { background:var(--blue); border-color:var(--blue); color:#fff; }
+.rail button:hover { color:var(--ink); border-color:var(--blue); }
+.wrap { max-width:1120px; margin:0 auto; padding:22px 24px 40px; }
+.stage { display:none; } .stage.on { display:block; }
+.h1 { font-size:25px; font-weight:700; margin-bottom:6px; }
+.lede { color:var(--dim); max-width:720px; margin-bottom:20px; line-height:1.6; }
+.notes { position:fixed; left:0; right:0; bottom:0; z-index:40; background:var(--bg2);
+  border-top:2px solid var(--blue); padding:14px 24px; max-height:34vh; overflow:auto; }
+.notes.hide { display:none; }
+.notes .lbl { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--blue); font-weight:700; margin-bottom:5px; }
+.notes p { max-width:980px; line-height:1.62; margin-bottom:7px; }
+.notes .ask { color:var(--amber); font-weight:600; }
+.notes-src { display:none; }
+.pg { position:fixed; right:24px; bottom:calc(34vh + 20px); color:var(--faint); font-size:12px; z-index:41; }
+
+/* product surfaces */
+.app { border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; background:var(--bg);
+  box-shadow:0 10px 36px rgba(0,0,0,.26); }
+.app .bar { display:flex; align-items:center; gap:7px; padding:9px 14px; background:var(--bg2); border-bottom:1px solid var(--border); }
+.dot { width:11px; height:11px; border-radius:50%; background:var(--border); }
+.app .url { margin-left:10px; color:var(--faint); font-size:12px; font-family:ui-monospace,Menlo,monospace; }
+.app .body { display:flex; min-height:430px; }
+.side { width:184px; flex-shrink:0; padding:16px 12px; background:var(--bg2); border-right:1px solid var(--border); }
+.nav { display:flex; flex-direction:column; gap:3px; margin-top:16px; }
+.nav span { display:block; padding:8px 11px; border-radius:var(--radius-s); color:var(--dim); font-weight:500; font-size:13px; }
+.nav span.on { background:var(--blue); color:#fff; }
+.main { flex:1; padding:20px 22px; min-width:0; }
+.panel { background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:16px; margin-bottom:13px; }
+.card { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:15px 17px; margin-bottom:13px; }
+.chead { display:flex; justify-content:space-between; align-items:baseline; gap:8px; margin-bottom:11px; }
+.chead h2 { font-size:13px; font-weight:700; }
+.g3 { display:grid; grid-template-columns:repeat(auto-fit,minmax(252px,1fr)); gap:13px; align-items:start; }
+.g3 .card { margin:0; }
+.kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(118px,1fr)); gap:11px; margin-bottom:15px; }
+.kpi { background:var(--card); border:1px solid var(--border); border-radius:var(--radius-s); padding:12px 14px; }
+.kpi i { display:block; font-style:normal; font-size:10px; text-transform:uppercase; letter-spacing:.4px; color:var(--faint); }
+.kpi b { display:block; font-size:21px; margin-top:3px; } .kpi em { font-style:normal; font-size:11px; color:var(--faint); }
+.kpi.am b { color:var(--amber); } .kpi.gr b { color:var(--green); }
+.badge { display:inline-flex; align-items:center; gap:5px; border-radius:20px; padding:3px 10px;
+  font-size:12px; font-weight:600; white-space:nowrap; }
+.b-green { background:var(--green-bg); color:var(--green); } .b-amber { background:var(--amber-bg); color:var(--amber); }
+.b-red { background:var(--red-bg); color:var(--red); } .b-blue { background:var(--blue-bg); color:var(--blue); }
+.b-violet { background:var(--violet-bg); color:var(--violet); }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th { text-align:left; padding:7px 9px; border-bottom:1px solid var(--border); color:var(--faint);
+  font-size:10px; text-transform:uppercase; letter-spacing:.4px; }
+td { padding:9px 9px; border-bottom:1px solid var(--border); }
+td.nm { font-weight:700; }
+.steps { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:17px; }
+.steps div { display:flex; align-items:center; gap:7px; font-size:12px; font-weight:600; color:var(--dim);
+  background:var(--panel); border:1px solid var(--border); border-radius:999px; padding:5px 13px 5px 6px; }
+.steps div.on { background:var(--blue); border-color:var(--blue); color:#fff; }
+.steps div.ok { color:var(--ink); }
+.steps i { display:grid; place-items:center; width:20px; height:20px; border-radius:50%;
+  background:var(--card-h); font-style:normal; font-size:11px; }
+.steps div.on i { background:rgba(255,255,255,.26); } .steps div.ok i { background:var(--green); color:#fff; }
+.prog div { display:flex; gap:11px; padding:8px 0; }
+.prog .nd { width:13px; height:13px; border-radius:50%; border:2px solid var(--border); background:var(--panel); flex-shrink:0; margin-top:2px; }
+.prog .done .nd { background:var(--green); border-color:var(--green); }
+.prog .now .nd { background:var(--amber); border-color:var(--amber); box-shadow:0 0 0 4px rgba(240,180,41,.16); }
+.prog b { display:block; font-size:13px; } .prog em { font-style:normal; font-size:12px; color:var(--faint); }
+.prog .now em { color:var(--amber); }
+.note { border:1px solid; border-radius:var(--radius-s); padding:11px 15px; font-size:13px; margin-bottom:13px; line-height:1.55; }
+.n-info { background:var(--blue-bg); border-color:var(--blue-bd); color:var(--blue-ink); }
+.n-warn { background:var(--amber-bg); border-color:var(--amber-bd); color:var(--amber); }
+.n-ok { background:var(--green-bg); border-color:var(--green-bd); color:var(--green-ink); }
+label { display:block; font-size:12px; font-weight:600; color:var(--dim); margin-bottom:5px; }
+input { width:100%; background:var(--panel); border:1px solid var(--border); border-radius:var(--radius-s);
+  color:var(--ink); font:inherit; font-size:13px; padding:8px 11px; }
+.fld { margin-bottom:12px; } .fld .hint { font-size:11px; color:var(--faint); margin-top:4px; }
+.drop { border:2px dashed var(--border); border-radius:var(--radius); padding:26px; text-align:center; background:var(--bg2); }
+.drop b { display:block; margin-bottom:3px; } .drop em { font-style:normal; font-size:12px; color:var(--faint); }
+.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:11px; }
+pre { background:var(--bg2); border:1px solid var(--border); border-radius:var(--radius-s); padding:11px;
+  overflow:auto; font-family:ui-monospace,Menlo,monospace; font-size:11.5px; line-height:1.55; }
+.hitl { background:var(--card); border:1px solid var(--border); border-left:4px solid var(--amber);
+  border-radius:var(--radius); padding:16px; margin-bottom:13px; }
+.qt { background:var(--panel); border:1px solid var(--border); border-radius:var(--radius-s); padding:11px; font-size:13px; margin:9px 0; }
+.agent { background:var(--blue-bg); border:1px solid var(--blue-bd); border-radius:var(--radius-s);
+  padding:11px 13px; color:var(--blue-ink); font-size:13px; margin:11px 0; }
+.chip { font:inherit; font-size:13px; font-weight:600; border:1px solid var(--border); background:var(--panel);
+  color:var(--ink); padding:7px 15px; border-radius:20px; }
+.feed { list-style:none; font-size:13px; }
+.feed li { display:grid; grid-template-columns:76px 1fr; gap:10px; padding:6px 2px; border-bottom:1px solid var(--border); }
+.feed time { color:var(--faint); font-size:12px; }
+.ul { padding-left:19px; } .ul li { padding:3px 0; font-size:13px; }
+.kv { display:grid; grid-template-columns:11rem 1fr; gap:5px 12px; font-size:13px; }
+.kv dt { color:var(--faint); } .kv dd { margin:0; }
+.two { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+@media (max-width:860px){ .two{grid-template-columns:1fr} .side{display:none} }
+.live { display:inline-flex; align-items:center; gap:6px; font-size:12px; font-weight:600; color:var(--dim);
+  border:1px solid var(--border); border-radius:999px; padding:2px 10px; }
+.live i { width:7px; height:7px; border-radius:50%; background:var(--green); font-style:normal; }
+svg .ou { fill:var(--blue-bg); stroke:var(--blue); } svg .ct { fill:var(--violet-bg); stroke:var(--violet); }
+svg text { fill:var(--ink); font:12px -apple-system,BlinkMacSystemFont,sans-serif; }
+svg line { stroke:var(--dim); }
+.flow { display:grid; gap:9px; }
+.flow .st { display:flex; gap:11px; align-items:flex-start; background:var(--card); border:1px solid var(--border);
+  border-radius:var(--radius-s); padding:11px 13px; }
+.flow .n { flex-shrink:0; display:grid; place-items:center; width:23px; height:23px; border-radius:50%;
+  background:var(--blue); color:#fff; font-size:12px; font-weight:700; }
+.flow .st.aws .n { background:var(--violet); }
+.flow b { display:block; font-size:13px; } .flow em { font-style:normal; font-size:12px; color:var(--dim); }
+</style>
+</head>
+<body>
+
+<div class="top">
+  <span class="logo"><b>IN</b>GRAM</span>
+  <span class="ttl">Landing Zone Agent &mdash; demo</span>
+  <span class="sp">
+    <button class="btn btn-sm" onclick="toggleNotes()">Notes <span style="opacity:.6">N</span></button>
+    <button class="btn btn-sm" onclick="toggleTheme()">Theme <span style="opacity:.6">T</span></button>
+    <button class="btn" id="prev" onclick="go(-1)">&larr;</button>
+    <button class="btn btn-p" id="next" onclick="go(1)">Next &rarr;</button>
+  </span>
+</div>
+<div class="rail" id="rail"></div>
+
+<div class="wrap">
+
+<section class="stage">
+  <div class="h1">From a statement of work to a running AWS landing zone</div>
+  <p class="lede">An agent reads the customer's SOW, designs the landing zone, generates and validates the
+  infrastructure code, then builds it in the customer's AWS account through AWS Transform. A person approves
+  anything that creates or changes AWS resources.</p>
+  <div class="kpis">
+    <div class="kpi"><i>Input</i><b>1</b><em>SOW document</em></div>
+    <div class="kpi"><i>Design time</i><b>9 min</b><em>SOW to validated code</em></div>
+    <div class="kpi"><i>Output</i><b>2</b><em>Terraform + CloudFormation</em></div>
+    <div class="kpi gr"><i>Checks run</i><b>120</b><em>lint + security scan</em></div>
+    <div class="kpi am"><i>Approvals</i><b>Human</b><em>for every AWS change</em></div>
+  </div>
+  <div class="two">
+    <div class="card">
+      <div class="chead"><h2>What the agent does</h2></div>
+      <ul class="ul">
+        <li>Reads the SOW and maps every requirement to a landing zone decision</li>
+        <li>Cites the SOW text behind each decision, or marks it inferred</li>
+        <li>Writes Terraform and CloudFormation, then validates and security-scans both</li>
+        <li>Answers AWS Transform's build questions from the approved design</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="chead"><h2>What it never does</h2></div>
+      <ul class="ul">
+        <li>Approve anything that creates or changes AWS resources</li>
+        <li>Invent a value the SOW does not state &mdash; it raises an open question instead</li>
+        <li>Apply the AI-written policies automatically</li>
+        <li>Close an AWS Transform job on its own say-so</li>
+      </ul>
+    </div>
+  </div>
+  <div class="notes-src">
+    <p><b>Open with the problem.</b> A landing zone normally takes four to eight weeks: discovery workshops,
+    architecture design, deployment, then review cycles between migration, security and the business.</p>
+    <p>This takes the SOW the customer already signed and produces a reviewed, validated design in minutes,
+    then builds it. The figures on screen are from a real run, not a mock-up.</p>
+    <p class="ask">Set expectations now: a person still approves every change that touches AWS. That is deliberate,
+    and it is the first question security teams ask.</p>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="h1">Projects</div>
+  <p class="lede">One row per customer. The status says where the work is and what to do next, so nobody
+  has to remember which run was which.</p>
+  <div class="app">
+    <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="url">d3hry80lb2bie6.cloudfront.net/#/runs</span></div>
+    <div class="body">
+      <div class="side"><span class="logo"><b>IN</b>GRAM</span>
+        <div class="nav"><span>Dashboard</span><span class="on">Projects</span><span>New project</span></div></div>
+      <div class="main">
+        <div class="row" style="justify-content:space-between;margin:0 0 14px">
+          <b style="font-size:19px">Projects</b>
+          <button class="btn btn-p btn-sm">New project</button>
+        </div>
+        <div class="panel">
+          <div class="row" style="margin:0 0 12px">
+            <button class="btn btn-sm btn-p">All 3</button>
+            <button class="btn btn-sm">Needs you 1</button>
+            <button class="btn btn-sm">In progress 1</button>
+            <button class="btn btn-sm">Complete 1</button>
+          </div>
+          <table>
+            <thead><tr><th>Customer</th><th>Where it is</th><th>Started</th><th></th></tr></thead>
+            <tbody>
+              <tr><td class="nm">GetSetYo</td><td><span class="badge b-amber">Needs your answer</span></td>
+                <td>18 min ago</td><td><button class="btn btn-p btn-sm">Answer &rarr;</button></td></tr>
+              <tr><td class="nm">Moon Trades</td><td><span class="badge b-blue">Ready to review</span></td>
+                <td>2 h ago</td><td><a href="#">Review &rarr;</a></td></tr>
+              <tr><td class="nm">Zeta Corp</td><td><span class="badge b-green">Complete</span></td>
+                <td>3 d ago</td><td><a href="#">View &rarr;</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="notes-src">
+    <p><b>The point of this screen is that there is nothing to work out.</b> Each row says where the customer
+    is and the one action available. "Needs your answer" is the only one that needs a person right now.</p>
+    <p>Earlier this was two rows per customer, a design run and a deploy run, and people had to know which was
+    which. They are now one project.</p>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="h1">Step 1 &mdash; Start from the SOW</div>
+  <p class="lede">Drop in the document the customer signed. PDF, Word, text or Markdown.</p>
+  <div class="app">
+    <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="url">&hellip;/#/new</span></div>
+    <div class="body">
+      <div class="side"><span class="logo"><b>IN</b>GRAM</span>
+        <div class="nav"><span>Dashboard</span><span>Projects</span><span class="on">New project</span></div></div>
+      <div class="main">
+        <b style="font-size:19px">New project</b>
+        <p style="color:var(--dim);margin:6px 0 16px;font-size:13px">The agent reads the SOW, designs the landing
+          zone, and generates and checks the Terraform and CloudFormation.</p>
+        <div class="panel">
+          <div class="fld"><label>Customer name</label><input value="GetSetYo" />
+            <div class="hint">Run name: <code>getsetyo11</code></div></div>
+          <div class="drop"><b>GetSetYo_GCP_to_AWS_Migration_SOW_v3.pdf</b><em>412 KB &middot; click to change</em></div>
+          <div class="row"><button class="btn btn-p">Start the analysis</button><button class="btn">Cancel</button></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="notes-src">
+    <p><b>This is the whole input.</b> No form to fill in, no architecture questionnaire. There is an optional
+    box for requirements that came up in conversation and are not in the document.</p>
+    <p>This SOW is a GCP to AWS migration, about 90,000 characters. Everything that follows is derived from it.</p>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="h1">Step 2 &mdash; The agent reads and designs</div>
+  <p class="lede">Four stages, visible as they happen. Roughly nine minutes for this SOW.</p>
+  <div class="app">
+    <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="url">&hellip;/#/run/73dcc255/analyze</span></div>
+    <div class="body">
+      <div class="side"><span class="logo"><b>IN</b>GRAM</span>
+        <div class="nav"><span>Dashboard</span><span class="on">Projects</span><span>New project</span></div></div>
+      <div class="main">
+        <div class="row" style="margin:0 0 10px"><b style="font-size:19px">GetSetYo</b>
+          <span class="live"><i></i>Live</span></div>
+        <div class="steps">
+          <div class="on"><i>1</i>Analyze SOW</div><div><i>2</i>Review design</div>
+          <div><i>3</i>Edit policies</div><div><i>4</i>Deploy</div><div><i>5</i>Results</div>
+        </div>
+        <div class="panel">
+          <div class="chead"><h2>The agent is reading the SOW</h2><span class="badge b-amber">In progress</span></div>
+          <div class="prog">
+            <div class="done"><span class="nd"></span><span><b>Read the SOW</b><em>Done &mdash; 3 pages, 89,806 characters</em></span></div>
+            <div class="done"><span class="nd"></span><span><b>Understand the scope</b><em>Done &mdash; every requirement mapped</em></span></div>
+            <div class="now"><span class="nd"></span><span><b>Generate the code</b><em>In progress &mdash; Terraform and CloudFormation</em></span></div>
+            <div><span class="nd"></span><span><b>Validate and scan</b><em>Lint and security scan</em></span></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="chead"><h2>History of the analysis</h2></div>
+          <ul class="feed">
+            <li><time>just now</time><span>Code generated &mdash; Terraform, 23 files</span></li>
+            <li><time>1 min ago</time><span>Saved the scope &mdash; 4 OUs, 5 accounts, 16 controls</span></li>
+            <li><time>4 min ago</time><span>Scope rejected: a quote was not found in the SOW &mdash; retrying</span></li>
+            <li><time>6 min ago</time><span>Read the catalog of policies and controls</span></li>
+            <li><time>8 min ago</time><span>SOW text extracted</span></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="notes-src">
+    <p><b>Point at the rejection line in the history.</b> The agent tried to save a design claiming a quote from
+    the SOW, the platform could not find that quote in the document, and it refused the save.</p>
+    <p>That check is the core of the trust model. Every decision must either quote the SOW or be labelled as
+    inferred. The agent cannot assert something the document does not say. It retried and got it right.</p>
+    <p class="ask">If asked: yes, that costs time. It took four attempts here. We would rather retry than ship a
+    design with an invented justification.</p>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="h1">Step 3 &mdash; Review the design</div>
+  <p class="lede">What the agent decided, the organization it will build, and the evidence behind each choice.</p>
+  <div class="kpis">
+    <div class="kpi"><i>OUs</i><b>4</b></div>
+    <div class="kpi"><i>Accounts</i><b>5</b></div>
+    <div class="kpi"><i>Controls enabled</i><b>20</b></div>
+    <div class="kpi"><i>Catalog SCPs</i><b>4</b></div>
+    <div class="kpi am"><i>Custom SCPs</i><b>2</b><em>to review next</em></div>
+  </div>
+  <div class="two">
+    <div class="panel">
+      <div class="chead"><h2>Organization</h2></div>
+      <svg viewBox="0 0 430 216" width="100%" height="206" role="img" aria-label="Organization chart">
+        <rect class="ou" x="160" y="6" width="104" height="30" rx="6" stroke-width="1.6"/><text x="196" y="26">Root</text>
+        <line x1="212" y1="36" x2="212" y2="52" stroke-width="1.4"/>
+        <line x1="72" y1="52" x2="352" y2="52" stroke-width="1.4"/>
+        <line x1="72" y1="52" x2="72" y2="68" stroke-width="1.4"/>
+        <line x1="212" y1="52" x2="212" y2="68" stroke-width="1.4"/>
+        <line x1="352" y1="52" x2="352" y2="68" stroke-width="1.4"/>
+        <rect class="ct" x="18" y="68" width="108" height="30" rx="6" stroke-width="1.6"/><text x="46" y="88">Security</text>
+        <rect class="ou" x="158" y="68" width="108" height="30" rx="6" stroke-width="1.6"/><text x="178" y="88">Workloads</text>
+        <rect class="ou" x="298" y="68" width="108" height="30" rx="6" stroke-width="1.6"/><text x="322" y="88">Sandbox</text>
+        <line x1="72" y1="98" x2="72" y2="120" stroke-width="1.4"/>
+        <rect class="ct" x="18" y="120" width="108" height="28" rx="6" stroke-width="1.6"/><text x="50" y="139">Audit</text>
+        <line x1="72" y1="148" x2="72" y2="170" stroke-width="1.4"/>
+        <rect class="ct" x="8" y="170" width="128" height="28" rx="6" stroke-width="1.6"/><text x="26" y="189">Log Archive</text>
+        <line x1="212" y1="98" x2="212" y2="110" stroke-width="1.4"/>
+        <line x1="172" y1="110" x2="252" y2="110" stroke-width="1.4"/>
+        <line x1="172" y1="110" x2="172" y2="120" stroke-width="1.4"/>
+        <line x1="252" y1="110" x2="252" y2="120" stroke-width="1.4"/>
+        <rect class="ou" x="140" y="120" width="64" height="28" rx="6" stroke-width="1.6"/><text x="156" y="139">Prod</text>
+        <rect class="ou" x="218" y="120" width="76" height="28" rx="6" stroke-width="1.6"/><text x="230" y="139">NonProd</text>
+      </svg>
+      <p style="font-size:12px;color:var(--faint);margin-top:8px">
+        <span class="badge b-violet">Control Tower</span> sets up Security and the shared accounts.
+        <span class="badge b-blue">Designed</span> from the SOW.</p>
+    </div>
+    <div>
+      <div class="card">
+        <div class="chead"><h2>Regions and logging</h2></div>
+        <dl class="kv">
+          <dt>Home Region</dt><dd><code>ap-south-1</code> Mumbai</dd>
+          <dt>Governed</dt><dd>1 Region</dd>
+          <dt>Region deny</dt><dd>On &mdash; 31 Regions denied</dd>
+          <dt>Log retention</dt><dd>365 days</dd>
+        </dl>
+      </div>
+      <div class="card">
+        <div class="chead"><h2>Before you apply</h2></div>
+        <div class="note n-warn" style="margin:0 0 9px">2 open questions to confirm with the customer</div>
+        <p style="font-size:12.5px;color:var(--dim)">Each new account needs a unique root email that has never
+          been used for an AWS account. Terraform reads these from <code>terraform.tfvars</code>.</p>
+      </div>
+      <div class="card">
+        <div class="chead"><h2>Security and validation</h2><span class="badge b-green">All checks passed</span></div>
+        <dl class="kv"><dt>Checks scanned</dt><dd>120</dd><dt>Passed</dt><dd>110</dd>
+          <dt>Findings</dt><dd>6 &mdash; reported, not blocking</dd></dl>
+      </div>
+    </div>
+  </div>
+  <div class="notes-src">
+    <p><b>Everything here is traceable.</b> Each OU, account, policy and control carries a badge: either
+    "From SOW" with the quote, or "Inferred" where the agent applied AWS best practice because the SOW was silent.
+    That is what a security reviewer reads first.</p>
+    <p>Note the two open questions. The agent did not guess the root emails. It asked.</p>
+    <p>The code is downloadable here as Terraform or CloudFormation, each with its own scan reports, whether or
+    not the customer ever uses our deploy.</p>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="h1">Step 4 &mdash; Review and edit the policies</div>
+  <p class="lede">Where the SOW asks for something the standard catalog cannot express, the agent writes the
+  policy. It arrives with sample values, and a person fills in the real ones.</p>
+  <div class="app">
+    <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="url">&hellip;/#/run/73dcc255/policies</span></div>
+    <div class="body"><div class="main">
+      <div class="steps">
+        <div class="ok"><i>&check;</i>Analyze SOW</div><div class="ok"><i>&check;</i>Review design</div>
+        <div class="on"><i>3</i>Edit policies</div><div><i>4</i>Deploy</div><div><i>5</i>Results</div>
+      </div>
+      <div class="note n-info"><b>The model wrote these policies from the SOW with sample values.</b>
+        Enter your real values and test on a non-production account first. Saving updates your downloads.
+        It does not apply anything to AWS.</div>
+      <div class="card">
+        <div class="chead"><div><h2>Protect the audit trail</h2>
+          <div style="font-size:12px;color:var(--faint)">Deny CloudTrail changes except by the platform role</div></div>
+          <span class="badge b-amber">1 value needed</span></div>
+        <div class="row" style="margin:0 0 11px"><span style="font-size:12px;color:var(--faint)">Applies to</span>
+          <span class="badge b-blue">Workloads</span><span class="badge b-green">From SOW</span></div>
+        <div class="fld"><label>Admin role name</label><input placeholder="GSY-Administrator" />
+          <div class="hint">Role allowed to change CloudTrail settings</div></div>
+        <pre>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Deny",
+    "Action": ["cloudtrail:StopLogging", "cloudtrail:DeleteTrail"],
+    "Resource": "*",
+    "Condition": { "ArnNotLike": {
+      "aws:PrincipalArn": "arn:aws:iam::*:role/{{ADMIN_ROLE_NAME}}" } }
+  }]
+}</pre>
+        <div class="row"><button class="btn btn-p btn-sm">Save 1 change</button>
+          <button class="btn btn-sm">Next: Deploy</button></div>
+      </div>
+    </div></div>
+  </div>
+  <div class="notes-src">
+    <p><b>This was the gap the team raised.</b> The generated policies previously shipped with
+    <code>{{PLACEHOLDER}}</code> values that somebody had to find and hand-edit in a JSON file.</p>
+    <p>Now each placeholder is a labelled field with its description and an example. The raw JSON stays editable
+    for anything the fields do not cover, and the server re-checks on save: Deny-only, inside the AWS size limit,
+    and a value cannot break out of the JSON structure.</p>
+    <p class="ask">Be clear on the boundary: saving updates the downloadable code. It does not touch the customer's
+    organization. Applying these is a separate, deliberate step.</p>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="h1">Step 5 &mdash; Build it, with a person in the loop</div>
+  <p class="lede">AWS Transform builds the Control Tower landing zone. The agent answers its questions from the
+  approved design, and hands over anything that commits a change.</p>
+  <div class="app">
+    <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="url">&hellip;/#/run/73dcc255/deploy</span></div>
+    <div class="body"><div class="main">
+      <div class="steps">
+        <div class="ok"><i>&check;</i>Analyze SOW</div><div class="ok"><i>&check;</i>Review design</div>
+        <div class="ok"><i>&check;</i>Edit policies</div><div class="on"><i>4</i>Deploy</div><div><i>5</i>Results</div>
+      </div>
+      <div class="hitl">
+        <div class="row" style="margin:0"><b style="font-size:15px">AWS Transform needs your input</b>
+          <span class="live"><i></i>Live</span></div>
+        <div class="qt">Control Tower is recorded. Next are the Service Control Policies. I recommend staging
+          five additional controls on the Workloads OUs. How would you like to proceed?</div>
+        <div class="agent"><b>Deploy agent:</b> none of the five proposed controls is in the approved design,
+          so skipping them is correct.<br>
+          <span style="opacity:.85">Suggested option: <b>Skip for now</b> &mdash; you confirm before it is sent.</span></div>
+        <div class="row"><button class="chip">Stage all five on Workloads</button>
+          <button class="chip">Skip for now</button></div>
+      </div>
+      <div class="g3">
+        <div class="card"><div class="chead"><h2>Progress</h2></div>
+          <div class="prog">
+            <div class="done"><span class="nd"></span><span><b>Discover baseline</b><em>Done</em></span></div>
+            <div class="now"><span class="nd"></span><span><b>Build with AWS Transform</b><em>Waiting for your answer</em></span></div>
+            <div><span class="nd"></span><span><b>Assess and plan</b><em>Foundation assessment</em></span></div>
+            <div><span class="nd"></span><span><b>Attest and deliver</b><em>Foundation report</em></span></div>
+          </div></div>
+        <div class="card"><div class="chead"><h2>Who answered what</h2></div>
+          <ul class="feed">
+            <li><time>2 min ago</time><span>Deploy agent answered &ldquo;Custom structure&rdquo;</span></li>
+            <li><time>6 min ago</time><span>Deploy agent handed you a plan approval</span></li>
+            <li><time>9 min ago</time><span>You approved &ldquo;Landing Zone Deployment&rdquo;</span></li>
+            <li><time>14 min ago</time><span>Deploy agent answered the Region question</span></li>
+          </ul></div>
+      </div>
+    </div></div>
+  </div>
+  <div class="notes-src">
+    <p><b>This is the heart of the product.</b> Transform asks a long series of questions. The agent answers the
+    ones the approved design already settles, and refuses the rest.</p>
+    <p>Read the blue box aloud. The agent explains its reasoning and names the option it would pick, but a person
+    presses the button. Options that start execution &mdash; Proceed, Approve, Deploy for me &mdash; are refused in
+    code, not by asking the model nicely. Anything unrecognised goes to a second reviewer model that fails closed.</p>
+    <p class="ask">Expect "why not fully automatic?" The answer: these actions create AWS accounts and cannot be
+    undone. Closing an AWS account takes up to 90 days.</p>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="h1">Step 6 &mdash; Evidence, not just a green tick</div>
+  <p class="lede">The platform checks the account itself, then closes the Transform job and produces an
+  attestation of what was actually built.</p>
+  <div class="two">
+    <div class="panel">
+      <div class="chead"><h2>Deployment report</h2><span class="badge b-green">Foundation attestation passed</span></div>
+      <div class="kpis" style="margin-bottom:12px">
+        <div class="kpi"><i>OUs before</i><b>1</b></div><div class="kpi gr"><i>OUs after</i><b>4</b></div>
+        <div class="kpi"><i>Accounts before</i><b>1</b></div><div class="kpi gr"><i>Accounts after</i><b>5</b></div>
+      </div>
+      <dl class="kv">
+        <dt>Before deploy</dt><dd>Greenfield</dd>
+        <dt>After deploy</dt><dd>Control Tower landing zone, ACTIVE</dd>
+        <dt>Gaps vs design</dt><dd>None &mdash; no missing OUs or accounts</dd>
+      </dl>
+      <div class="row">
+        <button class="btn btn-p btn-sm">Deployment report</button>
+        <button class="btn btn-sm">Foundation assessment</button>
+        <button class="btn btn-sm">IaC change plan</button>
+      </div>
+    </div>
+    <div>
+      <div class="note n-ok"><b>The landing zone is built.</b> Verified against the approved design before the
+        Transform job was closed.</div>
+      <div class="card">
+        <div class="chead"><h2>How the job gets closed</h2></div>
+        <div class="flow">
+          <div class="st"><span class="n">1</span><span><b>The agent reports the build looks complete</b>
+            <em>A claim in text. It closes nothing.</em></span></div>
+          <div class="st aws"><span class="n">2</span><span><b>The platform reads the real account</b>
+            <em>Do the OUs and accounts exist, are the accounts ACTIVE, is there one ACTIVE landing zone?</em></span></div>
+          <div class="st"><span class="n">3</span><span><b>Only then is the job closed</b>
+            <em>Code does this, from facts it read itself.</em></span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="chead"><h2>Audit</h2></div>
+        <p style="font-size:12.5px;color:var(--dim)">Every tool call, every answer, and who gave it &mdash; the agent
+          or a named person &mdash; is recorded against the run and cannot be edited from the app.</p>
+      </div>
+    </div>
+  </div>
+  <div class="notes-src">
+    <p><b>This slide answers "how do I know it worked?"</b> Not because the model said so. The platform calls
+    AWS Organizations and Control Tower, compares what it finds against the approved design, and only then
+    closes the job.</p>
+    <p>The attestation names what was observed before and after, and any gap against the design. That is the
+    artifact a customer's security team can keep.</p>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="h1">Where the guardrails sit</div>
+  <p class="lede">The division of labour, in one view. This is the slide to leave on screen during questions.</p>
+  <div class="two">
+    <div class="card">
+      <div class="chead"><h2>The agent decides</h2><span class="badge b-blue">Model</span></div>
+      <ul class="ul">
+        <li>Mapping the SOW to OUs, accounts, policies and controls</li>
+        <li>Writing custom policy JSON, for human review</li>
+        <li>Answering Transform questions the design already settles</li>
+        <li>Choosing between paths that change nothing in AWS</li>
+      </ul>
+      <h3>Checked by</h3>
+      <p style="font-size:12.5px;color:var(--dim)">Quote verification against the SOW, a second reviewer model on
+        every typed reply, and a per-run cap on how many answers the agent may send.</p>
+    </div>
+    <div class="card">
+      <div class="chead"><h2>A person decides</h2><span class="badge b-amber">Human</span></div>
+      <ul class="ul">
+        <li>Approving the plan so the build starts</li>
+        <li>Any option that creates or changes AWS resources</li>
+        <li>Values the SOW does not state, such as root emails</li>
+        <li>Whether to apply the AI-written policies at all</li>
+      </ul>
+      <h3>Enforced by</h3>
+      <p style="font-size:12.5px;color:var(--dim)">A refusal in code, not a prompt instruction. The tool rejects
+        these options whatever the model asks for, and hands them over with the exact wording.</p>
+    </div>
+  </div>
+  <div class="card">
+    <div class="chead"><h2>What AWS owns, and we cannot change</h2><span class="badge b-violet">AWS</span></div>
+    <p style="font-size:12.5px;color:var(--dim);margin-bottom:9px">Transform builds in two rounds: the foundation
+      first, then the workload OUs and accounts once it has designed them from your answers.</p>
+    <dl class="kv">
+      <dt>Round 1</dt><dd><code>Landing Zone - Base</code>, <code>Configure AWS CloudTrail</code> &mdash; Control
+        Tower, the Security OU and the shared accounts</dd>
+      <dt>Round 2</dt><dd><code>Organizational Unit hierarchy</code>, <code>preventive guardrails</code>,
+        <code>Accounts</code></dd>
+    </dl>
+  </div>
+  <div class="notes-src">
+    <p><b>Use this for the hard questions.</b> Three parts: what the model does, what a person does, and what
+    belongs to AWS.</p>
+    <p>The last card matters if anyone asks why the deployment happens in two passes. That split is Transform's,
+    because it designs the workload accounts only after the foundation conversation. We cannot collapse it into
+    one stack, though we may be able to reduce it to a single deployment round.</p>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="h1">What this changes</div>
+  <div class="two">
+    <div class="card">
+      <div class="chead"><h2>Before</h2></div>
+      <ul class="ul">
+        <li>Four to eight weeks for a landing zone, longer when regulated</li>
+        <li>Discovery workshops to re-establish what the SOW already says</li>
+        <li>Design quality depends on who is available</li>
+        <li>The link from a requirement to a built control lives in someone's head</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="chead"><h2>With the agent</h2></div>
+      <ul class="ul">
+        <li>Validated design and code in minutes from the signed SOW</li>
+        <li>Every decision quotes the SOW or is marked inferred</li>
+        <li>The same catalog of policies and controls on every engagement</li>
+        <li>An attestation of what was built, with a full audit trail</li>
+      </ul>
+    </div>
+  </div>
+  <div class="card">
+    <div class="chead"><h2>Honest limits</h2></div>
+    <ul class="ul">
+      <li>AWS Transform is required for the deploy path, and it owns the build sequence</li>
+      <li>Foundation scope only: OUs, accounts, catalog policies and controls. Not networking or workloads</li>
+      <li>The AI-written policies are delivered for review and are never applied automatically</li>
+      <li>Security scan findings are reported, not blocking. A person judges them</li>
+    </ul>
+  </div>
+  <div class="notes-src">
+    <p><b>Close on the limits, not the benefits.</b> Naming what the product does not do is what makes the rest
+    credible, and it stops a customer discovering a boundary later.</p>
+    <p class="ask">Next steps to offer: run it against a real SOW of theirs, and walk their security team through
+    the attestation and audit trail.</p>
+  </div>
+</section>
+
+</div>
+
+<div class="pg" id="pg"></div>
+<div class="notes" id="notes"><div class="lbl">Speaker notes</div><div id="notesBody"></div></div>
+
+<script>
+var stages = [].slice.call(document.querySelectorAll('.stage'));
+var titles = ['Overview', 'Projects', '1 - SOW', '2 - Analyze', '3 - Review',
+              '4 - Policies', '5 - Build', '6 - Evidence', 'Guardrails', 'Value'];
+var at = 0, notesOn = true;
+
+var rail = document.getElementById('rail');
+titles.forEach(function (label, n) {
+  var b = document.createElement('button');
+  b.textContent = label;
+  b.onclick = function () { set(n); };
+  rail.appendChild(b);
+});
+
+function set(n) {
+  at = Math.max(0, Math.min(stages.length - 1, n));
+  stages.forEach(function (s, k) { s.classList.toggle('on', k === at); });
+  [].slice.call(rail.children).forEach(function (b, k) { b.setAttribute('aria-current', k === at); });
+  var src = stages[at].querySelector('.notes-src');
+  document.getElementById('notesBody').innerHTML = src ? src.innerHTML : '';
+  document.getElementById('pg').textContent = (at + 1) + ' / ' + stages.length;
+  document.getElementById('prev').disabled = at === 0;
+  document.getElementById('next').disabled = at === stages.length - 1;
+  if (location.hash !== '#' + at) { history.replaceState(null, '', '#' + at); }
+  window.scrollTo(0, 0);
+}
+/** The step named in the address, so a single slide can be linked or screenshotted. */
+function fromHash() {
+  var n = parseInt(location.hash.slice(1), 10);
+  return isNaN(n) ? 0 : n;
+}
+function go(d) { set(at + d); }
+function toggleNotes() {
+  notesOn = !notesOn;
+  document.getElementById('notes').classList.toggle('hide', !notesOn);
+  document.body.style.paddingBottom = notesOn ? '38vh' : '32px';
+  document.getElementById('pg').style.bottom = notesOn ? 'calc(34vh + 20px)' : '18px';
+}
+function toggleTheme() {
+  var light = document.documentElement.getAttribute('data-theme') === 'light';
+  document.documentElement.setAttribute('data-theme', light ? 'dark' : 'light');
+}
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'ArrowRight' || e.key === 'PageDown') { go(1); }
+  else if (e.key === 'ArrowLeft' || e.key === 'PageUp') { go(-1); }
+  else if (e.key === 'n' || e.key === 'N') { toggleNotes(); }
+  else if (e.key === 't' || e.key === 'T') { toggleTheme(); }
+  else if (e.key === 'f' || e.key === 'F') {
+    if (document.fullscreenElement) { document.exitFullscreen(); }
+    else { document.documentElement.requestFullscreen(); }
+  }
+});
+window.addEventListener('hashchange', function () { if (fromHash() !== at) { set(fromHash()); } });
+set(fromHash());
+</script>
+</body>
+</html>
