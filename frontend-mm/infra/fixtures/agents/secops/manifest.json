@@ -1,0 +1,21 @@
+{
+  "id": "secops",
+  "apiProxy": [
+    {
+      "prefix": "/agents/secops/api/",
+      "originDomain": "d3hw4gjr2u1j6z.cloudfront.net",
+      "originPath": "/api/",
+      "note": "fixture: the agent's live CloudFront adds its own origin token"
+    }
+  ],
+  "externalHosts": {
+    "font-src": [],
+    "img-src": [],
+    "connect-src": [
+      "https://cognito-idp.us-east-1.amazonaws.com"
+    ],
+    "style-src": []
+  },
+  "needsAws": [],
+  "note": "fixture: secops"
+}

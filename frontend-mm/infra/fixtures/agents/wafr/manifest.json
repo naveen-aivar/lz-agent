@@ -1,0 +1,21 @@
+{
+  "id": "wafr",
+  "apiProxy": [
+    {
+      "prefix": "/agents/wafr/api/",
+      "originDomain": "dk8m9hsjkboj8.cloudfront.net",
+      "originPath": "/api/",
+      "note": "fixture"
+    }
+  ],
+  "externalHosts": {
+    "font-src": [],
+    "img-src": [],
+    "connect-src": [
+      "https://cognito-idp.us-east-1.amazonaws.com"
+    ],
+    "style-src": []
+  },
+  "needsAws": [],
+  "note": "fixture: wafr"
+}

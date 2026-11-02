@@ -1,0 +1,8 @@
+# The agent ids of the test fixtures (fixtures/agents/<id>/manifest.json): example agents for the render, deploy and script tests.
+# They are not the dashboard's agents (those are in infra/agents.txt).
+secops
+wafr
+sre
+devops
+onboarding
+backupdr

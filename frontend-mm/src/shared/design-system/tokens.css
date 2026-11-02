@@ -1,0 +1,173 @@
+/*
+ * Ingram Micro brand tokens, from the Ingram Micro Brand Style Guide.
+ *
+ * The brand's primary colours are blue, black and white:
+ *   blue   Pantone 285 C, #1570ef (RGB 21 112 239)  -> --color-primary-600 and --color-logo
+ *   black  #000000                                   -> --color-gray-900 (text) and the inverted surfaces
+ *   white  #ffffff                                   -> --color-surface and the logo on dark surfaces
+ * Any other colour may be used as a secondary colour or a background. The blue ramp 25 to 900 is the one
+ * the 600 sits in; its darker 700 (#175cd3) is the hover colour. White text on #1570ef is 4.6:1 (WCAG AA).
+ */
+
+:root {
+  /* The height of the footer bars along the bottom of the page (the sidebar's, a guided run's, a call's), so
+     their divider lines meet across the page. */
+  --chrome-footer-height: 4.75rem;
+  --color-base-white: #ffffff;
+  --color-surface: #ffffff;
+  --color-gray-25: #fcfcfd;
+  --color-gray-100: #eef2f6;
+  --color-gray-200: #e3e8ef;
+  --color-gray-300: #cdd5df;
+  --color-gray-400: #9aa4b2;
+  --color-gray-500: #697586;
+  --color-gray-600: #4b5565;
+  --color-gray-700: #364152;
+  --color-gray-800: #202939;
+  --color-gray-900: #000000;
+
+  --color-primary-25: #f5faff;
+  --color-primary-50: #eff8ff;
+  --color-primary-100: #d1e9ff;
+  --color-primary-200: #b2ddff;
+  --color-primary-600: #1570ef;
+  --color-primary-700: #175cd3;
+  /* Solid-fill companions: -700 is text-on-surface and flips to a light tint in dark mode, so
+     anything that needs a filled background with white text uses these instead. */
+  --color-primary-hover: #175cd3;
+  --color-success-solid: #027a48;
+  --color-neutral-solid: #364152;
+  --color-primary-900: #194185;
+  /* The Ingram Micro logo: the guide allows it only in blue (Pantone 285 C, #1570ef), black or white. It is
+     blue on light surfaces and white on dark ones (below). */
+  --color-logo: #1570ef;
+  /* The blue curves in the page's corners (see brand-backdrop.tsx). */
+  --backdrop-opacity: 1;
+
+  --color-success-50: #ecfdf3;
+  --color-success-700: #027a48;
+  --color-warning-50: #fffaeb;
+  --color-warning-700: #b54708;
+  --color-danger-50: #fef3f2;
+  --color-danger-700: #b42318;
+  /* Two extra hues for stat-card icon badges (dashboard overview), beyond the four status tones. */
+  --color-violet-50: #f5f3ff;
+  --color-violet-700: #6938ef;
+  --color-teal-50: #f0fdfa;
+  --color-teal-700: #0f766e;
+
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 16px;
+  --radius-pill: 32px;
+
+  --shadow-sm: 0 1px 2px 0 rgba(18, 25, 38, 0.05);
+  --shadow-md: 0 4px 8px -2px rgba(16, 24, 40, 0.1), 0 2px 4px -2px rgba(16, 24, 40, 0.06);
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /*
+   * Typefaces (brand guide): Helvetica Neue for body text and Meta Serif for headlines and large display
+   * text, both as the Adobe Fonts families Helvetica Neue LT Pro (`helvetica-neue-lt-pro`) and Meta Serif Pro
+   * (`meta-serif-pro`). Arial is the option when Helvetica Neue is not available, and Inter only if both are
+   * unavailable. Meta Serif has no stated fall-back, so a headline falls back to the body stack. Code keeps
+   * the browser's monospace: the guide does not cover it.
+   */
+  --font-sans: 'helvetica-neue-lt-pro', 'Helvetica Neue', Arial, Inter, sans-serif;
+  --font-display: 'meta-serif-pro', 'Helvetica Neue', Arial, Inter, sans-serif;
+  /* Helvetica Neue Light for body text, Bold for text that needs emphasis (every other weight is one of them). */
+  --font-weight-body: 300;
+  --font-weight-emphasis: 700;
+  --font-size-sm: 14px;
+  --font-size-md: 16px;
+  --font-size-lg: 18px;
+  --font-size-xl: 20px;
+  --font-size-2xl: 24px;
+  --line-height-sm: 20px;
+  --line-height-md: 24px;
+  --line-height-lg: 28px;
+
+  --content-max-width: 1600px;
+
+  --gradient-primary: linear-gradient(135deg, #1570ef 0%, #2e90fa 100%);
+  --color-sidebar: rgb(255 255 255 / 0.85);
+  /* Tooltips and selected pills: inverted surfaces that stay readable in both themes. */
+  --color-tooltip-bg: #000000;
+  --color-tooltip-text: #ffffff;
+  --color-selected-bg: #000000;
+  --color-selected-text: #ffffff;
+  --color-selected-badge: #1570ef;
+}
+
+/*
+ * EXPERIMENT — navy dark theme (design palette): page #0F172A, sidebar #1B273A, cards #1E293B,
+ * primary blue #2589F5, text #F1F5F9, secondary text #A7B4C8, borders #334155.
+ *
+ * To roll back: replace the colour values below with the previous neutral-grey set kept in
+ * the comment at the end of this file, drop the sidebar, tooltip, selected-pill, primary-600 and gradient-primary tokens
+ * from this block, and restore DARK_CHROME in shared/components/charts/insight-chart.tsx.
+ */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --color-base-white: #1e293b;
+  --color-surface: #1e293b;
+  --color-sidebar: #1b273a;
+  --color-tooltip-bg: #2a3a54;
+  --color-tooltip-text: #f1f5f9;
+  --color-selected-bg: #2589f5;
+  --color-selected-text: #ffffff;
+  --color-selected-badge: rgb(255 255 255 / 0.25);
+  --color-gray-25: #0f172a;
+  --color-gray-100: #334155;
+  --color-gray-200: #3f4f68;
+  --color-gray-300: #55657e;
+  --color-gray-400: #64748b;
+  --color-gray-500: #a7b4c8;
+  --color-gray-600: #c3cddb;
+  --color-gray-700: #dde5ef;
+  --color-gray-800: #e8eef5;
+  --color-gray-900: #f1f5f9;
+
+  --color-primary-25: #0b1222;
+  --color-primary-50: #1f2d4a;
+  --color-primary-100: #2a3a5e;
+  --color-primary-200: #3a4f78;
+  --color-primary-600: #2589f5;
+  --color-primary-700: #f1f5f9;
+  --color-primary-hover: #4a9cf7;
+  --color-success-solid: #15803d;
+  --color-neutral-solid: #475569;
+  --color-primary-900: #e2e8f0;
+  --color-logo: #ffffff;
+  --gradient-primary: linear-gradient(135deg, #2589f5 0%, #4b9ef7 100%);
+
+  --color-success-50: #0f2a22;
+  --color-success-700: #86efac;
+  --color-warning-50: #2b2412;
+  --color-warning-700: #fcd34d;
+  --color-danger-50: #321b25;
+  --color-danger-700: #fca5a5;
+  --color-violet-50: #251f45;
+  --color-violet-700: #c4b5fd;
+  --color-teal-50: #0e2c33;
+  --color-teal-700: #5eead4;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --shadow-md: 0 12px 28px rgba(0, 0, 0, 0.5);
+}
+
+/*
+ * Previous neutral-grey dark values (rollback reference, not applied):
+ *   base-white/surface #2a2a2a · gray-25 #1a1a1a · gray-100 #333333 · gray-200 #454545
+ *   gray-300 #5c5c5c · gray-400 #8f8f8f · gray-500 #bdbdbd · gray-600 #d6d6d6 · gray-700 #ececec
+ *   gray-900 #ffffff · primary-25 #121212 · primary-50 #333333 · primary-100 #3d3d3d
+ *   primary-200 #4f4f4f · primary-900 #e6e6e6 · success-50 #1c2b22 · warning-50 #332b14
+ *   danger-50 #3a2222 · violet-50 #2a2340 · teal-50 #142e2b
+ *   chart chrome: grid #454545 · axis #bdbdbd · surface #2a2a2a · text #ffffff
+ */

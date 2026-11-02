@@ -1,0 +1,28 @@
+{
+  "id": "sre",
+  "apiProxy": [
+    {
+      "prefix": "/agents/sre/api/",
+      "originDomain": "d7f6umgnwp45w.cloudfront.net",
+      "originPath": "/api/",
+      "note": "fixture"
+    }
+  ],
+  "externalHosts": {
+    "font-src": [
+      "https://fonts.gstatic.com"
+    ],
+    "img-src": [
+      "data:"
+    ],
+    "connect-src": [
+      "https://cognito-idp.us-east-1.amazonaws.com"
+    ],
+    "style-src": [
+      "https://fonts.googleapis.com",
+      "'unsafe-inline'"
+    ]
+  },
+  "needsAws": [],
+  "note": "fixture: sre"
+}

@@ -1,0 +1,11 @@
+# Deck Orchestrator in the dashboard
+Source: the `ingram-mm-orch` service (REST API `docs/api.md` in that repository). Written for the dashboard, not ported: the service has no UI of its own.
+What it does: lists deck runs, a trigger ("Generate decks") and a run page. Nothing is uploaded in the dashboard: the assessment agents hand their files over to the service themselves (presigned upload, see ingram-mm-orch docs/sending-outputs.md). The trigger takes the decks (MAP Assess, CVA), an optional customer and date, and, for each source (TCO, 7Rs, MRA, CVA), the job the files were handed over under, chosen from `GET /handovers` (only complete sources can be chosen). It creates a run with `from_jobs`, starts it, and opens it; the service reads the files from S3. The run page polls every 3 seconds, then shows each deck: a PDF preview, PowerPoint and PDF downloads, and how each slide came out (written, built by code, data not available, could not be built).
+The list of sources in `src/features/orchestrator/trigger.ts` is the four the decks use; the other agents' stored-only slots are not offered here.
+Reuses from the TCO agent: `DeckPreview` (and its pdf.js files under /agents/tco/pdfjs/) and `formatDate`.
+Not connected yet (see `needsAws` in the parked manifest): the key gate is written (`infra/key_gates.py`, see infra/README.md: Key gates) but not created in AWS, its secret has to be copied first (`scripts/copy-orchestrator-key.sh`), and bucket CORS, the dashboard origins on the API and the line in `infra/agents.txt` are still to do. Nothing was deployed. Not verified: a real run, the PDF preview from the orchestrator's bucket, the browser at 1440 and 1024.
+The trigger starts a run from files a person adds. It does not yet fetch another agent's finished output by itself (the service does not either: "invoking the other agents ... is still manual").
+
+The manifest is live (`manifest.json`, listed in `infra/agents.txt`).
+
+CSP: connect-src allows `https://s3.us-east-1.amazonaws.com` (the whole regional S3 host), because the service's presigned links are path-style on that host. This is wider than the TCO agent's single-bucket host. To tighten it, the service must return virtual-hosted links; then list `https://mm-dev-data-831493647146.s3.us-east-1.amazonaws.com` instead.

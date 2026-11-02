@@ -1,0 +1,74 @@
+.lz-scene { display: flex; flex-direction: column; gap: 1rem; }
+.lz-scene-status { font-weight: var(--font-weight-emphasis, 600); }
+.lz-scene-board {
+  border: 1px solid var(--color-gray-100);
+  border-radius: var(--radius-lg, 12px);
+  background: var(--color-surface, #fff);
+  padding: 1rem;
+}
+.lz-scene-root {
+  margin: 0 auto 0.75rem;
+  width: fit-content;
+  border-radius: 999px;
+  background: var(--color-primary-50, #e8f1fb);
+  color: var(--color-primary-700, #0b3d91);
+  padding: 0.25rem 0.75rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.lz-scene-groups { display: grid; gap: 0.75rem; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.lz-scene-group {
+  border: 1px dashed var(--color-primary-200, #b9d4f5);
+  border-radius: var(--radius-md, 8px);
+  padding: 0.75rem;
+}
+.lz-scene-group p { margin: 0 0 0.5rem; font-size: 0.875rem; font-weight: 600; }
+.lz-scene-group ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 0.35rem; }
+.lz-scene-group li {
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-gray-50, #f6f7f9);
+  padding: 0.35rem 0.5rem;
+  font-size: 0.75rem;
+}
+
+@media (max-width: 700px) {
+  .lz-scene-groups { grid-template-columns: 1fr; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .lz-scene-group {
+    animation: lz-scene-in 420ms ease-out backwards;
+  }
+  .lz-scene-group:nth-child(2) { animation-delay: 140ms; }
+  .lz-scene-group:nth-child(3) { animation-delay: 280ms; }
+  .lz-scene-group li {
+    animation: lz-scene-in 420ms ease-out backwards;
+  }
+  .lz-scene-group li:nth-child(2) { animation-delay: 180ms; }
+}
+
+@keyframes lz-scene-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lz-scene-group, .lz-scene-group li { animation: none; }
+}
+
+/* Header actions (New architecture, Approve, and the other step buttons) sit on the brand
+   corner the way the other agents' header buttons do: the button itself, with a white edge.
+   The wide-screen tray in architecture.css paints a white card behind them; this wins over it. */
+.mm-architecture-design .page-header > .page-header-actions {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.mm-architecture-design .page-header > .page-header-actions .btn,
+.mm-architecture-design .page-header > .page-header-actions .btn:hover,
+.mm-architecture-design .page-header > .page-header-actions .btn:disabled {
+  border-color: #fff;
+}

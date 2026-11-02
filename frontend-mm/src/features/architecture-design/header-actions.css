@@ -1,0 +1,21 @@
+/* The ported agent's base stylesheet gives its own screen root a pale page surface.
+   The dashboard already owns that surface and the brand corner, so the agent root
+   stays transparent like the other native modules. */
+.mm-architecture-design#content {
+  background: transparent !important;
+}
+
+/* The ported agent's desktop stylesheet draws this wrapper as a separate white pill.
+   The dashboard's brand corner needs the action itself to stand alone. */
+.mm-architecture-design .page-header > .page-header-actions {
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.mm-architecture-design .page-header > .page-header-actions .btn {
+  border-color: #fff !important;
+}

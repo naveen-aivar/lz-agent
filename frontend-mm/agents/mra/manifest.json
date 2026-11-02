@@ -1,0 +1,19 @@
+{
+  "id": "mra",
+  "apiProxy": [
+    {
+      "prefix": "/agents/mra/api/",
+      "originDomain": "d3r4ziahwb4a6v.cloudfront.net",
+      "originPath": "/api/",
+      "note": "Hosted MRA review (CloudFront d3r4ziahwb4a6v, account behind that distribution). /agents/mra/api/runs becomes /api/runs. GET /api/health answered 200 on 2026-10-29. Other routes need that site's own Cognito token (pool us-east-1_4Ptm61JxJ), which is not the portal pool. Forward all methods, the query string and every header except Host. Do not cache."
+    }
+  ],
+  "externalHosts": {
+    "font-src": [],
+    "img-src": [],
+    "connect-src": [],
+    "style-src": []
+  },
+  "needsAws": [],
+  "note": "The dashboard serves the screens (src/features/mra). Only the API is proxied. Finished files come back as a short-lived link the service returns; that link is opened directly."
+}

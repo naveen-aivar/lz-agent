@@ -1,0 +1,470 @@
+/* Class names are looked for in src/ only: the folder also holds built copies of the agents (.build/, agents/) that must not be scanned. */
+@import 'tailwindcss' source('../');
+@import '../shared/design-system/tokens.css';
+
+@theme inline {
+  --color-background: var(--color-gray-25);
+  --color-foreground: var(--color-gray-900);
+  --font-sans: var(--font-sans);
+  --font-display: var(--font-display);
+  /* Two weights, as the brand guide says: Light for body text, Bold where text needs emphasis. */
+  --font-weight-normal: var(--font-weight-body);
+  --font-weight-medium: var(--font-weight-emphasis);
+  --font-weight-semibold: var(--font-weight-emphasis);
+  --font-weight-bold: var(--font-weight-emphasis);
+}
+
+/*
+  Line heights of the Ingram Micro website's text styles (12/18, 20/30, 30/38, 36/44, 60/72), where
+  Tailwind's defaults differ. 14/20, 16/24, 18/28 and 24/32 already match, so they are left alone.
+*/
+@theme {
+  --text-xs--line-height: calc(18 / 12);
+  --text-xl--line-height: calc(30 / 20);
+  --text-3xl--line-height: calc(38 / 30);
+  --text-4xl--line-height: calc(44 / 36);
+  --text-6xl--line-height: calc(72 / 60);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-gray-25);
+  color: var(--color-gray-900);
+  font-family: var(--font-sans);
+  font-weight: var(--font-weight-body);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-sm);
+  letter-spacing: 0;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p,
+button,
+input,
+select,
+textarea,
+label {
+  font-family: inherit;
+  letter-spacing: 0;
+}
+
+/* Meta Serif is for headlines and large display text (brand guide): the page's headline, and any text that
+   asks for it with `font-display`. Smaller headings inside a page are interface text and stay in the body face. */
+h1,
+.font-display {
+  font-family: var(--font-display);
+}
+
+/* In the base layer so a link's own text-* / underline utilities can win; unlayered CSS beats
+   every Tailwind utility, which left "Start a run" and other styled links in the inherited color. */
+@layer base {
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+}
+
+/*
+  Form controls take the page's type, but not its weight: a rule outside Tailwind's layers beats every
+  utility, so `font: inherit` here also overrode `font-semibold` on every button. The weight is set in the
+  base layer below instead, where a utility wins: Light like the body unless a control asks for the
+  emphasis weight (Bold), as the brand guide has it. The size and line height are the same: they come from
+  Tailwind's own reset (also in the base layer), so `text-base leading-6` on a large button is applied
+  instead of being pinned to the page's 14/20.
+*/
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-style: inherit;
+  font-variant: inherit;
+  font-stretch: inherit;
+}
+
+@layer base {
+  button,
+  input,
+  select,
+  textarea {
+    font-weight: inherit;
+  }
+
+  /*
+    Emphasis is Bold (700), not "bolder": relative to the Light (300) body text, bolder is only 400, so a
+    <strong> in a paragraph would not stand out. A native option list is body text, not the control's weight.
+  */
+  b,
+  strong {
+    font-weight: var(--font-weight-emphasis);
+  }
+
+  option,
+  optgroup {
+    font-weight: var(--font-weight-body);
+  }
+}
+
+/*
+  The user-agent stylesheet sets cursor: default on buttons, and Tailwind utilities can
+  override an un-important rule. Clickable controls keep the pointer.
+*/
+button:not(:disabled),
+[role='button']:not([aria-disabled='true']),
+[role='tab']:not(:disabled):not([data-disabled]),
+select:not(:disabled),
+summary,
+label,
+a[href] {
+  cursor: pointer !important;
+}
+
+button:disabled,
+select:disabled,
+input:disabled,
+textarea:disabled,
+[aria-disabled='true'],
+[data-disabled]:not([data-disabled='false']) {
+  cursor: not-allowed !important;
+}
+
+.skeleton-block {
+  background: var(--color-gray-200);
+  animation: skeleton-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes skeleton-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes slide-in-right {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@keyframes slide-out-right {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes scale-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+@keyframes scale-out {
+  from {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.96);
+  }
+}
+
+.drawer-overlay[data-state='open'] {
+  animation: fade-in 260ms ease-out both;
+}
+.drawer-overlay[data-state='closed'] {
+  animation: fade-out 200ms ease-in both;
+}
+.drawer-panel[data-state='open'] {
+  animation: slide-in-right 280ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+.drawer-panel[data-state='closed'] {
+  animation: slide-out-right 220ms cubic-bezier(0.4, 0, 1, 1) both;
+}
+
+.modal-overlay[data-state='open'] {
+  animation: fade-in 220ms ease-out both;
+}
+.modal-overlay[data-state='closed'] {
+  animation: fade-out 180ms ease-in both;
+}
+.modal-panel[data-state='open'] {
+  animation: scale-in 220ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+.modal-panel[data-state='closed'] {
+  animation: scale-out 180ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+.animate-fade-up {
+  animation: fade-up 420ms cubic-bezier(0.2, 0.7, 0.2, 1) backwards;
+  animation-delay: calc(var(--stagger, 0) * 45ms);
+}
+
+.animate-fade-in {
+  animation: fade-in 260ms ease-out backwards;
+}
+
+/*
+  Motion for the steps of a run (the same vocabulary as the other agents: short, ease-out, no overshoot, nothing that loops except the one
+  ring on the current stage). Every rule below stands still for a person who asked their system for less motion.
+*/
+@keyframes grow-y {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes tick-in {
+  from {
+    opacity: 0;
+    transform: scale(0.7);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* A timeline's rail filling downwards, to the step after it. */
+.animate-grow-y {
+  transform-origin: top center;
+  animation: grow-y 360ms cubic-bezier(0.2, 0.7, 0.2, 1) backwards;
+}
+
+/* A tick appearing inside a ring when its stage or step is done. */
+.animate-tick-in {
+  animation: tick-in 280ms ease-out backwards;
+}
+
+/* A page of a tab: its blocks come in one after the other, so moving from one step of the work to the next reads as a move. */
+.view-enter > * {
+  animation: fade-up 360ms cubic-bezier(0.2, 0.7, 0.2, 1) backwards;
+}
+.view-enter > :nth-child(2) {
+  animation-delay: 40ms;
+}
+.view-enter > :nth-child(3) {
+  animation-delay: 80ms;
+}
+.view-enter > :nth-child(4) {
+  animation-delay: 120ms;
+}
+.view-enter > :nth-child(n + 5) {
+  animation-delay: 160ms;
+}
+
+/* The inside of a "more detail" block opening (a native <details>, which cannot animate its height). */
+details[open] > .disclosure-body {
+  animation: fade-up 260ms cubic-bezier(0.2, 0.7, 0.2, 1) backwards;
+}
+
+/*
+  For a person who asked their system for less motion. This block stands AFTER every rule that starts an animation (a rule later in the file wins
+  at equal specificity) and names the state selectors of the dialogs too, which are more specific than the plain classes.
+*/
+@media (prefers-reduced-motion: reduce) {
+  .drawer-overlay,
+  .drawer-panel,
+  .modal-overlay,
+  .modal-panel,
+  .drawer-overlay[data-state],
+  .drawer-panel[data-state],
+  .modal-overlay[data-state],
+  .modal-panel[data-state],
+  .animate-fade-up,
+  .animate-fade-in,
+  .animate-grow-y,
+  .animate-tick-in,
+  .skeleton-block,
+  .view-enter > *,
+  details[open] > .disclosure-body {
+    animation: none;
+  }
+}
+
+/*
+ * Hidden sidebar (app-sidebar sets data-sidebar on <html>; pre-paint script in layout.tsx
+ * avoids a flash). Shrinks to nothing so the page uses the full width.
+ */
+html[data-sidebar='hidden'] [data-app-sidebar] {
+  width: 0;
+  margin-right: -0.75rem;
+  border-width: 0;
+  opacity: 0;
+  box-shadow: none;
+  pointer-events: none;
+}
+
+/* Sign-in page: the drifting waves in the blue panel beside the form (decorative; they stand still under reduced motion). */
+.silk-root {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  isolation: isolate;
+}
+.silk-fabric {
+  position: absolute;
+  inset: -15%;
+  transform: rotate(var(--silk-angle, -18deg));
+  pointer-events: none;
+}
+.silk-fabric svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.silk-wave {
+  transform-origin: center;
+  transform-box: fill-box;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .silk-wave {
+    animation: silk-drift var(--silk-speed, 12s) ease-in-out infinite;
+  }
+}
+@keyframes silk-drift {
+  0% {
+    transform: translate3d(-4%, 0, 0) scaleY(1);
+  }
+  50% {
+    transform: translate3d(4%, -2.5%, 0) scaleY(1.05);
+  }
+  100% {
+    transform: translate3d(-4%, 0, 0) scaleY(1);
+  }
+}
+
+/* Toasts (Sonner) bring their own system font and weights; the `html` in front out-ranks them, so a toast reads in the brand typeface. */
+html [data-sonner-toaster] {
+  font-family: var(--font-sans);
+}
+html [data-sonner-toast][data-styled='true'] [data-description] {
+  font-weight: var(--font-weight-body);
+}
+html [data-sonner-toast][data-styled='true'] [data-title],
+html [data-sonner-toast][data-styled='true'] [data-button] {
+  font-weight: var(--font-weight-emphasis);
+}
+/* A toast's one follow-up button is a brand-blue pill (Sonner's default is black). */
+html [data-sonner-toast][data-styled='true'] [data-button] {
+  height: auto;
+  padding: 0.375rem 0.875rem;
+  border-radius: var(--radius-pill);
+  background: var(--color-primary-600);
+  color: #fff;
+}
+html [data-sonner-toast][data-styled='true'] [data-button]:hover {
+  background: var(--color-primary-hover);
+}
+
+/*
+ * A step's forward button (the unified agents dashboard's StepNextButton): while the agent is still working a soft bright band sweeps across
+ * the filled part; once the step is ready a ring pulses out from the button and its arrow nudges forward, after the fill has finished.
+ * Reduced motion keeps a still ring and no movement.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  .step-fill-shine {
+    background-image: linear-gradient(100deg, transparent 42%, rgba(255, 255, 255, 0.55) 50%, transparent 58%);
+    background-size: 500% 100%;
+    background-repeat: no-repeat;
+    animation: step-fill-shine 2.4s ease-in-out infinite;
+  }
+  .next-ready:not(:disabled) {
+    animation: next-ready-ring 2.2s ease-out var(--next-fill-ms, 0ms) infinite;
+  }
+  .next-ready:not(:disabled) > svg:last-child {
+    animation: next-ready-nudge 1.1s ease-in-out var(--next-fill-ms, 0ms) infinite;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .next-ready:not(:disabled) {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-primary-600) 25%, transparent);
+  }
+}
+@keyframes step-fill-shine {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0% 0;
+  }
+}
+@keyframes next-ready-ring {
+  0% {
+    box-shadow:
+      var(--shadow-sm),
+      0 0 0 0 color-mix(in srgb, var(--color-primary-600) 45%, transparent);
+  }
+  70%,
+  100% {
+    box-shadow:
+      var(--shadow-sm),
+      0 0 0 10px transparent;
+  }
+}
+@keyframes next-ready-nudge {
+  50% {
+    transform: translateX(3px);
+  }
+}

@@ -1,0 +1,43 @@
+/* The gauge arc draws itself once when a result appears. While a score is being worked out, that arc is the one loop on this agent. */
+.mm-mra .mra-gauge-fill {
+  transition: stroke-dasharray 420ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+.mm-mra .mra-gauge-busy .mra-gauge-fill {
+  animation: mra-sweep 1.6s ease-out infinite;
+}
+
+.mm-mra .mra-step-current {
+  animation: mra-pulse 1.6s ease-out infinite;
+}
+
+@keyframes mra-pulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-primary-600) 35%, transparent); }
+  100% { box-shadow: 0 0 0 8px transparent; }
+}
+
+.mm-mra .mra-bar > span {
+  transform-origin: left center;
+  animation: mra-grow 420ms cubic-bezier(0.2, 0.7, 0.2, 1) backwards;
+}
+
+@keyframes mra-sweep {
+  0% { stroke-dasharray: 0 113; }
+  70% { stroke-dasharray: 113 113; }
+  100% { stroke-dasharray: 113 113; }
+}
+
+@keyframes mra-grow {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mm-mra .mra-gauge-busy .mra-gauge-fill,
+  .mm-mra .mra-step-current,
+  .mm-mra .mra-bar > span,
+  .mm-mra .mra-gauge-fill {
+    animation: none;
+    transition: none;
+  }
+}

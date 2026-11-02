@@ -1,0 +1,21 @@
+{
+  "id": "backupdr",
+  "apiProxy": [
+    {
+      "prefix": "/agents/backupdr/api/",
+      "originDomain": "a1b2c3d4e5.execute-api.us-east-1.amazonaws.com",
+      "originPath": "",
+      "note": "fixture: an API Gateway default stage, so the origin path is empty (the origin's root)"
+    }
+  ],
+  "externalHosts": {
+    "font-src": [],
+    "img-src": [],
+    "connect-src": [
+      "https://cognito-idp.us-east-1.amazonaws.com"
+    ],
+    "style-src": []
+  },
+  "needsAws": [],
+  "note": "fixture: backupdr, an empty originPath and no static files"
+}

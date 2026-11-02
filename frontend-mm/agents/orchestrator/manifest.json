@@ -1,0 +1,27 @@
+{
+  "id": "orchestrator",
+  "apiProxy": [
+    {
+      "prefix": "/agents/orchestrator/api/",
+      "originDomain": "aafoxbd4f1.execute-api.us-east-1.amazonaws.com",
+      "originPath": "/dev/",
+      "note": "REST API of ingram-mm-orch (id aafoxbd4f1) in the Agentic Systems account 831493647146, us-east-1, stage dev. /agents/orchestrator/api/jobs becomes /dev/jobs. Every route except /health needs the X-Access-Key header (secret mm-dev/access-key in Secrets Manager); the browser must not hold it. Forward all methods, the query string and every header except Host. Do not cache."
+    }
+  ],
+  "externalHosts": {
+    "font-src": [],
+    "img-src": [],
+    "connect-src": [
+      "https://cognito-idp.us-east-1.amazonaws.com",
+      "https://s3.us-east-1.amazonaws.com"
+    ],
+    "style-src": []
+  },
+  "needsAws": [
+    "Key gate: ingram-mm-dashboard-orchestrator-key-gate (infra/key_gates.py), built by deploy.sh. Its secret ingram-mm-dashboard/orchestrator-access-key was copied here from mm-dev/access-key (account 831493647146) on 2026-10-30 with scripts/copy-orchestrator-key.sh.",
+    "Bucket mm-dev-data-831493647146 (account 831493647146): CORS got https://mm.aivar.app and https://d1h79dmk5ce1yh.cloudfront.net on 2026-10-30, keeping http://localhost:8000. Methods POST and GET, AllowedHeaders *, ExposeHeaders ETag. put-bucket-cors replaces the whole configuration, so a later change must keep those origins.",
+    "API Lambda mm-dev-api UI_ORIGINS is still localhost only; the dashboard calls the API through CloudFront, so this does not block it.",
+    "CSP: the service builds its presigned links on the shared regional S3 host (https://s3.us-east-1.amazonaws.com/<bucket>/...), so connect-src allows that whole host, not only this bucket. A tighter policy needs the service to return virtual-hosted links (<bucket>.s3.us-east-1.amazonaws.com); then replace the host here."
+  ],
+  "note": "The dashboard serves the screens (src/features/orchestrator). Only the API is proxied. The PDF preview reuses the TCO agent's pdf.js files under /agents/tco/pdfjs/. The browser POSTs input files to, and fetches the finished PDF from, presigned links on https://s3.us-east-1.amazonaws.com."
+}

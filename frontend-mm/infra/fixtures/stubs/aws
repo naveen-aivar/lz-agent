@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# A test double for the AWS CLI, used by infra/test_scripts.sh. It changes nothing anywhere: it logs every call to
+# $STUB_LOG and keeps a pretend account (a stack marker and a "bucket" folder) in $STUB_STATE.
+# The one call it passes to the real CLI is `aws s3 cp --dryrun` (pure local file matching, no AWS access).
+# The S3 and CloudFront calls of the direct deploy (infra/direct.py) are answered by aws_direct.py, which keeps a pretend account.
+set -u
+{ printf '%q ' "$@"; printf '\n'; } >> "$STUB_LOG"
+all="$*"
+case "${1:-} ${2:-}" in
+  "sts get-caller-identity")
+    printf '%s\tarn:aws:sts::%s:assumed-role/stub/stub\n' "${STUB_ACCOUNT:-455162169375}" "${STUB_ACCOUNT:-455162169375}" ;;
+  "cloudformation validate-template") echo '{"Parameters":[]}' ;;
+  "cloudformation describe-stacks")
+    if [ ! -f "$STUB_STATE/stack" ]; then
+      echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id ingram-msp-dashboard does not exist" >&2
+      exit 254
+    fi
+    case "$all" in
+      *StackStatus*) echo CREATE_COMPLETE ;;
+      *SiteBucketName*) echo stub-bucket ;;
+      *DistributionId*) echo ESTUB123 ;;
+      *DistributionDomainName*) echo dstub123.cloudfront.net ;;
+      *Parameters*) echo '[{"ParameterKey":"DomainName","ParameterValue":"mm.aivar.app"},{"ParameterKey":"CertificateArn","ParameterValue":"arn:aws:acm:us-east-1:455162169375:certificate/df4a2cb0-96be-4c56-9639-fad4dd000d8d"}]' ;;
+    esac ;;
+  "cloudformation get-template") cat "$STUB_STATE/template.json" ;;
+  "cloudformation deploy")
+    while [ $# -gt 0 ]; do if [ "$1" = "--template-file" ]; then cp "$2" "$STUB_STATE/template.json"; fi; shift; done
+    touch "$STUB_STATE/stack"; echo "Successfully created/updated stack - ingram-msp-dashboard" ;;
+  "cloudfront create-invalidation") echo I-STUB ;;
+  "cloudfront wait") ;;
+  "s3 ls")
+    live="$STUB_STATE/live"
+    if [ ! -d "$live" ]; then printf '\nTotal Objects: 0\n   Total Size: 0\n'; exit 1; fi
+    printf '\nTotal Objects: %s\n   Total Size: %s\n' "$(find "$live" -type f | wc -l | tr -d ' ')" "$(find "$live" -type f -print0 | xargs -0 cat | wc -c | tr -d ' ')" ;;
+  "s3 cp"|"s3 sync")
+    case "$all" in
+      *--dryrun*) exec env -u AWS_PROFILE AWS_ACCESS_KEY_ID=stub AWS_SECRET_ACCESS_KEY=stub "$REAL_AWS" "$@" ;;
+    esac
+    source="$3"; target="$4"
+    mkdir -p "$STUB_STATE/live"
+    case "$source" in
+      s3://*) mkdir -p "$target"; rsync -a "$STUB_STATE/live/" "$target/" ;;   # a download: the backup
+      *) rsync -a "$source/" "$STUB_STATE/live/" ;;                          # an upload (filters not applied: superset)
+    esac ;;
+  "s3api "*|"cloudfront "*) exec python3 "$(dirname "${BASH_SOURCE[0]}")/aws_direct.py" "$@" ;;   # the direct deploy's calls (infra/direct.py)
+  *) echo "stub aws: unexpected call: $all" >&2; exit 99 ;;
+esac

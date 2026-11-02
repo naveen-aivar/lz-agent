@@ -1,0 +1,72 @@
+import { cn } from '@/shared/utils/cn';
+
+/** The artwork's own size, from the brand team's supplied file. */
+const ART_WIDTH = 122;
+const ART_HEIGHT = 32;
+/** The INGRAM wordmark inside it runs from y = 6.29 to y = 25.08, so it is 18.79 units high. */
+const WORDMARK_HEIGHT = 18.79;
+
+/**
+ * How high the logo is drawn, in pixels. The brand guide's web minimum is a logo 100 px wide, which is
+ * 26.2 px high, so there is no size below 28 px to ask for.
+ */
+const SIZES = { sm: 28, md: 32, lg: 40 } as const;
+export type IngramLogoSize = keyof typeof SIZES;
+
+/** Width in pixels of a logo drawn at this size. */
+export const logoWidth = (size: IngramLogoSize): number => (SIZES[size] * ART_WIDTH) / ART_HEIGHT;
+
+/**
+ * The clear space the guide keeps round the logo: the height of the wordmark on every side, measured on
+ * the guide's "minimum space" diagram.
+ */
+export const logoClearSpace = (size: IngramLogoSize): number =>
+  (SIZES[size] * WORDMARK_HEIGHT) / ART_HEIGHT;
+
+/**
+ * The Ingram Micro logo, from the brand team's supplied artwork: the INGRAM wordmark, MICRO and the
+ * registration mark. The brand guide does not allow it to be redrawn, stretched, recoloured, shadowed,
+ * filled with a texture or used as a mask, and the ® and MICRO always stay with it.
+ *
+ * It is drawn in `currentColor`, which defaults to `--color-logo`: Ingram Micro blue on light surfaces and
+ * white on dark ones, the only colours the guide allows besides black (`text-black`). Nothing else may
+ * appear within its clear space, so the logo brings that space with it, as padding, and exposes it as
+ * `--logo-clear-space`: a caller that wants the logo flush with its neighbours gives it the matching
+ * negative margin (`-ml-[var(--logo-clear-space)]`) where the surrounding padding is at least as wide.
+ */
+export function IngramLogo({
+  size = 'md',
+  className,
+}: {
+  size?: IngramLogoSize;
+  className?: string;
+}) {
+  const height = SIZES[size];
+  const space = logoClearSpace(size);
+  return (
+    <span
+      className={cn('inline-flex shrink-0', className)}
+      style={{ padding: space, ['--logo-clear-space' as string]: `${space}px` }}
+    >
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        width={logoWidth(size)}
+        height={height}
+        viewBox={`0 0 ${ART_WIDTH} ${ART_HEIGHT}`}
+        fill="none"
+        role="img"
+        aria-label="Ingram Micro"
+        className="block text-[var(--color-logo)]"
+      >
+        <path
+          d="M114.621 7.70732C114.621 7.19241 115.116 6.98238 115.922 6.98238C116.708 6.98238 117.223 7.17209 117.223 7.70732C117.223 8.37128 116.423 8.4458 115.915 8.4458C115.116 8.4458 114.621 8.23578 114.621 7.70732ZM117.988 7.70732C117.988 6.69783 117.216 6 115.915 6C114.974 6 113.856 6.46748 113.856 7.70732C113.856 8.89974 114.852 9.4282 115.915 9.4282C116.999 9.43498 117.988 8.89974 117.988 7.70732ZM114.628 12.4431V11.725C114.628 11.2778 114.906 11.122 115.136 11.122C115.387 11.122 115.651 11.2913 115.651 11.725V12.4431H114.628ZM116.349 12.4431V11.7588L117.934 11.1423V10.0989L116.159 10.8442C116.003 10.4106 115.577 10.1464 115.123 10.1464C114.377 10.1464 113.917 10.6342 113.917 11.5962V13.3781H117.934V12.4431H116.349ZM115.407 14.2792C114.438 14.3876 113.856 14.9025 113.856 15.9052C113.856 17.1112 114.811 17.7074 115.922 17.7074C117.02 17.7074 117.988 17.1247 117.988 15.9323C117.988 15.0041 117.446 14.374 116.525 14.2724L116.464 15.187C116.85 15.2412 117.216 15.4445 117.216 15.8849C117.216 16.5963 116.505 16.6572 115.956 16.6572C115.468 16.6572 114.601 16.5895 114.601 15.9323C114.601 15.4174 115.014 15.2616 115.461 15.2616L115.407 14.2792ZM117.934 18.6152H113.917V19.5502H117.934V18.6152ZM117.934 22.6532V23.2969L114.662 24.2657V24.286H117.934V25.0787H113.917V23.6085L116.322 22.9039L113.917 22.1654V20.6952H117.934V21.6302H114.662V21.6505L117.934 22.6532ZM35.1831 25.0787H19.973C18.7941 20.7088 16.3009 11.4811 16.3009 11.4811H16.2535V25.0787H10.0339V6.29132H20.8267C21.9649 10.6274 24.343 19.5367 24.343 19.5367H24.3904V6.29132H30.6235V9.14364C29.1059 10.7493 28.1844 12.7954 28.1844 15.37C28.1844 19.0624 30.2576 23.6424 35.1831 25.0787ZM109.079 6.29132V25.0787H102.562V10.3632H102.467L98.7201 25.0787H92.7038L88.9775 10.3632H88.8759V25.0787H77.4869L76.3487 21.034H70.224L69.0858 25.0787H58.1982C58.1982 25.0787 57.8323 22.3077 57.7375 21.6166C57.4123 19.286 56.7144 18.7237 55.3255 18.7237H53.4217V25.0787H42.2699C45.4813 24.347 48.381 22.8903 50.0477 21.8876L47.7035 13.0055L41.4772 14.645L42.8051 19.6789C42.4122 19.9567 41.1181 20.4106 40.2306 20.4106C37.2563 20.4106 35.8403 17.4296 35.8403 14.8618C35.8403 10.729 40.0544 9.13688 43.7604 9.13688C44.6209 9.13688 45.7388 9.21139 45.8946 9.23172L45.1154 6.28454H58.0898C63.2863 6.28454 65.2985 8.74391 65.2985 11.3659C65.2985 15.3361 61.518 16.0814 60.793 16.2033C60.7795 16.2033 60.7795 16.3117 60.793 16.3185C62.3039 16.603 63.415 17.3348 64.1264 18.6152C64.0993 18.5746 68.1034 7.32113 68.4625 6.28454H78.4422L82.6495 18.0665H82.7037V6.28454H93.4355C93.4355 6.28454 95.922 16.5692 95.9355 16.5692C96.7485 13.1409 98.3745 6.28454 98.3745 6.28454H109.079V6.29132ZM0 6.29132H7.22904C7.22904 6.29132 7.21549 18.7779 7.21549 25.0787C7.17484 25.0787 0.0406506 25.0855 0 25.0787V6.29132ZM73.2389 10.3293L71.2199 16.5217H75.3866L73.3473 10.3293H73.2389ZM53.4353 14.4892H55.583C57.3377 14.4892 58.0694 13.5813 58.0694 12.4702C58.0694 11.0474 56.8567 10.4919 55.583 10.4919C54.8242 10.4919 53.4353 10.4919 53.4353 10.4919V14.4892Z"
+          fill="currentColor"
+        />
+        <path
+          d="M118 1.83704C118 0.824581 118.825 0 119.837 0C120.849 0 121.674 0.824581 121.674 1.83704C121.674 2.8495 120.849 3.67408 119.837 3.67408C118.825 3.67234 118 2.8495 118 1.83704ZM121.225 1.83704C121.225 0.977667 120.604 0.356622 119.837 0.356622C119.068 0.356622 118.449 0.977667 118.449 1.83704C118.449 2.69641 119.07 3.31746 119.837 3.31746C120.604 3.31746 121.225 2.69641 121.225 1.83704ZM119.129 0.788049H119.901C120.401 0.788049 120.67 0.960271 120.67 1.39866C120.67 1.75528 120.467 1.9275 120.126 1.95881L120.686 2.86864H120.289L119.75 1.97273H119.515V2.86864H119.129V0.788049ZM119.515 1.67873H119.856C120.086 1.67873 120.284 1.64742 120.284 1.36908C120.284 1.12554 120.06 1.08378 119.861 1.08378H119.515V1.67873Z"
+          fill="currentColor"
+        />
+      </svg>
+    </span>
+  );
+}

@@ -1,0 +1,24 @@
+{
+  "id": "onboarding",
+  "apiProxy": [
+    {
+      "prefix": "/agents/onboarding/api/",
+      "originDomain": "api.example-msp.aivar.app",
+      "originPath": "/v2/",
+      "note": "fixture: same domain as devops, other path"
+    }
+  ],
+  "externalHosts": {
+    "font-src": [],
+    "img-src": [
+      "https://*.s3.amazonaws.com"
+    ],
+    "connect-src": [
+      "https://cognito-idp.us-east-1.amazonaws.com",
+      "https://onboarding-uploads.s3.us-east-1.amazonaws.com"
+    ],
+    "style-src": []
+  },
+  "needsAws": [],
+  "note": "fixture: onboarding"
+}

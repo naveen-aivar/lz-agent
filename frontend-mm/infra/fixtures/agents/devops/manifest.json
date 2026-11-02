@@ -1,0 +1,34 @@
+{
+  "id": "devops",
+  "apiProxy": [
+    {
+      "prefix": "/agents/devops/api/",
+      "originDomain": "api.example-msp.aivar.app",
+      "originPath": "/prod/",
+      "note": "fixture: shares an origin domain with onboarding"
+    },
+    {
+      "prefix": "/agents/devops/api/stream/",
+      "originDomain": "stream.example-msp.aivar.app",
+      "originPath": "/",
+      "note": "fixture: a longer prefix that must win over /agents/devops/api/"
+    }
+  ],
+  "externalHosts": {
+    "font-src": [],
+    "img-src": [
+      "data:"
+    ],
+    "connect-src": [
+      "https://cognito-idp.us-east-1.amazonaws.com"
+    ],
+    "style-src": [
+      "'unsafe-inline'"
+    ]
+  },
+  "needsAws": [
+    "fixture: example of an open item the integrator must review"
+  ],
+  "note": "fixture: shares an origin domain with onboarding and has a second, longer API prefix",
+  "rewrites": []
+}

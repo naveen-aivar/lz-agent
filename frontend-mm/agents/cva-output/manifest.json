@@ -1,0 +1,19 @@
+{
+  "id": "cva-output",
+  "apiProxy": [
+    {
+      "prefix": "/agents/cva-output/api/",
+      "originDomain": "d2f11is2hu6tzu.cloudfront.net",
+      "originPath": "/api/",
+      "note": "CVA agent's access-key API: stack cva-agent-key (shubham-aivar/cva-output-agent, deploy/key) in the aivar-vision account 604775478403, CloudFront d2f11is2hu6tzu.cloudfront.net in front of one EC2 instance. /agents/cva-output/api/runs becomes /api/runs. Every route except /health needs X-Access-Key: the CVA key gate (infra/key_gates.py) adds it from Secrets Manager ingram-mm-dashboard/cva-output-access-key for signed-in people; the screens never hold the key. The instance is stopped every night at 15:30 UTC by that account's off-hours policy (start: deploy/key/deploy.sh start). Forward all methods, the query string and every header except Host. Do not cache."
+    }
+  ],
+  "externalHosts": {
+    "font-src": [],
+    "img-src": [],
+    "connect-src": [],
+    "style-src": []
+  },
+  "needsAws": [],
+  "note": "The dashboard serves the screens (src/features/cva-output). Only /api/ is proxied. File downloads on the hosted site live at /download/, which this proxy does not cover, so the Outputs step lists the file names the service returns."
+}

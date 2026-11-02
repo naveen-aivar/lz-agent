@@ -1,0 +1,25 @@
+{
+  "id": "tco",
+  "apiProxy": [
+    {
+      "prefix": "/agents/tco/api/",
+      "originDomain": "sdcr1ipp07.execute-api.us-east-1.amazonaws.com",
+      "originPath": "/dev/",
+      "note": "REST API tco-dev-api (id sdcr1ipp07) in the Agentic Systems account 831493647146, us-east-1, stage dev. /agents/tco/api/jobs becomes /dev/jobs. GET /dev/health answered 200 on 2026-10-28 with {\"status\":\"ok\",\"features\":{\"map_credits\":\"ask\"}}. Other routes need the X-Access-Key header the screen sends. Forward all methods, the query string and every header except Host. Do not cache."
+    }
+  ],
+  "externalHosts": {
+    "font-src": [],
+    "img-src": [],
+    "connect-src": [
+      "https://cognito-idp.us-east-1.amazonaws.com",
+      "https://tco-dev-data-831493647146.s3.amazonaws.com"
+    ],
+    "style-src": []
+  },
+  "needsAws": [
+    "S3 bucket tco-dev-data-831493647146 (account 831493647146, us-east-1): the browser POSTs the Excel file to a presigned URL on https://tco-dev-data-831493647146.s3.amazonaws.com. On 2026-10-28 the bucket CORS was updated in place, keeping the existing origins and adding https://mm.aivar.app and https://d1h79dmk5ce1yh.cloudfront.net. put-bucket-cors replaces the whole configuration, so a later change must keep those origins. Allowed methods stay POST and GET, AllowedHeaders *, ExposeHeaders ETag.",
+    "Lambda tco-dev-api environment CORS_ALLOWED_ORIGINS was given the same two dashboard origins on 2026-10-28. The dashboard calls the API through CloudFront, so the browser does not need that header for the JSON calls; the bucket CORS is what the file upload needs."
+  ],
+  "note": "The dashboard serves the screens (src/features/tco). Only the API is proxied. The workbook upload is a browser POST to the data bucket, which is why that host is in connect-src. A finished assessment also fetches the slide deck PDF from that bucket once, to draw the preview."
+}

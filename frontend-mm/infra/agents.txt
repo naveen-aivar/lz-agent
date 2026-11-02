@@ -1,0 +1,10 @@
+# The agents whose API the dashboard proxies, one id per line (the one list to edit to connect an agent).
+# Each one needs agents/<id>/manifest.json (its API proxy at /agents/<id>/api/ and the outside hosts its screens call);
+# infra/render.py refuses a manifest that is not listed here and a listed id without one. Its screens are a module of the
+# dashboard app (src/features/<id>/); /agents/<id>/ otherwise holds only the static files of public/agents/<id>/.
+# Connected: cva-output, mra, architecture-design, tco, orchestrator. The others show "not connected yet" until their API origin is known.
+cva-output
+mra
+architecture-design
+tco
+orchestrator

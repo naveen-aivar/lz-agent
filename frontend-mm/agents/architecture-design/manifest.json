@@ -1,0 +1,21 @@
+{
+  "id": "architecture-design",
+  "apiProxy": [
+    {
+      "prefix": "/agents/architecture-design/api/",
+      "originDomain": "xtyojvbhm9.execute-api.us-east-1.amazonaws.com",
+      "originPath": "",
+      "note": "HTTP API of the a05-arch-dev stack (aivar-tech/architecture-design-agent) in account 455162169375, us-east-1. GET /session and GET /runs answer at the root (default stage), so originPath is empty: /agents/architecture-design/api/runs becomes /runs. Every route needs the shared X-Access-Key header: the Architecture Design key gate (infra/key_gates.py) adds it from Secrets Manager a05-arch-dev/access-key for signed-in people and calls the API's dev stage (/dev/<path>); the screens never hold the key. Forward all methods, the query string and every header except Host. Do not cache."
+    }
+  ],
+  "externalHosts": {
+    "font-src": [],
+    "img-src": [],
+    "connect-src": [
+      "https://cognito-idp.us-east-1.amazonaws.com"
+    ],
+    "style-src": []
+  },
+  "needsAws": [],
+  "note": "The dashboard serves the screens (src/features/architecture-design). Only the API is proxied. Diagrams come back inside the JSON as data, so no extra image host is needed. The sample run's files are static: public/agents/architecture-design/."
+}
